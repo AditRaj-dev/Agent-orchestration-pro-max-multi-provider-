@@ -381,7 +381,7 @@ impl SupervisorCore {
         task_id: &Uuid,
         base_commit: &str,
     ) -> Result<WorktreeRef, RuntimeError> {
-        let key = worktree_key(*task_id);
+        let key = *task_id;
         let expected = self.worktrees.managed_root().join(key.to_string());
         if expected.exists() {
             // A retry of the same task, or a reclaimed lease after a
@@ -508,21 +508,6 @@ fn elapsed_secs(task: &TaskRecord) -> u64 {
         .signed_duration_since(chrono::Utc::now())
         .num_seconds()
         .unsigned_abs()
-}
-
-/// Worktree identity for a task: the byte-swapped task UUID.
-///
-/// F-09 derives branch names from the FIRST 8 hex of the run and task ids
-/// (`agentos/<run8>/<task8>`), but the engine mints every task UUIDv7 of a
-/// run in one burst inside `create_run`, so their leading timestamp bits —
-/// and therefore the derived branch names — collide, and `git worktree add
-/// -b` fails with "branch already exists". Swapping the bytes is a pure
-/// function of the engine task id (still a harness-minted UUID, so the
-/// GIT-04 "no model-controlled text in ref names" guarantee is intact)
-/// that moves the entropy — the random tail — to the front, giving every
-/// task a collision-free key even within the same millisecond.
-fn worktree_key(task_id: Uuid) -> Uuid {
-    Uuid::from_u128(task_id.as_u128().swap_bytes())
 }
 
 /// Session timeout: the stricter of the node's machine budget and the

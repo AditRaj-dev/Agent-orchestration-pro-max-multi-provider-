@@ -84,11 +84,8 @@ Only ignored tests: two env-gated free e2e probes (`AGENTOS_CLAUDE_E2E=1`, `AGEN
 
 ## 4. Known debts / seams (ordered by priority)
 
-1. **F-09 branch-name collision (real bug, worked around):** F-09 derives worktree branch names
-   from the first 8 hex of run/task UUIDv7s; a run's tasks are minted in one millisecond so
-   prefixes collide and `git worktree add -b` fails. F-07 works around it with a byte-swapped
-   task UUID (see F-07 F-doc). **Fix properly in F-09** (wider prefix or different derivation),
-   then remove/keep the F-07 shim accordingly. Small PR, do first.
+1. ~~**F-09 branch-name collision**~~ — FIXED: shorts now come from the UUID tail
+   (`worktree.rs::short_hex`), F-07's byte-swap shim removed.
 2. **F-07 GitGate hardcodes `approved=true`** — the seam for F-10 approval gates. Wire
    `agentos-policy` into the supervisor: Push/Commit gating through `git_gate_check` +
    `approval.rs`; HumanApproval nodes must resolve via the approval store (currently fail loudly).

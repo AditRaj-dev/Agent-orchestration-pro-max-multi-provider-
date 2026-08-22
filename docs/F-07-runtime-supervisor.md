@@ -223,15 +223,13 @@ flows into ledger attribution.
 
 ## 7. Integration notes & discovered constraints
 
-- **F-09 branch-name collisions (found by the e2e suite):** `WorktreeManager`
-  derives branch names from the *first 8 hex* of run/task UUIDs, but the engine
-  mints every task UUIDv7 of a run in one millisecond burst, so those prefixes
-  — and thus `agentos/<run8>/<task8>` branches — collide and `git worktree add
-  -b` fails. F-07 passes a **byte-swapped task UUID** as the worktree identity:
-  a pure function of the engine task id (GIT-04's "UUID-derived refs only"
-  guarantee intact) whose leading bits are the random tail instead of the
-  timestamp. Recommendation for F-09: widen the short-hex or add a
-  disambiguator.
+- **F-09 branch-name collisions (found by the e2e suite, since FIXED in F-09):**
+  `WorktreeManager` used to derive branch names from the *first 8 hex* of
+  run/task UUIDs, but the engine mints every task UUIDv7 of a run in one
+  millisecond burst, so those prefixes — and thus `agentos/<run8>/<task8>`
+  branches — collided and `git worktree add -b` failed. F-09 now derives both
+  shorts from the UUID **tail** (the random leg); F-07's byte-swap shim is
+  removed and the task id is used directly as the worktree key.
 - **Journal by path:** `agentos-daemon` returns `rusqlite::Connection` without
   re-exporting rusqlite, and F-07's manifest has no rusqlite dependency; the
   journal therefore opens per append. Cheap at this scale and avoids smuggling

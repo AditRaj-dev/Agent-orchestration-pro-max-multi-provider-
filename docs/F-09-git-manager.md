@@ -32,8 +32,10 @@ io/json errors, plus typed `PushNotApproved` and `Invalid(String)`.
 agentos / <run_id_short> / <task_id_short>
 ```
 
-- Both `<*_short>` are the **first 8 hex characters** of the parsed UUID
-  (simple form, no hyphens).
+- Both `<*_short>` are the **last 8 hex characters** of the parsed UUID
+  (simple form, no hyphens) — the TAIL, because a run's tasks are minted as
+  UUIDv7s in one millisecond burst, so head-derived shorts collide and
+  `git worktree add -b` fails.
 - Both ids **must parse as UUIDs** (`Uuid::parse_str`); anything else is
   rejected with `GitError::Invalid`. This structurally guarantees no
   model-controlled free text can ever reach a ref name — the model never

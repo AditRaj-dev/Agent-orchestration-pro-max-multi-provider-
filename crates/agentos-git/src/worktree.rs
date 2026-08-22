@@ -76,7 +76,8 @@ impl WorktreeManager {
     }
 
     /// Deterministic branch name: exactly `agentos/<run_id_short>/<task_id_short>`
-    /// where both shorts are the first 8 hex characters of the parsed UUIDs.
+    /// where both shorts are the last 8 hex characters of the parsed UUIDs
+    /// (the random leg of a UUIDv7 — heads collide within a mint burst).
     ///
     /// Both ids must parse as UUIDs — this structurally guarantees that no
     /// model-generated free text can enter a ref name (GIT-04).
@@ -168,13 +169,17 @@ impl WorktreeManager {
     }
 }
 
-/// First 8 hex characters of a UUID string, rejecting anything that is not a
+/// Last 8 hex characters of a UUID string, rejecting anything that is not a
 /// UUID (branch names must never carry model-controlled text).
+///
+/// The TAIL, not the head: a run's tasks are minted as UUIDv7s in one burst,
+/// so their leading timestamp bits collide and head-derived branch names
+/// clash in `git worktree add -b`. The tail is the random leg.
 fn short_hex(id: &str, field: &str) -> Result<String, GitError> {
     let parsed = Uuid::parse_str(id)
         .map_err(|e| GitError::Invalid(format!("{field} `{id}` is not a UUID: {e}")))?;
     let hex = parsed.simple().to_string();
-    hex.get(..8)
+    hex.get(hex.len() - 8..)
         .map(str::to_string)
         .ok_or_else(|| GitError::Invalid(format!("{field} `{id}` yielded truncated hex")))
 }
@@ -214,12 +219,25 @@ mod tests {
         let run_id = "0a1b2c3d-1111-2222-3333-444455556666";
         let task_id = "f00dcafe-7777-8888-9999-aaaabbbbcccc";
         let name = WorktreeManager::branch_name(run_id, task_id).expect("branch name");
-        assert_eq!(name, "agentos/0a1b2c3d/f00dcafe");
+        assert_eq!(name, "agentos/55556666/bbbbcccc");
         // three slash-free segments: prefix + two 8-char hex shorts
         let segments: Vec<&str> = name.split('/').collect();
         assert_eq!(segments.len(), 3);
         assert!(segments[1].len() == 8 && segments[1].bytes().all(|b| b.is_ascii_hexdigit()));
         assert!(segments[2].len() == 8 && segments[2].bytes().all(|b| b.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn uuidv7_ids_minted_in_one_burst_get_distinct_branches() {
+        // Same millisecond timestamp, different random tails: the exact
+        // shape `create_run` mints, which head-derived names collided on.
+        let run = "01931f2a-1c00-7000-8000-000000000000";
+        let a = "01931f2a-1c00-7abc-8000-0000deadbeef";
+        let b = "01931f2a-1c00-7abd-8000-0000feedface";
+        assert_ne!(
+            WorktreeManager::branch_name(run, a).expect("a"),
+            WorktreeManager::branch_name(run, b).expect("b")
+        );
     }
 
     #[test]

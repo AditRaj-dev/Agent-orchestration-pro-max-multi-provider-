@@ -27,9 +27,11 @@ fn worktree_create_branch_name_list_remove_round_trip() {
         .create(&run_id, &task_id, &base)
         .expect("create worktree");
 
-    // branch name is EXACTLY agentos/<run8>/<task8>, hex-truncated uuids
-    let run_short = &Uuid::parse_str(&run_id).unwrap().simple().to_string()[..8];
-    let task_short = &Uuid::parse_str(&task_id).unwrap().simple().to_string()[..8];
+    // branch name is EXACTLY agentos/<run8>/<task8>, uuid hex TAILS
+    let run_hex = Uuid::parse_str(&run_id).unwrap().simple().to_string();
+    let task_hex = Uuid::parse_str(&task_id).unwrap().simple().to_string();
+    let run_short = &run_hex[run_hex.len() - 8..];
+    let task_short = &task_hex[task_hex.len() - 8..];
     assert_eq!(worktree.branch, format!("agentos/{run_short}/{task_short}"));
 
     // path lives under <repo>/.agentos-worktrees/<task_id>
