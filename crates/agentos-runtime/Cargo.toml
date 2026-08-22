@@ -1,0 +1,24 @@
+[package]
+name = "agentos-runtime"
+description = "F-07: supervisor — contracts, handoff packets, end-to-end wiring"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+agentos-core = { path = "../agentos-core" }
+agentos-daemon = { path = "../agentos-daemon" }
+agentos-adapters = { path = "../agentos-adapters" }
+agentos-workflow = { path = "../agentos-workflow" }
+agentos-git = { path = "../agentos-git" }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+chrono = { workspace = true }
+async-trait = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

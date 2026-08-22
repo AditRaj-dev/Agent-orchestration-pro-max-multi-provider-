@@ -6,6 +6,9 @@ members = [
     "crates/agentos-adapters",
     "crates/agentos-workflow",
     "crates/agentos-git",
+    "crates/agentos-runtime",
+    "crates/agentos-context",
+    "crates/agentos-policy",
 ]
 
 [workspace.package]
@@ -25,6 +28,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 async-trait = "0.1"
 chrono = { version = "0.4", features = ["serde"] }
 tempfile = "3"
+blake3 = "1"
 
 [profile.release]
 lto = "thin"
