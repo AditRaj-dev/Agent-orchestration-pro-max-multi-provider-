@@ -9,6 +9,7 @@ members = [
     "crates/agentos-runtime",
     "crates/agentos-context",
     "crates/agentos-policy",
+    "crates/agentos-orchestrator",
 ]
 
 [workspace.package]

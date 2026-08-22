@@ -1,17 +1,14 @@
 [package]
-name = "agentos-runtime"
-description = "F-07: supervisor — contracts, handoff packets, end-to-end wiring"
+name = "agentos-orchestrator"
+description = "F-12: master orchestrator — plan commands validated by the workflow engine"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [dependencies]
 agentos-core = { path = "../agentos-core" }
-agentos-daemon = { path = "../agentos-daemon" }
 agentos-adapters = { path = "../agentos-adapters" }
 agentos-workflow = { path = "../agentos-workflow" }
-agentos-git = { path = "../agentos-git" }
-agentos-policy = { path = "../agentos-policy" }
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

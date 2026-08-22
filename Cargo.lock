@@ -78,6 +78,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "agentos-orchestrator"
+version = "0.1.0"
+dependencies = [
+ "agentos-adapters",
+ "agentos-core",
+ "agentos-workflow",
+ "async-trait",
+ "chrono",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "agentos-policy"
 version = "0.1.0"
 dependencies = [
@@ -100,6 +118,7 @@ dependencies = [
  "agentos-core",
  "agentos-daemon",
  "agentos-git",
+ "agentos-policy",
  "agentos-workflow",
  "async-trait",
  "chrono",
