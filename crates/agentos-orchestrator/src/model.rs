@@ -20,17 +20,26 @@
 //! denylist, rendered by F-03 as the equals-form
 //! `--disallowedTools=a,b` (F-00 §4 canon).
 //!
-//! Two honest caveats, both discovered rather than assumed:
+//! Every token in [`ORCHESTRATOR_TOOL_DENYLIST`] is **observed**, not
+//! assumed: `Bash`, `WebFetch` and `WebSearch` from probe T2 (zero tool
+//! uses, graceful exit 0), and the rest read straight out of the installed
+//! CLI's own tool registry (`claude` 2.1.239: the literal array beginning
+//! `["Bash","BashOutput","KillShell","PowerShell","Tmux","Monitor","REPL",
+//! "Read","Edit","MultiEdit","Write","NotebookEdit",...]`, plus its
+//! write-tool set `["Write","Edit","MultiEdit","NotebookEdit"]`). That
+//! matters because an unknown token is a silent no-op, not an error — a
+//! typo would leave the guard wide open while looking correct.
 //!
-//! 1. Only `Bash`, `WebFetch` and `WebSearch` are *observed* to be accepted
-//!    denylist tokens (probe T2: zero tool uses, graceful exit 0). The
-//!    write-tool names in [`ORCHESTRATOR_TOOL_DENYLIST`] are unverified on
-//!    this install and must be smoke-tested on adapter upgrades — an
-//!    unknown token is a silent no-op, not an error.
-//! 2. `SpawnSpec` carries no permission-mode field, so F-03 pins
-//!    `acceptEdits`. The orchestrator therefore cannot request claude's
-//!    plan mode through the trait; the denylist is the whole guard. Both
-//!    are recorded as seams in `docs/F-12-orchestrator.md`.
+//! The registry also showed the guard was too *narrow*: denying `Bash`
+//! alone leaves `PowerShell`, `Tmux` and `REPL`, and denying the write
+//! tools leaves delegation (`Agent`, `Task`, `TaskCreate`, `Skill`,
+//! `Workflow`) through which a subagent writes whatever it likes. All are
+//! denied now. Re-run [`verify_denylist_tokens`] on adapter/CLI upgrades.
+//!
+//! One caveat remains: `SpawnSpec` carries no permission-mode field, so
+//! F-03 pins `acceptEdits`. The orchestrator cannot request claude's plan
+//! mode through the trait; the denylist is the whole guard. Recorded as a
+//! seam in `docs/F-12-orchestrator.md`.
 //!
 //! No test in this crate makes a billable call. The only live invocation is
 //! an `#[ignore]`d probe gated behind `AGENTOS_ORCHESTRATOR_E2E=1`, mirroring
@@ -58,16 +67,48 @@ pub const ORCHESTRATOR_E2E_ENV: &str = "AGENTOS_ORCHESTRATOR_E2E";
 pub const DEFAULT_PLANNING_TIMEOUT_SECS: u64 = 300;
 
 /// Tools denied to the orchestrator session so it commands rather than
-/// codes. See the module docs for which tokens are observed-verified.
-pub const ORCHESTRATOR_TOOL_DENYLIST: [&str; 7] = [
-    "Bash",         // T2-verified token
-    "WebFetch",     // T2-verified token
-    "WebSearch",    // T2-verified token
-    "Write",        // unverified token name — smoke-test on upgrades
-    "Edit",         // unverified token name
-    "MultiEdit",    // unverified token name
-    "NotebookEdit", // unverified token name
+/// codes. Every token is verified against the installed CLI's tool registry
+/// (see the module docs); an unrecognized token would silently do nothing.
+pub const ORCHESTRATOR_TOOL_DENYLIST: [&str; 17] = [
+    // Shells — every one of them executes arbitrary code.
+    "Bash",
+    "BashOutput",
+    "KillShell",
+    "PowerShell",
+    "Tmux",
+    "REPL",
+    // The CLI's own write-tool set.
+    "Write",
+    "Edit",
+    "MultiEdit",
+    "NotebookEdit",
+    // Delegation: a subagent inherits none of this denylist, so an
+    // orchestrator that can spawn one can write code through it.
+    "Agent",
+    "Task",
+    "TaskCreate",
+    "Skill",
+    "Workflow",
+    // Network reach (T2-verified).
+    "WebFetch",
+    "WebSearch",
 ];
+
+/// Tool tokens the orchestrator must never hold, as observed in the CLI
+/// registry. Kept separate from the denylist so a token that disappears
+/// from a future CLI can be spotted rather than silently no-op'd.
+///
+/// This is the upgrade smoke test: point it at the installed binary and it
+/// reports any denied token the CLI no longer knows about. It reads the
+/// file only — no session, no billable call.
+pub fn verify_denylist_tokens(cli_path: &std::path::Path) -> std::io::Result<Vec<&'static str>> {
+    let bytes = std::fs::read(cli_path)?;
+    let haystack = String::from_utf8_lossy(&bytes);
+    Ok(ORCHESTRATOR_TOOL_DENYLIST
+        .into_iter()
+        .filter(|token| !haystack.contains(&format!("\"{token}\"")))
+        .collect())
+}
 
 /// What one planning turn produced.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -314,7 +355,21 @@ mod tests {
         assert_eq!(spec.model.as_deref(), Some("claude-opus-5"));
         assert_eq!(spec.objective, "plan this");
         assert!(spec.tool_allowlist.is_empty());
-        for tool in ["Bash", "WebFetch", "WebSearch", "Write", "Edit"] {
+        for tool in [
+            "Bash",
+            "PowerShell",
+            "Tmux",
+            "REPL",
+            "WebFetch",
+            "WebSearch",
+            "Write",
+            "Edit",
+            "MultiEdit",
+            "NotebookEdit",
+            "Agent",
+            "Task",
+            "Skill",
+        ] {
             assert!(
                 spec.tool_denylist.iter().any(|denied| denied == tool),
                 "{tool} must be denied to the orchestrator"
@@ -333,14 +388,47 @@ mod tests {
             .iter()
             .find(|arg| arg.starts_with("--disallowedTools="))
             .expect("denylist flag rendered in equals form");
+        assert!(denylist.contains("Bash,BashOutput,KillShell"), "{denylist}");
         assert!(
-            denylist.contains("Bash,WebFetch,WebSearch,Write"),
+            denylist.contains("Write,Edit,MultiEdit,NotebookEdit"),
             "{denylist}"
         );
         assert!(args.contains(&"--model".to_owned()));
         assert!(args.contains(&"claude-opus-5".to_owned()));
         // Prompt is NOT an argv element (stdin delivery, T3 canon).
         assert!(!args.iter().any(|arg| arg == "plan this"));
+    }
+
+    /// The upgrade smoke test, run against a real CLI binary when
+    /// `AGENTOS_CLAUDE_CLI` points at one. Reads the file; never spawns a
+    /// session, never bills. A token the CLI no longer knows about would
+    /// silently stop denying anything, so this fails loudly instead.
+    #[test]
+    fn every_denied_token_exists_in_the_installed_cli_registry() {
+        let Ok(path) = std::env::var("AGENTOS_CLAUDE_CLI") else {
+            eprintln!("AGENTOS_CLAUDE_CLI unset; skipping CLI registry check");
+            return;
+        };
+        let missing =
+            verify_denylist_tokens(std::path::Path::new(&path)).expect("read the cli binary");
+        assert!(
+            missing.is_empty(),
+            "tokens the installed CLI does not know (they would silently no-op): {missing:?}"
+        );
+    }
+
+    #[test]
+    fn the_denylist_covers_every_write_path_the_cli_exposes() {
+        // Shells, file writes and delegation: each is a way to author code.
+        for token in ["Bash", "PowerShell", "Tmux", "REPL"] {
+            assert!(ORCHESTRATOR_TOOL_DENYLIST.contains(&token), "{token}");
+        }
+        for token in ["Write", "Edit", "MultiEdit", "NotebookEdit"] {
+            assert!(ORCHESTRATOR_TOOL_DENYLIST.contains(&token), "{token}");
+        }
+        for token in ["Agent", "Task", "TaskCreate", "Skill", "Workflow"] {
+            assert!(ORCHESTRATOR_TOOL_DENYLIST.contains(&token), "{token}");
+        }
     }
 
     #[test]

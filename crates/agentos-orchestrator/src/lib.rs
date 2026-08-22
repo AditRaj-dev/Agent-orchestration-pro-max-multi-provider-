@@ -114,8 +114,8 @@ pub mod snapshot;
 
 pub use error::{OrchestratorError, Rejection, RejectionReason};
 pub use model::{
-    ClaudePlanningModel, ModelResponse, PlanningModel, ScriptedPlanningModel, ORCHESTRATOR_E2E_ENV,
-    ORCHESTRATOR_MODEL, ORCHESTRATOR_TOOL_DENYLIST,
+    verify_denylist_tokens, ClaudePlanningModel, ModelResponse, PlanningModel,
+    ScriptedPlanningModel, ORCHESTRATOR_E2E_ENV, ORCHESTRATOR_MODEL, ORCHESTRATOR_TOOL_DENYLIST,
 };
 pub use operation::{
     AddDependency, AssignPool, CloseGoal, CreateTask, Escalate, Escalation, EscalationTarget,
