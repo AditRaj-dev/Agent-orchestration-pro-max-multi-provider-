@@ -24,14 +24,17 @@
 //!   journal (F-00 §3 event rules: append-only, run_id + trace_id on every
 //!   event, large payloads offloaded to content-addressed artifacts that the
 //!   event references by `payload_ref` + `payload_hash`).
+//! - [`policy`]: the F-10 wiring — fingerprint-bound approval gates
+//!   (`GitGate` and `HumanApproval` nodes), permission compilation into
+//!   adapter `SpawnConstraints`, and the policy audit trail. Every path
+//!   fails closed.
 //! - [`digest`]: a dependency-free SHA-256 used for the content addressing
 //!   of handoff artifacts.
 //!
 //! Seams deliberately left open (see `docs/F-07-runtime-supervisor.md`):
-//! the git-gate approval plumbing arrives with F-10 (F-07 enqueues with
-//! `approved = true`), the deterministic stub reviewer stands in for the real
-//! reviewer pool, and cross-stage ownership holds (until commit rather than
-//! per attempt) land with the same PR.
+//! the deterministic stub reviewer stands in for the real reviewer pool, and
+//! cross-stage ownership holds (until commit rather than per attempt) land
+//! with the orchestrator PR.
 
 #![forbid(unsafe_code)]
 
@@ -39,6 +42,7 @@ pub mod contract;
 pub mod digest;
 pub mod error;
 pub mod handoff;
+pub mod policy;
 pub mod supervisor;
 pub mod usage_ledger;
 
@@ -48,5 +52,15 @@ pub use error::RuntimeError;
 pub use handoff::{
     ArtifactRef, HandoffPacket, HandoffRule, HandoffStatus, RequestedAction, TestReport, TestStatus,
 };
+pub use policy::{
+    compile_constraints, derive_permissions, GateVerdict, PolicyGate, OP_KIND_GIT, OP_KIND_HUMAN,
+};
 pub use supervisor::{DriveSummary, Supervisor, SupervisorConfig};
+
+// The F-10 vocabulary the supervisor's gate API speaks, re-exported so
+// embedders (and tests) resolve one gate/decision type, not two.
+pub use agentos_policy::{
+    ApprovalDecision, ApprovalRequest, ApprovalStatus, ApprovalStore, AuditStore, Gate, GitAction,
+    PermissionSet, PolicyDenial, SpawnConstraints,
+};
 pub use usage_ledger::{BudgetStatus, ModelUsage, TaskUsage, UsageLedger};

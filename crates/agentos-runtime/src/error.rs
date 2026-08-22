@@ -23,6 +23,34 @@ pub enum RuntimeError {
     /// A shared core failure (journal/storage SQLITE_BUSY, serialization).
     #[error("core error: {0}")]
     Core(#[from] agentos_core::CoreError),
+    /// A policy-engine failure (approval/audit store). Retryability rides
+    /// the wrapped [`agentos_core::CoreError::SqliteBusy`]; a policy error
+    /// never authorizes anything.
+    #[error("policy error: {0}")]
+    Policy(#[from] agentos_policy::PolicyError),
+    /// A policy gate refused an operation (permission missing, or no live
+    /// approval bound to the exact operation). Deterministic — retrying
+    /// without a permission/approval change yields the same denial.
+    #[error("policy denial: {0}")]
+    PolicyDenied(#[from] agentos_policy::PolicyDenial),
+    /// Compiling the task's permission set into adapter constraints refused
+    /// the spawn: the contract and the permission set disagree.
+    #[error("policy refused to spawn contract `{contract}`: {reason}")]
+    PolicyRefusedSpawn {
+        /// Contract id that was refused.
+        contract: String,
+        /// Which fail-closed rule refused it.
+        reason: String,
+    },
+    /// The named node is not a gate node, so it carries no approvable
+    /// operation.
+    #[error("node `{node}` of run {run_id} is not a gate node")]
+    NotAGate {
+        /// The node that was asked for a gate operation.
+        node: String,
+        /// The run the node belongs to.
+        run_id: uuid::Uuid,
+    },
     /// An ownership-map conflict or invalid hold.
     #[error("ownership error: {0}")]
     Ownership(#[from] agentos_git::ownership::OwnershipError),

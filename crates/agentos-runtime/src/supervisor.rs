@@ -35,12 +35,21 @@
 //! - **Review nodes** — a deterministic stub reviewer (the real reviewer
 //!   pool lands in a later PR): approve iff every dependency packet has no
 //!   unresolved items, non-empty test evidence, and no failed test.
-//! - **GitGate nodes** — enqueue a `Commit` mutation on the serialized
-//!   queue with `approved = true` (the approval plumbing is F-10's seam),
-//!   act as the single consumer, run the stale-base gate, commit the run's
-//!   audit bundle on the gate branch, record the agent-ledger attribution
-//!   (sha -> task/agent/reviewers/context versions/workflow, GIT-03) and
-//!   emit `git.queued` + `git.committed`.
+//! - **GitGate nodes** — authorize the mutation against F-10 first
+//!   (`git_gate_check` for the gate role's git permission plus a live,
+//!   fingerprint-bound human approval; nothing is created before that
+//!   verdict), enqueue a `Commit` mutation on the serialized queue carrying
+//!   that verdict, act as the single consumer, run the stale-base gate,
+//!   commit the run's audit bundle on the gate branch, record the
+//!   agent-ledger attribution (sha -> task/agent/reviewers/context
+//!   versions/workflow, GIT-03) and emit `git.queued` + `git.committed`.
+//! - **HumanApproval nodes** — resolved against the F-10 approval store,
+//!   never self-approved: a pending decision is a bounded wait (transient
+//!   requeue), a refusal/expiry/mutation is a deterministic failure.
+//! - **Policy at spawn** — the task's `PermissionSet` (role mapping, else
+//!   derived from the leased contract) is compiled into `SpawnConstraints`
+//!   and carried into the `SpawnSpec`; a permission set that cannot cover
+//!   the contract refuses the spawn.
 //! - **Recovery** — leases live in the durable task store; on supervisor
 //!   restart, tasks stuck `Leased`/`Running` whose adapter sessions are
 //!   gone are reclaimed by the engine's expired-lease path (phase 1 of its
@@ -63,6 +72,10 @@ use agentos_git::ledger::{AgentLedger, LedgerEntry};
 use agentos_git::ownership::OwnershipMap;
 use agentos_git::queue::{MutationAction, MutationQueue};
 use agentos_git::worktree::{WorktreeManager, WorktreeRef};
+use agentos_policy::{
+    git_gate_check, ApprovalRequest, ApprovalStore, AuditStore, Gate, GitAction, PermissionSet,
+    PolicyDenial,
+};
 use agentos_workflow::{
     NodeType, Outcome, RunStatus, Scheduler, TaskExecutor, TaskRecord, TaskStore, TickReport,
     WorkflowEngine, WorkflowSpec, DEFAULT_LEASE_TTL,
@@ -77,6 +90,7 @@ use crate::contract::{GitPolicy, TaskContract};
 use crate::digest::sha256_hex;
 use crate::error::RuntimeError;
 use crate::handoff::{HandoffPacket, TestStatus};
+use crate::policy::{self, GateVerdict, PolicyGate};
 use crate::usage_ledger::UsageLedger;
 
 /// Identity of the deterministic stand-in reviewer (the real reviewer pool
@@ -95,9 +109,24 @@ const EVT_TASK_FAILED: &str = "task.failed";
 const EVT_HANDOFF_REJECTED: &str = "handoff.rejected";
 const EVT_OWNERSHIP_CONFLICT: &str = "ownership.conflict";
 const EVT_APPROVAL_REQUIRED: &str = "approval.required";
+const EVT_APPROVAL_GRANTED: &str = "approval.granted";
+const EVT_APPROVAL_DENIED: &str = "approval.denied";
+const EVT_POLICY_DENIED: &str = "policy.denied";
 const EVT_GIT_GATE_FAILED: &str = "git.gate_failed";
 const EVT_GIT_STALE_BASE: &str = "git.stale_base";
 const EVT_RUN_FAILED: &str = "run.failed";
+
+/// The git action every gate node requests today. The gate commits the run's
+/// audit bundle on its own branch; merge/rebase/push travel the same code
+/// path once the integration policy lands (the queue already gates push).
+const GATE_GIT_ACTION: GitAction = GitAction::Commit;
+/// The mutation the gate enqueues, paired with [`GATE_GIT_ACTION`].
+const GATE_MUTATION: MutationAction = MutationAction::Commit;
+/// The approval gate a git mutation is bound to. F-10's [`Gate`] set carries
+/// exactly one git gate; the *action* lives in the operation payload, so a
+/// commit approval and a push approval have different fingerprints and never
+/// transfer (see the F-doc's integration notes).
+const GIT_MUTATION_GATE: Gate = Gate::GitPush;
 
 /// Where the supervisor keeps its durable run state (manifests, handoffs,
 /// content-addressed artifacts) and the four databases it composes.
@@ -113,6 +142,11 @@ pub struct SupervisorConfig {
     pub queue_db: PathBuf,
     /// Agent (commit attribution) ledger.
     pub ledger_db: PathBuf,
+    /// Human approval store (F-10 SEC-04): gates are resolved here, never
+    /// in prompt text.
+    pub approvals_db: PathBuf,
+    /// Append-only policy audit log (F-10 SEC-05).
+    pub audit_db: PathBuf,
     /// Main checkout of the governed repository (worktrees hang off it).
     pub repo: PathBuf,
     /// Orchestrator identity stamped into ledger attribution.
@@ -122,6 +156,23 @@ pub struct SupervisorConfig {
     pub default_adapter: String,
     /// `agent_role` -> adapter id routing table.
     pub role_adapters: HashMap<String, String>,
+    /// `agent_role` -> permission set (F-10 SEC-01). Roles without an entry
+    /// — and nodes that declare no role — execute under a set *derived from
+    /// the leased contract* ([`crate::policy::derive_permissions`]), which
+    /// is the least-privilege default.
+    pub role_permissions: HashMap<String, PermissionSet>,
+    /// The permission set the git gate itself acts under. Default:
+    /// [`PermissionSet::git_manager`] — the only role holding git actions
+    /// (GIT-01). Narrow it to prove PRD §23.3: a gate without `Commit`
+    /// cannot commit even with a live approval.
+    pub git_gate_permissions: PermissionSet,
+    /// Gate a `HumanApproval` node resolves against. F-10's gate set has no
+    /// generic "human decision" member; `ProdAction` is the closest
+    /// (irreversible action requiring a human) and is configurable here.
+    pub human_approval_gate: Gate,
+    /// Approval ttl used when the acting permission set declares no
+    /// `ApprovalRule` for the gate.
+    pub approval_ttl_secs: u64,
     /// Lease ttl the supervisor's engine grants.
     pub lease_ttl: Duration,
 }
@@ -137,11 +188,17 @@ impl SupervisorConfig {
             workflow_db: state_dir.join("workflow.db"),
             queue_db: state_dir.join("queue.db"),
             ledger_db: state_dir.join("ledger.db"),
+            approvals_db: state_dir.join("approvals.db"),
+            audit_db: state_dir.join("audit.db"),
             state_dir,
             repo: repo.into(),
             orchestrator: "agentos-supervisor".to_owned(),
             default_adapter: "mock".to_owned(),
             role_adapters: HashMap::new(),
+            role_permissions: HashMap::new(),
+            git_gate_permissions: PermissionSet::git_manager(),
+            human_approval_gate: Gate::ProdAction,
+            approval_ttl_secs: 900,
             lease_ttl: DEFAULT_LEASE_TTL,
         }
     }
@@ -150,6 +207,19 @@ impl SupervisorConfig {
     pub fn with_role_adapter(mut self, role: &str, adapter_id: &str) -> Self {
         self.role_adapters
             .insert(role.to_owned(), adapter_id.to_owned());
+        self
+    }
+
+    /// Bind `agent_role` to an explicit permission set (overrides the
+    /// contract-derived default for nodes carrying that role).
+    pub fn with_role_permissions(mut self, role: &str, permissions: PermissionSet) -> Self {
+        self.role_permissions.insert(role.to_owned(), permissions);
+        self
+    }
+
+    /// Replace the permission set the git gate acts under.
+    pub fn with_git_gate_permissions(mut self, permissions: PermissionSet) -> Self {
+        self.git_gate_permissions = permissions;
         self
     }
 }
@@ -235,6 +305,7 @@ struct SupervisorCore {
     agent_ledger: Arc<AgentLedger>,
     ownership: OwnershipMap,
     ledger: UsageLedger,
+    policy: PolicyGate,
     manifests: Mutex<HashMap<Uuid, RunManifest>>,
     handoffs: Mutex<HashMap<Uuid, HandoffPacket>>,
 }
@@ -284,6 +355,118 @@ impl SupervisorCore {
                 role: role.unwrap_or_default().to_owned(),
                 default: wanted,
             })
+    }
+
+    /// The permission set a task executes under: the role mapping when the
+    /// node declares a mapped `agent_role`, else the set derived from the
+    /// leased contract snapshot (least privilege by default).
+    fn permissions_for(&self, task: &TaskRecord, contract: &TaskContract) -> PermissionSet {
+        task.node
+            .agent_role
+            .as_deref()
+            .and_then(|role| self.config.role_permissions.get(role))
+            .cloned()
+            .unwrap_or_else(|| policy::derive_permissions(contract))
+    }
+
+    /// The approval ttl for `gate` under `perms`: the set's own
+    /// `ApprovalRule` when it declares one, else the configured fallback.
+    fn approval_ttl(&self, perms: &PermissionSet, gate: Gate) -> u64 {
+        perms
+            .approval_rule(gate)
+            .map(|rule| rule.ttl_secs)
+            .unwrap_or(self.config.approval_ttl_secs)
+    }
+
+    /// The gate + canonical operation payload of a gate node. Pure function
+    /// of durable state, so a human can approve *before* the node runs and
+    /// the gate recomputes the identical fingerprint when it executes.
+    fn gate_operation(
+        &self,
+        task: &TaskRecord,
+        manifest: &RunManifest,
+        contract: &TaskContract,
+    ) -> Result<(Gate, Value), RuntimeError> {
+        match task.node.node_type {
+            NodeType::GitGate => Ok((
+                GIT_MUTATION_GATE,
+                policy::git_mutation_operation(
+                    &task.run_id,
+                    &task.id,
+                    &task.node_id,
+                    &manifest.workflow_id,
+                    &self.config.repo,
+                    GATE_MUTATION.as_str(),
+                    &contract.base_commit,
+                ),
+            )),
+            NodeType::HumanApproval => Ok((
+                self.config.human_approval_gate,
+                policy::human_approval_operation(
+                    &task.run_id,
+                    &task.id,
+                    &task.node_id,
+                    &manifest.workflow_id,
+                    contract,
+                ),
+            )),
+            _ => Err(RuntimeError::NotAGate {
+                node: task.node_id.clone(),
+                run_id: task.run_id,
+            }),
+        }
+    }
+
+    /// Open a human approval request for a gate node's operation, track it
+    /// against the task, audit it, and journal `approval.required` so the
+    /// pending decision is discoverable instead of silently lost.
+    fn open_gate_request(
+        &self,
+        task: &TaskRecord,
+        manifest: &RunManifest,
+        gate: Gate,
+        operation: &Value,
+        perms: &PermissionSet,
+        requested_by: &str,
+    ) -> Result<ApprovalRequest, RuntimeError> {
+        let ttl = self.approval_ttl(perms, gate);
+        let request = self
+            .policy
+            .request(gate, operation, &task.id, requested_by, ttl)?;
+        self.audit_or_log(
+            task,
+            self.policy.audit().record_approval(
+                requested_by,
+                &request,
+                None,
+                Some(&task.run_id.to_string()),
+            ),
+        );
+        self.emit_for(
+            task,
+            manifest,
+            EventType::Other(EVT_APPROVAL_REQUIRED.to_owned()),
+            Some(requested_by),
+            json!({
+                "node": task.node_id,
+                "gate": gate.as_str(),
+                "requestId": request.id,
+                "operationFingerprint": request.operation_fingerprint,
+                "expiresAt": request.expires_at.to_rfc3339(),
+                "blocking": true,
+            }),
+        );
+        Ok(request)
+    }
+
+    /// Record an audit row, logging (never failing the task) when the audit
+    /// store itself is unavailable — the decision has already been made and
+    /// journaled; a missing audit row must not turn a denial into an
+    /// approval.
+    fn audit_or_log(&self, task: &TaskRecord, result: Result<String, agentos_policy::PolicyError>) {
+        if let Err(error) = result {
+            tracing::error!(task_id = %task.id, %error, "policy audit append failed");
+        }
     }
 
     /// Fire-and-forget event for a task context (journal failures are
@@ -560,18 +743,9 @@ impl TaskExecutor for SupervisorExecutor {
                     "joined": task.node.depends_on,
                 }),
             },
-            // F-07 has no human-approval plumbing (that is F-10's seam): a
-            // human gate fails loudly instead of silently self-approving.
-            NodeType::HumanApproval => {
-                self.core.emit_for(
-                    task,
-                    &manifest,
-                    EventType::Other(EVT_APPROVAL_REQUIRED.to_owned()),
-                    None,
-                    json!({"node": task.node_id, "blocking": true}),
-                );
-                Outcome::ReasoningFailure
-            }
+            // Resolved against the F-10 approval store — the supervisor
+            // never self-approves.
+            NodeType::HumanApproval => self.run_human_approval(task, &manifest, &contract).await,
         }
     }
 }
@@ -662,21 +836,58 @@ impl SupervisorExecutor {
             }
         };
 
+        // SEC-01: the task's permission set is *compiled* into the four
+        // policy-bearing SpawnSpec fields — the adapter's flags/sandbox come
+        // from policy, never from prompt text. A permission set that cannot
+        // cover the contract refuses the spawn (fail closed) rather than
+        // silently running with narrower or wider access.
+        let permissions = self.core.permissions_for(task, contract);
+        let constraints = match policy::compile_constraints(&permissions, &worktree.path, contract)
+        {
+            Ok(constraints) => constraints,
+            Err(error) => {
+                self.core.audit_or_log(
+                    task,
+                    self.core.policy.audit().append(agentos_policy::AuditEntry {
+                        actor: adapter.id().to_owned(),
+                        action_kind: "permission.denied".to_owned(),
+                        resource: format!("spawn:{}", contract.id),
+                        details: json!({"node": task.node_id, "reason": error.to_string()}),
+                        run_id: Some(task.run_id.to_string()),
+                    }),
+                );
+                self.core.emit_for(
+                    task,
+                    manifest,
+                    EventType::Other(EVT_POLICY_DENIED.to_owned()),
+                    Some(adapter.id()),
+                    json!({"node": task.node_id, "stage": "compile",
+                               "error": error.to_string()}),
+                );
+                return Outcome::ReasoningFailure;
+            }
+        };
+
+        // The git policy's direct-git denials ride on top of the compiled
+        // denylist (deny beats allow, F-10 §2).
+        let mut tool_denylist = constraints.tool_denylist.clone();
+        if contract.git_policy == GitPolicy::NoDirectGit {
+            for tool in ["Bash(git commit:*)", "Bash(git push:*)"] {
+                if !tool_denylist.iter().any(|denied| denied == tool) {
+                    tool_denylist.push(tool.to_owned());
+                }
+            }
+        }
+
         let timeout_secs = session_timeout(task, contract);
         let spec = SpawnSpec {
             task_id: task.id,
             objective: contract.objective.clone(),
             workspace: worktree.path.clone(),
-            allowed_paths: contract.allowed_paths.clone(),
-            forbidden_paths: contract.forbidden_paths.clone(),
-            tool_allowlist: Vec::new(),
-            tool_denylist: match contract.git_policy {
-                GitPolicy::NoDirectGit => vec![
-                    "Bash(git commit:*)".to_owned(),
-                    "Bash(git push:*)".to_owned(),
-                ],
-                GitPolicy::DirectAllowed => Vec::new(),
-            },
+            allowed_paths: constraints.allowed_paths.clone(),
+            forbidden_paths: constraints.forbidden_paths.clone(),
+            tool_allowlist: constraints.tool_allowlist.clone(),
+            tool_denylist: tool_denylist.clone(),
             model: None,
             timeout_secs,
             isolated_home: None,
@@ -692,6 +903,10 @@ impl SupervisorExecutor {
                 "workspace": worktree.path.display().to_string(),
                 "branch": worktree.branch,
                 "timeoutSecs": timeout_secs,
+                "allowedPaths": constraints.allowed_paths,
+                "forbiddenPaths": constraints.forbidden_paths,
+                "toolAllowlist": constraints.tool_allowlist,
+                "toolDenylist": tool_denylist,
             }),
         );
 
@@ -956,10 +1171,254 @@ impl SupervisorExecutor {
         }
     }
 
-    /// The git gate: enqueue a Commit mutation (approval plumbing is F-10's
-    /// seam, hence `approved = true` here), consume it as the single
-    /// consumer, commit the run's audit bundle, attribute the commit in the
-    /// agent ledger.
+    /// A `HumanApproval` node: resolved against the F-10 approval store,
+    /// never self-approved.
+    ///
+    /// Lifecycle mapping (no new task states — the engine's existing
+    /// vocabulary carries it): a decision still pending is a
+    /// `TransientFailure`, so the engine walks the task
+    /// `Running -> Retryable -> Ready` and re-leases it while transient
+    /// retries remain (a bounded wait); when they run out the task fails
+    /// terminally. A refusal (denied, expired, or an approval bound to a
+    /// mutated operation) is a `ReasoningFailure` — deterministic, since
+    /// retrying changes nothing.
+    async fn run_human_approval(
+        &self,
+        task: &TaskRecord,
+        manifest: &RunManifest,
+        contract: &TaskContract,
+    ) -> Outcome {
+        let actor = format!("{}/human-gate", self.core.config.orchestrator);
+        let (gate, operation) = match self.core.gate_operation(task, manifest, contract) {
+            Ok(pair) => pair,
+            Err(error) => {
+                tracing::error!(node = %task.node_id, %error, "human gate has no operation");
+                return Outcome::ReasoningFailure;
+            }
+        };
+        let permissions = self.core.permissions_for(task, contract);
+        let run_id = task.run_id.to_string();
+
+        let verdict = match self.core.policy.evaluate(gate, &operation, &task.id) {
+            Ok(verdict) => verdict,
+            Err(error) => {
+                // The store could not answer: wait and retry — an
+                // unavailable approval store never means "approved".
+                self.core.emit_for(
+                    task,
+                    manifest,
+                    EventType::Other(EVT_POLICY_DENIED.to_owned()),
+                    Some(actor.as_str()),
+                    json!({"node": task.node_id, "gate": gate.as_str(),
+                           "stage": "approval-store", "error": error.to_string()}),
+                );
+                return Outcome::TransientFailure;
+            }
+        };
+
+        match &verdict {
+            GateVerdict::Approved { fingerprint } => {
+                self.core.audit_or_log(
+                    task,
+                    self.core.policy.audit().append(agentos_policy::AuditEntry {
+                        actor: actor.clone(),
+                        action_kind: "approval.resolved".to_owned(),
+                        resource: task.node_id.clone(),
+                        details: json!({
+                            "gate": gate.as_str(),
+                            "operationFingerprint": fingerprint,
+                            "decision": "approved",
+                        }),
+                        run_id: Some(run_id),
+                    }),
+                );
+                self.core.emit_for(
+                    task,
+                    manifest,
+                    EventType::Other(EVT_APPROVAL_GRANTED.to_owned()),
+                    Some(actor.as_str()),
+                    json!({"node": task.node_id, "gate": gate.as_str(),
+                           "operationFingerprint": fingerprint}),
+                );
+                Outcome::Success {
+                    packet: json!({
+                        "node": task.node_id,
+                        "gate": gate.as_str(),
+                        "approved": true,
+                        "operationFingerprint": fingerprint,
+                    }),
+                }
+            }
+            // No request covers this exact operation (never asked, or the
+            // operation changed after the last one): ask now, then wait.
+            GateVerdict::Missing | GateVerdict::Mutated { .. } => {
+                if let Err(error) = self.core.open_gate_request(
+                    task,
+                    manifest,
+                    gate,
+                    &operation,
+                    &permissions,
+                    &actor,
+                ) {
+                    tracing::error!(task_id = %task.id, %error, "approval request failed");
+                }
+                Outcome::TransientFailure
+            }
+            GateVerdict::Pending { request_id } => {
+                self.core.emit_for(
+                    task,
+                    manifest,
+                    EventType::Other(EVT_APPROVAL_REQUIRED.to_owned()),
+                    Some(actor.as_str()),
+                    json!({"node": task.node_id, "gate": gate.as_str(),
+                           "requestId": request_id, "blocking": true, "waiting": true}),
+                );
+                Outcome::TransientFailure
+            }
+            GateVerdict::Denied { .. } | GateVerdict::Expired { .. } => {
+                let denial = PolicyDenial::ApprovalRequired { gate };
+                self.core.audit_or_log(
+                    task,
+                    self.core.policy.audit().record_permission_denial(
+                        &actor,
+                        &task.node_id,
+                        &denial,
+                        Some(&run_id),
+                    ),
+                );
+                self.core.emit_for(
+                    task,
+                    manifest,
+                    EventType::Other(EVT_APPROVAL_DENIED.to_owned()),
+                    Some(actor.as_str()),
+                    json!({
+                        "node": task.node_id,
+                        "gate": gate.as_str(),
+                        "requestId": verdict.request_id(),
+                        "reason": verdict.reason(),
+                        "error": RuntimeError::from(denial).to_string(),
+                    }),
+                );
+                Outcome::ReasoningFailure
+            }
+        }
+    }
+
+    /// PRD §23.3 in code: a git mutation is authorized only when the gate
+    /// role **holds** the git action *and* a live human approval is bound to
+    /// this exact mutation.
+    ///
+    /// `git_gate_check` supplies the first leg (permission trumps approval —
+    /// a role without the action is denied even with a live approval) and
+    /// push's approval leg; the supervisor tightens the second leg to
+    /// **every** queued mutation, because everything this gate enqueues
+    /// lands in the governed repository. Returns `Ok(false)` when policy
+    /// refused (already journaled + audited); `Err` only for store failures.
+    fn authorize_git_mutation(
+        &self,
+        task: &TaskRecord,
+        manifest: &RunManifest,
+        contract: &TaskContract,
+        actor: &str,
+    ) -> Result<bool, RuntimeError> {
+        let (gate, operation) = self.core.gate_operation(task, manifest, contract)?;
+        let permissions = self.core.config.git_gate_permissions.clone();
+        let run_id = task.run_id.to_string();
+        let verdict = self.core.policy.evaluate(gate, &operation, &task.id)?;
+        let approved = verdict.is_approved();
+
+        let denial = git_gate_check(&permissions, GATE_GIT_ACTION, approved)
+            .err()
+            .or_else(|| (!approved).then_some(PolicyDenial::ApprovalRequired { gate }));
+
+        let Some(denial) = denial else {
+            self.core.audit_or_log(
+                task,
+                self.core.policy.audit().record_git_gate(
+                    actor,
+                    GATE_GIT_ACTION,
+                    true,
+                    verdict.reason(),
+                    Some(&run_id),
+                ),
+            );
+            self.core.emit_for(
+                task,
+                manifest,
+                EventType::Other(EVT_APPROVAL_GRANTED.to_owned()),
+                Some(actor),
+                json!({
+                    "node": task.node_id,
+                    "gate": gate.as_str(),
+                    "action": GATE_GIT_ACTION.as_str(),
+                    "operationFingerprint": agentos_policy::operation_fingerprint(&operation),
+                }),
+            );
+            return Ok(true);
+        };
+
+        // Surface a decision a human can act on when none covers this exact
+        // mutation. A missing *permission* is not an approval question, so
+        // no request is opened for it.
+        if matches!(denial, PolicyDenial::ApprovalRequired { .. })
+            && matches!(verdict, GateVerdict::Missing | GateVerdict::Mutated { .. })
+        {
+            if let Err(error) =
+                self.core
+                    .open_gate_request(task, manifest, gate, &operation, &permissions, actor)
+            {
+                tracing::error!(task_id = %task.id, %error, "approval request failed");
+            }
+        }
+
+        self.core.audit_or_log(
+            task,
+            self.core.policy.audit().record_permission_denial(
+                actor,
+                &format!("git:{}", GATE_GIT_ACTION.as_str()),
+                &denial,
+                Some(&run_id),
+            ),
+        );
+        self.core.audit_or_log(
+            task,
+            self.core.policy.audit().record_git_gate(
+                actor,
+                GATE_GIT_ACTION,
+                false,
+                verdict.reason(),
+                Some(&run_id),
+            ),
+        );
+        self.core.emit_for(
+            task,
+            manifest,
+            EventType::Other(EVT_POLICY_DENIED.to_owned()),
+            Some(actor),
+            json!({
+                "node": task.node_id,
+                "gate": gate.as_str(),
+                "action": GATE_GIT_ACTION.as_str(),
+                "reason": verdict.reason(),
+                "requestId": verdict.request_id(),
+                "error": denial.to_string(),
+            }),
+        );
+        self.core.emit_for(
+            task,
+            manifest,
+            EventType::Other(EVT_GIT_GATE_FAILED.to_owned()),
+            Some(actor),
+            json!({"node": task.node_id, "stage": "policy", "error": denial.to_string()}),
+        );
+        Ok(false)
+    }
+
+    /// The git gate: authorize the mutation against F-10 (gate permission +
+    /// a live, fingerprint-bound human approval), then enqueue it on the
+    /// serialized queue with that verdict, consume it as the single
+    /// consumer, commit the run's audit bundle, and attribute the commit in
+    /// the agent ledger.
     async fn run_git_gate(
         &self,
         task: &TaskRecord,
@@ -976,6 +1435,18 @@ impl SupervisorExecutor {
                 json!({"node": task.node_id, "stage": stage, "error": error.to_string()}),
             );
             Outcome::TransientFailure
+        };
+
+        // Authorization happens before ANY side effect: an unauthorized
+        // mutation creates no worktree, no branch, no queue row (PRD §3
+        // "no hidden mutation").
+        let approved = match self.authorize_git_mutation(task, manifest, contract, &gate) {
+            Ok(true) => true,
+            // Policy refused; the denial is journaled and audited. Retrying
+            // without a permission/approval change yields the same denial.
+            Ok(false) => return Outcome::ReasoningFailure,
+            // The approval store itself failed: retry, never assume.
+            Err(error) => return fail(&self.core, "policy", &error),
         };
 
         let repo = self.core.config.repo.clone();
@@ -1000,15 +1471,13 @@ impl SupervisorExecutor {
             return fail(&self.core, "audit-bundle", &error);
         }
 
-        // SEAM (F-10): the approval gate. F-07 enqueues with approved=true —
-        // the commit is already review-approved upstream; push stays
-        // approval-gated inside the queue itself.
+        // `approved` is the policy verdict computed above — never a literal.
         let request_id = match self.core.queue.enqueue(
             &repo,
             &task.id.to_string(),
             &contract.base_commit,
-            MutationAction::Commit,
-            true,
+            GATE_MUTATION,
+            approved,
         ) {
             Ok(request_id) => request_id,
             Err(error) => return fail(&self.core, "enqueue", &error),
@@ -1021,7 +1490,8 @@ impl SupervisorExecutor {
             json!({
                 "node": task.node_id,
                 "requestId": request_id,
-                "action": "commit",
+                "action": GATE_MUTATION.as_str(),
+                "approved": approved,
                 "baseCommit": contract.base_commit,
             }),
         );
@@ -1176,13 +1646,20 @@ impl Supervisor {
         config: SupervisorConfig,
         adapters: Vec<Arc<dyn RuntimeAdapter>>,
     ) -> Result<Self, RuntimeError> {
-        for dir in ["runs", "handoffs", "artifacts"] {
+        for dir in ["runs", "handoffs", "artifacts", "approvals"] {
             std::fs::create_dir_all(config.state_dir.join(dir))?;
         }
         let journal = Journal::open(&config.journal_db)?;
         let store = Arc::new(TaskStore::open(&config.workflow_db)?);
         let queue = Arc::new(MutationQueue::open(&config.queue_db)?);
         let agent_ledger = Arc::new(AgentLedger::open(&config.ledger_db)?);
+        ensure_parent(&config.approvals_db);
+        ensure_parent(&config.audit_db);
+        let policy = PolicyGate::open(
+            &config.approvals_db,
+            &config.audit_db,
+            &config.state_dir.join("approvals"),
+        )?;
         let lease_ttl = config.lease_ttl;
         let core = Arc::new(SupervisorCore {
             worktrees: WorktreeManager::new(config.repo.clone()),
@@ -1193,6 +1670,7 @@ impl Supervisor {
             agent_ledger,
             ownership: OwnershipMap::new(),
             ledger: UsageLedger::new(),
+            policy,
             manifests: Mutex::new(HashMap::new()),
             handoffs: Mutex::new(HashMap::new()),
             config,
@@ -1233,6 +1711,83 @@ impl Supervisor {
     /// The path ownership map.
     pub fn ownership(&self) -> &OwnershipMap {
         &self.core.ownership
+    }
+
+    /// The F-10 approval store. Humans resolve gate requests through it
+    /// (`resolve(request_id, decision)`); the supervisor only ever reads it.
+    pub fn approvals(&self) -> &ApprovalStore {
+        self.core.policy.approvals()
+    }
+
+    /// The F-10 append-only policy audit log (SEC-05 bundles come from
+    /// `export_bundle(Some(run_id))`).
+    pub fn audit(&self) -> &AuditStore {
+        self.core.policy.audit()
+    }
+
+    /// The gate and canonical operation payload a gate node's approval must
+    /// be bound to. Computable as soon as `start_run` has materialized the
+    /// tasks, so a human can approve *before* the node is leased; the gate
+    /// recomputes exactly this value when it executes, and any drift in the
+    /// mutation (base commit, task, action, contract) changes the
+    /// fingerprint and invalidates the approval.
+    pub fn gate_operation(
+        &self,
+        run_id: &Uuid,
+        node_id: &str,
+    ) -> Result<(Gate, Value), RuntimeError> {
+        let (task, manifest, contract) = self.gate_node(run_id, node_id)?;
+        self.core.gate_operation(&task, &manifest, &contract)
+    }
+
+    /// Open a human approval request for a gate node (the machine asks; a
+    /// human resolves it through [`Supervisor::approvals`]). Tracked against
+    /// the task, audited, and journaled as `approval.required`.
+    pub fn request_gate_approval(
+        &self,
+        run_id: &Uuid,
+        node_id: &str,
+        requested_by: &str,
+    ) -> Result<ApprovalRequest, RuntimeError> {
+        let (task, manifest, contract) = self.gate_node(run_id, node_id)?;
+        let (gate, operation) = self.core.gate_operation(&task, &manifest, &contract)?;
+        let permissions = match task.node.node_type {
+            NodeType::GitGate => self.core.config.git_gate_permissions.clone(),
+            _ => self.core.permissions_for(&task, &contract),
+        };
+        self.core.open_gate_request(
+            &task,
+            &manifest,
+            gate,
+            &operation,
+            &permissions,
+            requested_by,
+        )
+    }
+
+    /// Resolve a gate node to its durable task, run manifest and contract
+    /// snapshot.
+    fn gate_node(
+        &self,
+        run_id: &Uuid,
+        node_id: &str,
+    ) -> Result<(TaskRecord, RunManifest, TaskContract), RuntimeError> {
+        let manifest = self.core.manifest(run_id)?;
+        let task = self
+            .store
+            .tasks_for_run(run_id)?
+            .into_iter()
+            .find(|task| task.node_id == node_id)
+            .ok_or_else(|| RuntimeError::NotAGate {
+                node: node_id.to_owned(),
+                run_id: *run_id,
+            })?;
+        let contract = manifest
+            .contracts
+            .get(node_id)
+            .cloned()
+            .ok_or_else(|| RuntimeError::MissingContracts(vec![node_id.to_owned()]))?;
+        Ok((task, manifest, contract))
     }
 
     /// Start a run of `spec`: validate every node's full contract (and

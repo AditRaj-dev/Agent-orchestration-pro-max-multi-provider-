@@ -1,7 +1,8 @@
 //! F-07 end-to-end tests: the full composition (MockAdapter → workflow
-//! engine → git queue → agent ledger → event journal) driven as one loop
-//! against a real temporary git repository, plus failure/retry, budget
-//! escalation, and crash recovery.
+//! engine → policy gate → git queue → agent ledger → event journal) driven
+//! as one loop against a real temporary git repository, plus failure/retry,
+//! budget escalation, crash recovery, and the F-10 policy boundary (PRD
+//! §23.3) exercised through the real mutation queue.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -13,9 +14,11 @@ use agentos_core::{EventType, TaskState};
 use agentos_git::cli;
 use agentos_git::queue::RequestStatus;
 use agentos_runtime::{
-    ContractBudgets, DriveSummary, HandoffPacket, Supervisor, SupervisorConfig, TaskContract,
+    ApprovalDecision, ContractBudgets, DriveSummary, HandoffPacket, PermissionSet, Supervisor,
+    SupervisorConfig, TaskContract,
 };
 use agentos_workflow::{Budgets, NodeSpec, NodeType, RetryPolicy, RunStatus, WorkflowSpec};
+use serde_json::{json, Value};
 use tempfile::TempDir;
 use uuid::Uuid;
 
@@ -130,6 +133,61 @@ fn tasks_by_node(
         .collect()
 }
 
+/// The human half of the F-10 gate: open the request the node's operation is
+/// bound to and approve it. Returns the request id.
+fn approve_gate(supervisor: &Supervisor, run_id: Uuid, node: &str) -> String {
+    let request = supervisor
+        .request_gate_approval(&run_id, node, "user@e2e")
+        .expect("approval request");
+    assert!(
+        supervisor
+            .approvals()
+            .resolve(&request.id, ApprovalDecision::Approved)
+            .expect("resolve"),
+        "a pending request must transition exactly once"
+    );
+    request.id
+}
+
+/// Approve some *other* operation on the same gate — the fingerprint-binding
+/// probe. `mutate` receives the node's real operation payload.
+fn approve_mutated_gate(
+    supervisor: &Supervisor,
+    run_id: Uuid,
+    node: &str,
+    ttl_secs: i64,
+    mutate: impl FnOnce(&mut Value),
+) {
+    let (gate, mut operation) = supervisor
+        .gate_operation(&run_id, node)
+        .expect("gate operation");
+    mutate(&mut operation);
+    let request = supervisor
+        .approvals()
+        .request(
+            gate,
+            &operation,
+            "user@e2e",
+            chrono::Duration::seconds(ttl_secs),
+        )
+        .expect("request");
+    assert!(supervisor
+        .approvals()
+        .resolve(&request.id, ApprovalDecision::Approved)
+        .expect("resolve"));
+}
+
+/// Payload of the first event of `event_type` in the run's journal.
+fn first_payload(supervisor: &Supervisor, run_id: Uuid, event_type: &str) -> Value {
+    supervisor
+        .events(&run_id)
+        .expect("events")
+        .into_iter()
+        .find(|event| event.event_type.to_string() == event_type)
+        .unwrap_or_else(|| panic!("no `{event_type}` event in the journal"))
+        .payload
+}
+
 fn event_types(supervisor: &Supervisor, run_id: Uuid) -> Vec<String> {
     supervisor
         .events(&run_id)
@@ -165,6 +223,9 @@ async fn e2e_happy_path_spec_parallel_review_gitgate() {
     let run_id = supervisor
         .start_run(&spec, "ship F-07", contracts_for(&spec, &head))
         .expect("start run");
+    // The git gate is fingerprint-bound: a human approves the exact
+    // mutation before the gate node is ever leased (F-10 SEC-04).
+    let approval_id = approve_gate(&supervisor, run_id, "commit");
     let summary = supervisor.drive(&run_id, 20).await.expect("drive");
 
     assert_eq!(summary.status, RunStatus::Completed);
@@ -214,7 +275,41 @@ async fn e2e_happy_path_spec_parallel_review_gitgate() {
         .expect("request exists");
     assert_eq!(request.status, RequestStatus::Done);
     assert_eq!(request.result_sha.as_deref(), Some(sha.as_str()));
-    assert!(request.approved, "F-07 enqueues approved=true (F-10 seam)");
+    assert!(
+        request.approved,
+        "the queued row carries the policy verdict, not a literal"
+    );
+    assert_eq!(
+        first_payload(&supervisor, run_id, "git.queued")["approved"],
+        json!(true)
+    );
+    // The policy decision is in the append-only audit bundle (SEC-05).
+    let bundle = supervisor
+        .audit()
+        .export_bundle(Some(&run_id.to_string()))
+        .expect("audit bundle");
+    let kinds: Vec<String> = bundle["events"]
+        .as_array()
+        .expect("events array")
+        .iter()
+        .map(|event| event["actionKind"].as_str().unwrap_or_default().to_owned())
+        .collect();
+    assert!(
+        kinds.contains(&"approval.requested".to_owned()),
+        "the request is audited: {kinds:?}"
+    );
+    assert!(
+        kinds.contains(&"git.gate".to_owned()),
+        "the gate decision is audited: {kinds:?}"
+    );
+    assert_eq!(
+        supervisor
+            .approvals()
+            .status(&approval_id)
+            .expect("approval status"),
+        Some(agentos_runtime::ApprovalStatus::Approved),
+        "approvals are immutable once resolved"
+    );
 
     // The ledger maps the sha to task/agent/reviewers/context/workflow.
     let record = supervisor
@@ -244,11 +339,45 @@ async fn e2e_happy_path_spec_parallel_review_gitgate() {
             "task.output_ready",
             "review.requested",
             "review.approved",
+            "approval.granted",
             "git.queued",
             "git.committed",
             "task.done",
             "run.completed",
         ],
+    );
+
+    // SEC-01 at the adapter seam: the spawn spec's policy fields are the
+    // compiled permission set, not the contract's raw globs.
+    let spawn = first_payload(&supervisor, run_id, "session.spawn");
+    let denied: Vec<&str> = spawn["toolDenylist"]
+        .as_array()
+        .expect("toolDenylist")
+        .iter()
+        .filter_map(Value::as_str)
+        .collect();
+    assert!(
+        denied.contains(&"WebFetch") && denied.contains(&"WebSearch"),
+        "an offline worker's network tools are denied: {denied:?}"
+    );
+    assert!(
+        denied.contains(&"Bash(git commit:*)"),
+        "no-direct-git rides on top of the compiled denylist: {denied:?}"
+    );
+    let allowed: Vec<&str> = spawn["toolAllowlist"]
+        .as_array()
+        .expect("toolAllowlist")
+        .iter()
+        .filter_map(Value::as_str)
+        .collect();
+    assert!(allowed.contains(&"Edit"), "write worker keeps Edit");
+    assert!(
+        spawn["allowedPaths"]
+            .as_array()
+            .expect("allowedPaths")
+            .iter()
+            .any(|path| path.as_str().is_some_and(|p| p.ends_with("/docs"))),
+        "the contract's write root is granted, workspace-joined: {spawn:#?}"
     );
 
     // Usage flowed into the journal and the ledger priced the preamble.
@@ -316,6 +445,7 @@ async fn e2e_flaky_transient_failure_retries_to_completion() {
     let run_id = supervisor
         .start_run(&spec, "retry within budget", contracts_for(&spec, &head))
         .expect("start run");
+    approve_gate(&supervisor, run_id, "commit");
     let summary: DriveSummary = supervisor.drive(&run_id, 30).await.expect("drive");
 
     assert_eq!(summary.status, RunStatus::Completed);
@@ -428,6 +558,9 @@ async fn e2e_crash_recovery_reclaims_expired_lease_and_completes() {
         run_id = supervisor
             .start_run(&spec, "survive the crash", contracts.clone())
             .expect("start run");
+        // Approved before the crash: the approval lives in SQLite and its
+        // task-keyed record on disk, so the successor supervisor inherits it.
+        approve_gate(&supervisor, run_id, "commit");
 
         // One tick completes `spec`; the parallel branches are still
         // Planned.
@@ -553,4 +686,337 @@ async fn e2e_ownership_conflict_is_journaled_and_retried() {
         "the conflicting attempt was consumed and retried"
     );
     assert!(supervisor.ownership().holds_for_task("").is_empty());
+}
+
+// ------------------------------------------------- F-10 policy boundary
+
+/// Assert the run never mutated the repository: no queue row reached the
+/// git manager, no commit was attributed, and the integration head is
+/// exactly where it started.
+fn assert_nothing_was_committed(supervisor: &Supervisor, run_id: Uuid, repo: &Path, head: &str) {
+    let types = event_types(supervisor, run_id);
+    assert!(
+        !types.contains(&"git.queued".to_owned()),
+        "a blocked mutation never reaches the queue: {types:?}"
+    );
+    assert!(
+        !types.contains(&"git.committed".to_owned()),
+        "a blocked mutation never commits: {types:?}"
+    );
+    assert!(
+        types.contains(&"policy.denied".to_owned()),
+        "the denial is journaled: {types:?}"
+    );
+    assert_eq!(
+        cli::rev_parse_head(repo).expect("head"),
+        head,
+        "the integration head did not move"
+    );
+}
+
+/// The policy audit rows for a run, as `actionKind` strings.
+fn audit_kinds(supervisor: &Supervisor, run_id: Uuid) -> Vec<String> {
+    supervisor
+        .audit()
+        .export_bundle(Some(&run_id.to_string()))
+        .expect("audit bundle")["events"]
+        .as_array()
+        .expect("events array")
+        .iter()
+        .map(|event| event["actionKind"].as_str().unwrap_or_default().to_owned())
+        .collect()
+}
+
+/// PRD §23.3, first leg: with **no** approval the git gate fails closed —
+/// nothing is queued, nothing is committed, and the run fails. The gate
+/// still opens a request a human could act on.
+#[tokio::test]
+async fn e2e_git_gate_blocks_without_an_approval() {
+    let (dir, repo, head) = temp_repo();
+    let spec = feature_build_spec();
+    let supervisor = supervisor_for(&repo, &dir.path().join("state"), success_adapter());
+
+    let run_id = supervisor
+        .start_run(&spec, "commit without asking", contracts_for(&spec, &head))
+        .expect("start run");
+    let summary = supervisor.drive(&run_id, 30).await.expect("drive");
+
+    assert_eq!(summary.status, RunStatus::Failed);
+    let tasks = tasks_by_node(&supervisor, run_id);
+    assert_eq!(tasks["commit"].state, TaskState::Failed);
+    assert_nothing_was_committed(&supervisor, run_id, &repo, &head);
+
+    let denial = first_payload(&supervisor, run_id, "policy.denied");
+    assert_eq!(denial["reason"], json!("no_approval_requested"));
+    assert!(
+        denial["error"]
+            .as_str()
+            .expect("error")
+            .contains("unexpired human approval"),
+        "{denial:#?}"
+    );
+    // The gate surfaced a decision instead of losing it.
+    let required = first_payload(&supervisor, run_id, "approval.required");
+    assert_eq!(required["gate"], json!("git_push"));
+    assert!(required["requestId"].is_string());
+    assert!(supervisor
+        .agent_ledger()
+        .by_task(&tasks["commit"].id.to_string())
+        .expect("ledger read")
+        .is_empty());
+    let kinds = audit_kinds(&supervisor, run_id);
+    assert!(kinds.contains(&"permission.denied".to_owned()), "{kinds:?}");
+    assert!(kinds.contains(&"git.gate".to_owned()), "{kinds:?}");
+}
+
+/// SEC-04 fingerprint binding through the real queue: a **live, approved**
+/// row for a mutation that differs by one field does not authorize this
+/// mutation.
+#[tokio::test]
+async fn e2e_git_gate_blocks_when_the_approval_covers_a_mutated_operation() {
+    let (dir, repo, head) = temp_repo();
+    let spec = feature_build_spec();
+    let supervisor = supervisor_for(&repo, &dir.path().join("state"), success_adapter());
+
+    let run_id = supervisor
+        .start_run(&spec, "approve something else", contracts_for(&spec, &head))
+        .expect("start run");
+    // Same gate, same task — a different base commit. One field is enough.
+    approve_mutated_gate(&supervisor, run_id, "commit", 600, |operation| {
+        operation["baseCommit"] = json!("deadbeefdeadbeefdeadbeefdeadbeefdeadbeef");
+    });
+
+    let summary = supervisor.drive(&run_id, 30).await.expect("drive");
+    assert_eq!(summary.status, RunStatus::Failed);
+    assert_eq!(
+        tasks_by_node(&supervisor, run_id)["commit"].state,
+        TaskState::Failed
+    );
+    assert_nothing_was_committed(&supervisor, run_id, &repo, &head);
+}
+
+/// SEC-04 expiry is enforced at check time: an approval whose ttl elapsed
+/// authorizes nothing, even though its row still reads `approved`.
+#[tokio::test]
+async fn e2e_git_gate_blocks_when_the_approval_has_expired() {
+    let (dir, repo, head) = temp_repo();
+    let spec = feature_build_spec();
+    let supervisor = supervisor_for(&repo, &dir.path().join("state"), success_adapter());
+
+    let run_id = supervisor
+        .start_run(&spec, "approve too late", contracts_for(&spec, &head))
+        .expect("start run");
+    // The exact operation, approved with a zero ttl (instantly expired).
+    approve_mutated_gate(&supervisor, run_id, "commit", 0, |_| {});
+
+    let summary = supervisor.drive(&run_id, 30).await.expect("drive");
+    assert_eq!(summary.status, RunStatus::Failed);
+    assert_nothing_was_committed(&supervisor, run_id, &repo, &head);
+}
+
+/// PRD §23.3, second leg: **permission trumps approval**. A gate role
+/// without the `Commit` git action cannot commit even with a genuinely
+/// approved, unexpired, exactly-matching approval.
+#[tokio::test]
+async fn e2e_git_gate_denies_a_role_without_git_permission_despite_a_live_approval() {
+    let (dir, repo, head) = temp_repo();
+    let spec = feature_build_spec();
+    // A write worker holds no git actions — every mutation belongs to the
+    // git manager (GIT-01).
+    let config = SupervisorConfig::for_repo(dir.path().join("state"), &repo)
+        .with_git_gate_permissions(PermissionSet::worker_write(&["**"]));
+    let supervisor = Supervisor::new(config, vec![success_adapter() as Arc<dyn RuntimeAdapter>])
+        .expect("supervisor");
+
+    let run_id = supervisor
+        .start_run(
+            &spec,
+            "commit without the role",
+            contracts_for(&spec, &head),
+        )
+        .expect("start run");
+    approve_gate(&supervisor, run_id, "commit");
+
+    let summary = supervisor.drive(&run_id, 30).await.expect("drive");
+    assert_eq!(summary.status, RunStatus::Failed);
+    assert_nothing_was_committed(&supervisor, run_id, &repo, &head);
+    let denial = first_payload(&supervisor, run_id, "policy.denied");
+    assert_eq!(
+        denial["reason"],
+        json!("approved"),
+        "the approval was live; the permission leg refused it"
+    );
+    assert!(
+        denial["error"]
+            .as_str()
+            .expect("error")
+            .contains("not permitted"),
+        "{denial:#?}"
+    );
+}
+
+/// A `HumanApproval` node with an approval resolves and the run completes;
+/// the same workflow without one waits (bounded by the transient retry
+/// budget) and then fails; a refusal fails immediately. The supervisor
+/// never self-approves.
+#[tokio::test]
+async fn e2e_human_approval_node_resolves_both_ways() {
+    let approval_spec = WorkflowSpec {
+        id: "human-gate".to_owned(),
+        version: 1,
+        nodes: vec![
+            node("build", NodeType::Run, &[]),
+            node("gate", NodeType::HumanApproval, &["build"]),
+            node("review", NodeType::Review, &["gate"]),
+        ],
+    };
+    let contracts_for_gate = |head: &str| -> HashMap<String, TaskContract> {
+        let mut contracts = HashMap::new();
+        contracts.insert(
+            "build".to_owned(),
+            TaskContract::builder("TASK-BUILD", "build behind a human gate")
+                .allowed_paths(vec!["src/**".to_owned()])
+                .base_commit(head.to_owned())
+                .build()
+                .unwrap(),
+        );
+        for node_id in ["gate", "review"] {
+            contracts.insert(
+                node_id.to_owned(),
+                TaskContract::builder(format!("TASK-{node_id}"), "human decision")
+                    .base_commit(head.to_owned())
+                    .build()
+                    .unwrap(),
+            );
+        }
+        contracts
+    };
+
+    // ---- approved: the node proceeds.
+    {
+        let (dir, repo, head) = temp_repo();
+        let supervisor = supervisor_for(&repo, &dir.path().join("state"), success_adapter());
+        let run_id = supervisor
+            .start_run(&approval_spec, "ask a human", contracts_for_gate(&head))
+            .expect("start run");
+        approve_gate(&supervisor, run_id, "gate");
+
+        let summary = supervisor.drive(&run_id, 30).await.expect("drive");
+        assert_eq!(summary.status, RunStatus::Completed);
+        assert_eq!(
+            tasks_by_node(&supervisor, run_id)["gate"].state,
+            TaskState::Done
+        );
+        let granted = first_payload(&supervisor, run_id, "approval.granted");
+        assert_eq!(granted["gate"], json!("prod_action"));
+        assert!(granted["operationFingerprint"]
+            .as_str()
+            .expect("fingerprint")
+            .starts_with("fnv1a64:"));
+    }
+
+    // ---- unresolved: the node waits within its retry budget, then fails.
+    {
+        let (dir, repo, head) = temp_repo();
+        let supervisor = supervisor_for(&repo, &dir.path().join("state"), success_adapter());
+        let run_id = supervisor
+            .start_run(&approval_spec, "nobody answers", contracts_for_gate(&head))
+            .expect("start run");
+
+        let summary = supervisor.drive(&run_id, 30).await.expect("drive");
+        assert_eq!(summary.status, RunStatus::Failed);
+        let tasks = tasks_by_node(&supervisor, run_id);
+        assert_eq!(tasks["gate"].state, TaskState::Failed);
+        assert_eq!(
+            tasks["review"].state,
+            TaskState::Blocked,
+            "the dependent is parked, never run unapproved"
+        );
+        assert_eq!(
+            tasks["gate"].attempt_count, 3,
+            "waiting consumes the transient retry budget (2 retries) before \
+             the gate fails terminally"
+        );
+        let types = event_types(&supervisor, run_id);
+        assert!(types.contains(&"approval.required".to_owned()), "{types:?}");
+        assert!(
+            !types.contains(&"approval.granted".to_owned()),
+            "nothing self-approves: {types:?}"
+        );
+    }
+
+    // ---- denied: the node fails deterministically with the typed denial.
+    {
+        let (dir, repo, head) = temp_repo();
+        let supervisor = supervisor_for(&repo, &dir.path().join("state"), success_adapter());
+        let run_id = supervisor
+            .start_run(&approval_spec, "a human says no", contracts_for_gate(&head))
+            .expect("start run");
+        let request = supervisor
+            .request_gate_approval(&run_id, "gate", "user@e2e")
+            .expect("request");
+        assert!(supervisor
+            .approvals()
+            .resolve(&request.id, ApprovalDecision::Denied)
+            .expect("resolve"));
+
+        let summary = supervisor.drive(&run_id, 30).await.expect("drive");
+        assert_eq!(summary.status, RunStatus::Failed);
+        let denied = first_payload(&supervisor, run_id, "approval.denied");
+        assert_eq!(denied["reason"], json!("denied"));
+        assert_eq!(denied["requestId"], json!(request.id));
+        assert_eq!(
+            tasks_by_node(&supervisor, run_id)["gate"].attempt_count,
+            2,
+            "a refusal is a reasoning failure: it burns the single reasoning \
+             retry, not the (larger) transient wait budget"
+        );
+    }
+}
+
+/// SEC-01 at spawn: a permission set that cannot cover the contract refuses
+/// the session before any billable work happens.
+#[tokio::test]
+async fn e2e_spawn_is_refused_when_policy_cannot_cover_the_contract() {
+    let (dir, repo, head) = temp_repo();
+    let spec = WorkflowSpec {
+        id: "narrow-policy".to_owned(),
+        version: 1,
+        nodes: vec![NodeSpec {
+            agent_role: Some("narrow".to_owned()),
+            ..node("build", NodeType::Run, &[])
+        }],
+    };
+    let mut contracts = HashMap::new();
+    contracts.insert(
+        "build".to_owned(),
+        TaskContract::builder("TASK-BUILD", "write outside the granted scope")
+            .allowed_paths(vec!["src/wide/**".to_owned()])
+            .base_commit(head.to_owned())
+            .build()
+            .unwrap(),
+    );
+    let config = SupervisorConfig::for_repo(dir.path().join("state"), &repo)
+        .with_role_permissions("narrow", PermissionSet::worker_write(&["src/narrow/**"]));
+    let supervisor = Supervisor::new(config, vec![success_adapter() as Arc<dyn RuntimeAdapter>])
+        .expect("supervisor");
+
+    let run_id = supervisor
+        .start_run(&spec, "over-claim the scope", contracts)
+        .expect("start run");
+    let summary = supervisor.drive(&run_id, 20).await.expect("drive");
+
+    assert_eq!(summary.status, RunStatus::Failed);
+    let types = event_types(&supervisor, run_id);
+    assert!(types.contains(&"policy.denied".to_owned()), "{types:?}");
+    assert!(
+        !types.contains(&"session.started".to_owned()),
+        "no session is ever spawned: {types:?}"
+    );
+    let denial = first_payload(&supervisor, run_id, "policy.denied");
+    assert_eq!(denial["stage"], json!("compile"));
+    assert!(denial["error"]
+        .as_str()
+        .expect("error")
+        .contains("src/wide/**"));
 }
