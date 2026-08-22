@@ -1,0 +1,13 @@
+[package]
+name = "agentos-core"
+description = "F-00: shared canon types — events, task lifecycle, error taxonomy"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+thiserror = { workspace = true }
+chrono = { workspace = true }

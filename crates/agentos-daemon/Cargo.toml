@@ -1,0 +1,17 @@
+[package]
+name = "agentos-daemon"
+description = "F-01: daemon core — SQLite state, append-only event journal, process supervision"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+agentos-core = { path = "../agentos-core" }
+tokio = { workspace = true }
+rusqlite = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
