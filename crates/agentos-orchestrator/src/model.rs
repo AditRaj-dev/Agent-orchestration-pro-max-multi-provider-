@@ -141,6 +141,10 @@ pub struct ClaudePlanningModel {
     workspace: PathBuf,
     model: String,
     timeout: Duration,
+    /// F-13: skill text prepended to every planning prompt (the
+    /// `mastermind-commands` skill body, loaded from the registry by the
+    /// caller). `None` keeps the bare prompt.
+    skill_preamble: Option<String>,
 }
 
 impl ClaudePlanningModel {
@@ -156,6 +160,7 @@ impl ClaudePlanningModel {
             workspace: workspace.into(),
             model: ORCHESTRATOR_MODEL.to_owned(),
             timeout: Duration::from_secs(DEFAULT_PLANNING_TIMEOUT_SECS),
+            skill_preamble: None,
         }
     }
 
@@ -171,14 +176,26 @@ impl ClaudePlanningModel {
         self
     }
 
+    /// Attach the skill preamble (F-13): rendered ahead of every planning
+    /// prompt, the same composition rule every registry agent's session
+    /// uses. Empty text is treated as absent.
+    pub fn with_skill_preamble(mut self, preamble: Option<String>) -> Self {
+        self.skill_preamble = preamble.filter(|text| !text.trim().is_empty());
+        self
+    }
+
     /// The spawn spec for one planning turn.
     ///
     /// Pure and unit-testable: the denylist, model pin and empty
     /// allowed-paths list are asserted in tests without spawning anything.
     pub fn spawn_spec(&self, prompt: &str) -> SpawnSpec {
+        let objective = match &self.skill_preamble {
+            Some(preamble) => format!("{preamble}{prompt}"),
+            None => prompt.to_owned(),
+        };
         SpawnSpec {
             task_id: Uuid::now_v7(),
-            objective: prompt.to_owned(),
+            objective,
             workspace: self.workspace.clone(),
             allowed_paths: Vec::new(),
             forbidden_paths: Vec::new(),
@@ -439,6 +456,28 @@ mod tests {
         let spec = planner.spawn_spec("x");
         assert_eq!(spec.model.as_deref(), Some("opus"));
         assert_eq!(spec.timeout_secs, 30);
+    }
+
+    #[test]
+    fn skill_preamble_rides_ahead_of_the_prompt() {
+        let skilled = planner().with_skill_preamble(Some("# Mastermind\n\nOrders.\n\n".to_owned()));
+        let spec = skilled.spawn_spec("plan this");
+        assert!(
+            spec.objective.starts_with("# Mastermind"),
+            "preamble first: {}",
+            &spec.objective[..30.min(spec.objective.len())]
+        );
+        assert!(spec.objective.ends_with("plan this"));
+
+        // Absent and empty preambles keep the bare prompt.
+        assert_eq!(planner().spawn_spec("plan this").objective, "plan this");
+        assert_eq!(
+            planner()
+                .with_skill_preamble(Some("   ".to_owned()))
+                .spawn_spec("plan this")
+                .objective,
+            "plan this"
+        );
     }
 
     #[tokio::test]

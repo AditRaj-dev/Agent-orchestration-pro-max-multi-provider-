@@ -1058,3 +1058,167 @@ async fn e2e_spawn_is_refused_when_policy_cannot_cover_the_contract() {
         .expect("error")
         .contains("src/wide/**"));
 }
+
+// ------------------------------------------------------------- F-13 registry
+
+/// F-13: registry-driven routing. A node whose `agent_role` names a
+/// registered agent spawns through the record's adapter with the record's
+/// model and its skills composed ahead of the contract objective — visible
+/// in the `session.spawn` payload (`model`, `objectivePreview`). An
+/// unmapped role keeps the static default.
+#[tokio::test]
+async fn registry_agent_drives_model_and_skill_preamble() {
+    let (dir, repo, head) = temp_repo();
+    let state = dir.path().join("state");
+    std::fs::create_dir_all(&state).expect("state dir");
+
+    // The registry: a mock-backed worker holding the tech-research skill.
+    let registry = agentos_agents::AgentRegistry::open(&state.join("agents.db")).expect("registry");
+    registry.seed_builtins().expect("seeds");
+    registry
+        .create_agent(agentos_agents::AgentRecord {
+            id: "registry-worker".to_owned(),
+            name: "Registry Worker".to_owned(),
+            description: "routed by the registry".to_owned(),
+            adapter_id: "mock".to_owned(),
+            model: Some("mock-model-1".to_owned()),
+            effort: None,
+            mode: agentos_agents::AgentMode::AcceptEdits,
+            skills: vec!["tech-research".to_owned()],
+            tool_allowlist: vec![],
+            tool_denylist: vec!["WebFetch".to_owned()],
+            timeout_secs: 600,
+            builtin: false,
+            enabled: true,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        })
+        .expect("create registry worker");
+
+    let spec = WorkflowSpec {
+        id: "registry-routed".to_owned(),
+        version: 1,
+        nodes: vec![NodeSpec {
+            id: "work".to_owned(),
+            node_type: NodeType::Run,
+            depends_on: vec![],
+            agent_role: Some("registry-worker".to_owned()),
+            budgets: Budgets::default(),
+            retry: RetryPolicy::default(),
+        }],
+    };
+    let contracts = HashMap::from([(
+        "work".to_owned(),
+        TaskContract::builder("TASK-WORK", "registry-routed objective text")
+            .allowed_paths(vec!["src/**".to_owned()])
+            .budgets(ContractBudgets::new(5, 2))
+            .base_commit(head)
+            .build()
+            .expect("contract"),
+    )]);
+
+    let config = SupervisorConfig::for_repo(&state, &repo).with_agents_db(state.join("agents.db"));
+    let mock = success_adapter();
+    let supervisor =
+        Supervisor::new(config, vec![mock as Arc<dyn RuntimeAdapter>]).expect("supervisor");
+    let run_id = supervisor
+        .start_run(&spec, "route through the registry", contracts)
+        .expect("start run");
+    let summary = supervisor.drive(&run_id, 20).await.expect("drive");
+    assert_eq!(summary.status, RunStatus::Completed);
+
+    // The spawn payload proves the record drove the session.
+    let spawn = first_payload(&supervisor, run_id, "session.spawn");
+    assert_eq!(spawn["model"], json!("mock-model-1"), "{spawn}");
+    let preview = spawn["objectivePreview"].as_str().expect("preview");
+    assert!(
+        preview.starts_with("# Assigned skills"),
+        "skill preamble rides ahead of the objective: {preview}"
+    );
+    assert!(
+        preview.contains("registry-routed objective text"),
+        "contract objective still present: {preview}"
+    );
+    assert!(
+        spawn["toolDenylist"]
+            .as_array()
+            .expect("denylist")
+            .iter()
+            .any(|tool| tool == &json!("WebFetch")),
+        "record denylist merges into the spec: {spawn}"
+    );
+}
+
+/// F-13: a disabled (or absent) registry entry falls back to the static
+/// routing table — the registry overlays routing, it never blocks it.
+#[tokio::test]
+async fn disabled_registry_agent_falls_back_to_static_routing() {
+    let (dir, repo, head) = temp_repo();
+    let state = dir.path().join("state");
+    std::fs::create_dir_all(&state).expect("state dir");
+    let registry = agentos_agents::AgentRegistry::open(&state.join("agents.db")).expect("registry");
+    registry.seed_builtins().expect("seeds");
+    registry
+        .create_agent(agentos_agents::AgentRecord {
+            id: "sleeper".to_owned(),
+            name: "Sleeper".to_owned(),
+            description: "disabled worker".to_owned(),
+            adapter_id: "mock".to_owned(),
+            model: Some("mock-model-1".to_owned()),
+            effort: None,
+            mode: agentos_agents::AgentMode::AcceptEdits,
+            skills: vec![],
+            tool_allowlist: vec![],
+            tool_denylist: vec![],
+            timeout_secs: 600,
+            builtin: false,
+            enabled: true,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        })
+        .expect("create sleeper");
+    registry
+        .set_agent_enabled("sleeper", false)
+        .expect("disable");
+
+    let spec = WorkflowSpec {
+        id: "fallback".to_owned(),
+        version: 1,
+        nodes: vec![NodeSpec {
+            id: "work".to_owned(),
+            node_type: NodeType::Run,
+            depends_on: vec![],
+            agent_role: Some("sleeper".to_owned()),
+            budgets: Budgets::default(),
+            retry: RetryPolicy::default(),
+        }],
+    };
+    let contracts = HashMap::from([(
+        "work".to_owned(),
+        TaskContract::builder("TASK-WORK", "fallback objective")
+            .allowed_paths(vec!["src/**".to_owned()])
+            .budgets(ContractBudgets::new(5, 2))
+            .base_commit(head)
+            .build()
+            .expect("contract"),
+    )]);
+
+    let config = SupervisorConfig::for_repo(&state, &repo).with_agents_db(state.join("agents.db"));
+    let mock = success_adapter();
+    let supervisor =
+        Supervisor::new(config, vec![mock as Arc<dyn RuntimeAdapter>]).expect("supervisor");
+    let run_id = supervisor
+        .start_run(&spec, "fall back gracefully", contracts)
+        .expect("start run");
+    let summary = supervisor.drive(&run_id, 20).await.expect("drive");
+    assert_eq!(summary.status, RunStatus::Completed);
+
+    // Static default (mock) served the spawn; no skill preamble was
+    // composed and the model key reflects the default path.
+    let spawn = first_payload(&supervisor, run_id, "session.spawn");
+    let preview = spawn["objectivePreview"].as_str().expect("preview");
+    assert_eq!(
+        preview, "fallback objective",
+        "no preamble without a resolved record: {spawn}"
+    );
+}

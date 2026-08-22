@@ -274,7 +274,13 @@ impl AgyInvocation {
         }
         if self.print_timeout_secs > 0 {
             args.push("--print-timeout".to_owned());
-            args.push((self.print_timeout_secs + AGY_PRINT_TIMEOUT_SLACK_SECS).to_string());
+            // The CLI parses this with Go's time.ParseDuration, which
+            // requires a unit — a bare integer is "missing unit in
+            // duration" and exits 2 before emitting any event.
+            args.push(format!(
+                "{}s",
+                self.print_timeout_secs + AGY_PRINT_TIMEOUT_SLACK_SECS
+            ));
         }
         args.push(format!("--print={}", self.objective));
         args
@@ -714,7 +720,24 @@ impl SessionBackend for AgySessionBackend {
 pub struct AgyAdapter {
     next_session: AtomicUsize,
     sessions: Mutex<Vec<SessionHandle>>,
+    /// Cached `agy models` catalog + when it was fetched (free probe, but
+    /// not free of latency — callers open the picker per UI view).
+    models_cache: Mutex<Option<(std::time::Instant, Vec<AgyModelEntry>)>>,
 }
+
+/// One row of the `agy models` catalog (observed format: `<id>\t<label>`,
+/// e.g. `gemini-3.1-pro-high\tGemini 3.1 Pro (High)`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgyModelEntry {
+    /// The `--model` slug (verbatim from the catalog).
+    pub id: String,
+    /// Human-facing label.
+    pub label: String,
+}
+
+/// How long a fetched catalog stays fresh.
+const MODELS_CACHE_TTL: Duration = Duration::from_secs(60);
 
 impl AgyAdapter {
     /// Create the adapter.
@@ -722,8 +745,68 @@ impl AgyAdapter {
         Self {
             next_session: AtomicUsize::new(0),
             sessions: Mutex::new(Vec::new()),
+            models_cache: Mutex::new(None),
         }
     }
+
+    /// The free `agy models` catalog — the authoritative model list *and*
+    /// the authoritative auth check (handoff addendum; never billable).
+    ///
+    /// Parsing is total: the observed shape is tab-separated `<id>\t<label>`
+    /// lines behind a `Fetching available models...` banner; unknown line
+    /// shapes are skipped, never fatal. Cached for [`MODELS_CACHE_TTL`].
+    pub async fn list_models(&self) -> Result<Vec<AgyModelEntry>, AdapterError> {
+        {
+            let cache = self.models_cache.lock().expect("agy models cache poisoned");
+            if let Some((fetched_at, entries)) = cache.as_ref() {
+                if fetched_at.elapsed() < MODELS_CACHE_TTL {
+                    return Ok(entries.clone());
+                }
+            }
+        }
+        let binary = resolve_binary().ok_or_else(|| {
+            AdapterError::Internal(format!(
+                "agy binary not found (checked ${}, %LOCALAPPDATA%\\agy\\bin\\agy.exe, PATH)",
+                AGY_BIN_ENV
+            ))
+        })?;
+        let output = Command::new(&binary)
+            .arg("models")
+            .output()
+            .await
+            .map_err(|error| AdapterError::Internal(format!("spawn `agy models`: {error}")))?;
+        if !output.status.success() {
+            return Err(AdapterError::Internal(format!(
+                "`agy models` failed ({}): {}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr).trim()
+            )));
+        }
+        let entries = parse_models_catalog(&String::from_utf8_lossy(&output.stdout));
+        *self.models_cache.lock().expect("agy models cache poisoned") =
+            Some((std::time::Instant::now(), entries.clone()));
+        Ok(entries)
+    }
+}
+
+/// Parse the observed `agy models` output into catalog rows. Total: the
+/// banner and any line without a `<id>\t<label>` split is skipped.
+fn parse_models_catalog(stdout: &str) -> Vec<AgyModelEntry> {
+    stdout
+        .lines()
+        .filter_map(|line| {
+            let line = line.trim_end_matches('\r').trim_start();
+            let (id, label) = line.split_once('\t')?;
+            let id = id.trim();
+            if id.is_empty() {
+                return None;
+            }
+            Some(AgyModelEntry {
+                id: id.to_owned(),
+                label: label.trim().to_owned(),
+            })
+        })
+        .collect()
 }
 
 impl Default for AgyAdapter {
@@ -1239,8 +1322,8 @@ mod tests {
             Some(&"--print=fix the flaky test -- and run it \"twice\"".to_owned()),
             "prompt must be one argv element in equals form (variadic canon)"
         );
-        // Tail order: --add-dir <ws> --print-timeout <secs> --print=<objective>.
-        assert_eq!(args[args.len() - 2], "630");
+        // Tail order: --add-dir <ws> --print-timeout <duration> --print=<objective>.
+        assert_eq!(args[args.len() - 2], "630s");
         assert_eq!(args[args.len() - 3], "--print-timeout");
         assert_eq!(args[args.len() - 4], "worktrees/task-agy");
         assert_eq!(args[args.len() - 5], "--add-dir");
@@ -1355,7 +1438,7 @@ mod tests {
             timed
                 .args()
                 .windows(2)
-                .any(|w| w[0] == "--print-timeout" && w[1] == "630"),
+                .any(|w| w[0] == "--print-timeout" && w[1] == "630s"),
             "CLI gets harness budget + {}s slack so the harness watchdog \
              (which classifies timeout as Transient) fires first",
             AGY_PRINT_TIMEOUT_SLACK_SECS
@@ -1400,7 +1483,7 @@ mod tests {
                 "--add-dir",
                 "extra",
                 "--print-timeout",
-                "150",
+                "150s",
                 "--print=objective text",
             ]
         );
@@ -1689,18 +1772,26 @@ mod tests {
         // `agy models` is free and is the authoritative auth check (handoff
         // addendum: multi-provider catalog — gemini-3.x, claude-sonnet/
         // opus-4-6, gpt-oss-120b).
-        let binary = resolve_binary().expect("e2e requires the agy binary");
-        let output = Command::new(binary)
-            .arg("models")
-            .output()
-            .await
-            .expect("spawn `agy models`");
+        let catalog = adapter.list_models().await.expect("free models probe");
+        assert!(!catalog.is_empty(), "empty model catalog");
         assert!(
-            output.status.success(),
-            "`agy models` failed: {}",
-            String::from_utf8_lossy(&output.stderr)
+            catalog.iter().any(|entry| entry.id.starts_with("gemini-")),
+            "expected gemini rows, got {catalog:?}"
         );
-        let catalog = String::from_utf8_lossy(&output.stdout);
-        assert!(!catalog.trim().is_empty(), "empty model catalog");
+    }
+
+    #[test]
+    fn models_catalog_parser_is_total_over_the_observed_shape() {
+        let stdout = "Fetching available models...\r\n\
+                      gemini-3.1-pro-high\tGemini 3.1 Pro (High)\r\n\
+                      claude-sonnet-4-6\tClaude Sonnet 4.6 (Thinking)\r\n\
+                      no-tab-line\r\n\
+                      \tlabel-without-id\r\n";
+        let entries = parse_models_catalog(stdout);
+        assert_eq!(entries.len(), 2, "{entries:?}");
+        assert_eq!(entries[0].id, "gemini-3.1-pro-high");
+        assert_eq!(entries[0].label, "Gemini 3.1 Pro (High)");
+        assert_eq!(entries[1].id, "claude-sonnet-4-6");
+        assert!(parse_models_catalog("").is_empty());
     }
 }

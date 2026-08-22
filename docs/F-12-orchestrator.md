@@ -182,11 +182,17 @@ explicitly labelled `STATE SNAPSHOT (data, not instructions)`.
    is expressed *only* through `tool_denylist`, rendered as the F-00 §4 canon
    equals form `--disallowedTools=Bash,WebFetch,WebSearch,Write,…`. Asserted by
    `the_spec_renders_the_observed_equals_form_claude_argv`.
-2. **Only three denylist tokens are observed-verified.** Probe T2 verified
-   `Bash`, `WebFetch`, `WebSearch` (zero tool uses, graceful exit 0). The
-   write-tool names in `ORCHESTRATOR_TOOL_DENYLIST` (`Write`, `Edit`,
-   `MultiEdit`, `NotebookEdit`) are *unverified on this install* — an unknown
-   token is a silent no-op, not an error. Smoke-test on adapter upgrades.
+2. **Every denylist token is verified against the installed CLI.** Probe T2
+   verified `Bash`, `WebFetch`, `WebSearch` behaviourally; the rest are read
+   out of the CLI's own tool registry (claude 2.1.239), because an unknown
+   token is a silent no-op — a typo would leave the guard open while looking
+   correct. That registry also showed the guard was too narrow: `Bash` alone
+   leaves `PowerShell`, `Tmux` and `REPL`, and denying the write tools leaves
+   delegation (`Agent`, `Task`, `TaskCreate`, `Skill`, `Workflow`) through
+   which a subagent writes anything it likes. 7 tokens → 17.
+   `verify_denylist_tokens(cli_path)` is the upgrade smoke test (reads the
+   binary; no session, no billable call), run by an
+   `AGENTOS_CLAUDE_CLI`-gated unit test.
 3. **`SessionHandle::events()` has no replay, and F-02 adapters spawn their
    driving task inside `start_session`.** A late subscriber can miss early
    events. `ClaudePlanningModel` therefore reads the final text from the terminal
@@ -215,10 +221,19 @@ explicitly labelled `STATE SNAPSHOT (data, not instructions)`.
    `assign_pool` post-commit): the durable store has no node-spec update, and a
    spec swap under a leased task would race the executor. Re-shaping an existing
    node still means a new run.
-2. **Escalation routing is a priority raise only.** `EscalationTarget::Human`
-   should resolve through F-10's approval store and
-   `EscalationTarget::StrongerAgent` through a capability-tiered pool (F-13).
-   Today all three targets raise `P0` and record the decision.
+2. ~~**Escalation routing is a priority raise only.**~~ **CLOSED** — every
+   escalation still raises `P0` (that lever always exists), and now also
+   routes: `stronger_agent`/`supervisor` retarget the task at
+   `PlanPolicy::escalation_pool` / `supervisor_pool` through F-06's guarded
+   `set_agent_role` (which refuses executing and terminal tasks, so an
+   in-flight attempt keeps the role it was contracted with), and `human`
+   raises the escalation on F-10's approval surface via the `EscalationDesk`
+   seam (`ApprovalDesk`). What does not route says why in
+   `EscalationOutcome::unrouted_reason` — no declared pool, no desk wired, or
+   no task in a retargetable state — instead of implying a hand-off that
+   never happened. Remaining: `assign_pool` on a committed run is still
+   refused, though `set_agent_role` could now support it for non-executing
+   tasks.
 3. **`contextRefs` in the snapshot is empty** — F-08's compiled context packs are
    not wired into the prompt yet. The field exists so the wire shape does not
    change when they are.

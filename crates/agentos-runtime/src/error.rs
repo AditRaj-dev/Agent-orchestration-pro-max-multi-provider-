@@ -23,6 +23,9 @@ pub enum RuntimeError {
     /// A shared core failure (journal/storage SQLITE_BUSY, serialization).
     #[error("core error: {0}")]
     Core(#[from] agentos_core::CoreError),
+    /// An agent-registry failure (F-13 storage/validation).
+    #[error("agent registry error: {0}")]
+    Agents(#[from] agentos_agents::AgentsError),
     /// A policy-engine failure (approval/audit store). Retryability rides
     /// the wrapped [`agentos_core::CoreError::SqliteBusy`]; a policy error
     /// never authorizes anything.

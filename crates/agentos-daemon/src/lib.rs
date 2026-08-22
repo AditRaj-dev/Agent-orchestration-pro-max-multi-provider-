@@ -18,8 +18,14 @@
 //! - [`projection`] folds the journal into the F-11 §3.3 UI summaries
 //!   (runs/tasks/agents) — a pure read-side projection, never a second
 //!   source of truth.
+//! - [`agent_sessions`] is the F-13 chat-session service: registry agents
+//!   (creator, researcher, …) spawned over their record's adapter with
+//!   skill preambles composed ahead of the message, adapter events
+//!   translated into journal events.
 //! - [`server`] is the loopback WebSocket JSON API (framing, method table,
-//!   replay-then-tail subscriptions, `daemon.stopping` broadcast).
+//!   replay-then-tail subscriptions, `daemon.stopping` broadcast) — since
+//!   F-13 it also carries the registry write methods and the chat-session
+//!   methods over [`agent_sessions`].
 //! - [`seed`] appends the frozen demo fixture into an explicit throwaway
 //!   journal (F-11 §3.4) for UI development without a live supervisor.
 //!
@@ -28,6 +34,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod agent_sessions;
 pub mod db;
 pub mod events;
 pub mod projection;

@@ -369,21 +369,19 @@ flows into ledger attribution.
   cannot fire engine-side yet; F-07 enforces cost at its own layer (executor +
   post-tick scan). Wiring `UsageLedger` into the scheduler is a one-liner once
   the engine takes a cost source.
-- **No `Gate::GitCommit` in F-10 (worked around, not edited):** `Gate` names
-  exactly one git gate (`GitPush`). The supervisor binds commit approvals to
-  it and puts the `action` in the *operation payload*, so a commit approval
-  and a push approval have different fingerprints and never transfer — the
-  security property holds, but the gate column reads `git_push` for a commit.
-  Adding a `Gate::GitCommit` variant is an `agentos-policy` change and was out
-  of this PR's file scope.
-- **`git_gate_check` only gates push; the supervisor gates every mutation.**
-  F-10's contract is "push requires a live approval"; F-07 tightens it because
-  everything its gate enqueues lands in the governed repository. The
-  permission leg is F-10's verbatim (permission trumps approval).
-- **Approval consumption is still not implemented (F-10 §3).** An approval
-  bound to a fingerprint stays valid for its whole ttl, so a *retried* attempt
-  of the same task reuses it. That is intended for retries (same operation),
-  but a one-time-use gate would need F-10 to add consumption.
+- **Commit has its own gate.** F-10 grew `Gate::GitCommit`, so the gate
+  constant is now the gate `agentos_policy::approval_gate` assigns to the
+  action the node performs (a unit test keeps the two in sync), and the audit
+  column reads `git_commit` for a commit. `git_gate_check` demands a live
+  approval for commit *and* push, which is what F-07 already enforced by hand;
+  the permission leg is F-10's verbatim (permission trumps approval).
+- **Git approvals are single-use.** One human decision authorizes exactly one
+  mutation: the supervisor requests git-gate approvals with `request_once` and
+  calls `consume` *after* the commit and ledger entry land — consuming first
+  would burn the decision on an attempt that then failed. A spent approval
+  reads as `GateVerdict::Consumed`, a deterministic refusal (`reason` =
+  `approval_already_used`), not a wait. Node-progression gates
+  (`HumanApproval`) stay reusable: a retry asks the same question.
 - **A pending human approval parks, it does not retry.** F-06 grew
   `Outcome::AwaitingApproval`, so the supervisor returns it and the engine
   CASes `Running → HumanRequired` without consuming an attempt or holding the
@@ -405,9 +403,9 @@ flows into ledger attribution.
 | ~~Git-gate approval (`approved=true` at enqueue)~~ | **CLOSED (this PR)** — verdict from `git_gate_check` + `ApprovalStore` |
 | ~~HumanApproval node plumbing~~ | **CLOSED (this PR)** — resolved against the approval store |
 | ~~Permission compilation into `SpawnSpec`~~ | **CLOSED (this PR)** — `compile_to_spawn_spec`, fail-closed |
-| `Gate::GitCommit` (commit approvals ride `GitPush`) | agentos-policy follow-up |
+| ~~`Gate::GitCommit`~~ | **CLOSED** — F-10 has it; the audit column reads `git_commit` |
 | ~~`Outcome::AwaitingApproval`~~ | **CLOSED** — F-06 has it; HumanApproval parks in `HumanRequired` |
-| One-time approval consumption | agentos-policy follow-up (F-10 §3) |
+| ~~One-time approval consumption~~ | **CLOSED** — git approvals are `request_once` + `consume` |
 | Deterministic stub reviewer | later PR (reviewer pool) |
 | Cross-stage ownership holds (until commit, not per attempt) | orchestration PR |
 | Contract amendments re-leased mid-run | orchestrator PR |

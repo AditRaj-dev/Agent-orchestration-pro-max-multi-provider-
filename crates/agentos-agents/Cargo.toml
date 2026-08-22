@@ -1,0 +1,18 @@
+[package]
+name = "agentos-agents"
+description = "F-13: dynamic agent registry — custom agents, skills, and prompt-preamble composition"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+agentos-core = { path = "../agentos-core" }
+rusqlite = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

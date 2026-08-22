@@ -12,7 +12,9 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use agentos_agents::AgentRegistry;
 use agentos_core::{Event, EventType};
+use agentos_daemon::agent_sessions::{AdapterSet, AgentSessions};
 use agentos_daemon::{db, events, server};
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
@@ -27,7 +29,8 @@ use uuid::Uuid;
 /// hanging the suite.
 const READ_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Server fixture: temp journal (seeded), bound WS server, shutdown switch.
+/// Server fixture: temp journal (seeded), agent registry (built-ins
+/// seeded), mock-backed chat sessions, bound WS server, shutdown switch.
 struct TestServer {
     _dir: tempfile::TempDir,
     journal_path: PathBuf,
@@ -43,9 +46,22 @@ async fn spawn_server(seeded: Vec<Event>) -> TestServer {
     for event in &seeded {
         events::append_event(&conn, event).expect("seed append");
     }
-    let bound = server::WsServer::new(Arc::new(Mutex::new(conn)), journal_path.clone())
-        .bind("127.0.0.1:0")
-        .expect("bind ephemeral loopback port");
+    let registry = Arc::new(AgentRegistry::open(&dir.path().join("agents.db")).expect("registry"));
+    registry.seed_builtins().expect("seed built-ins");
+    let sessions = Arc::new(AgentSessions::new(
+        Arc::clone(&registry),
+        AdapterSet::wired(),
+        journal_path.clone(),
+        dir.path().to_path_buf(),
+    ));
+    let bound = server::WsServer::new(
+        Arc::new(Mutex::new(conn)),
+        journal_path.clone(),
+        registry,
+        sessions,
+    )
+    .bind("127.0.0.1:0")
+    .expect("bind ephemeral loopback port");
     let addr = bound.local_addr();
     let (shutdown, shutdown_rx) = watch::channel(false);
     let task = tokio::spawn(bound.serve(shutdown_rx));
@@ -533,6 +549,56 @@ async fn slow_subscriber_is_closed_not_stalled() {
     srv.task.await.expect("serve task").expect("serve clean");
 }
 
+/// F-13 live e2e (opt-in, BILLABLE): a real chat with the seeded
+/// researcher (agy → gemini-3.1-pro-high). Doubly gated: `#[ignore]` plus
+/// `AGENTOS_AGY_E2E=1` — mirroring the adapter crates' live-probe gates.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "live agy session (billable): set AGENTOS_AGY_E2E=1 to run"]
+async fn live_researcher_chat_e2e() {
+    if std::env::var("AGENTOS_AGY_E2E").ok().as_deref() != Some("1") {
+        return;
+    }
+    let srv = spawn_server(vec![]).await;
+    let mut client = connect(srv.addr).await;
+
+    let resp = client
+        .request(
+            1,
+            "agent.session.start",
+            json!({
+                "agentId": "researcher",
+                "message": "In one sentence: what is the Antigravity CLI? Reply in a single sentence."
+            }),
+        )
+        .await;
+    assert_eq!(resp["ok"], json!(true), "{resp}");
+    let session_id = resp["result"]["sessionId"]
+        .as_str()
+        .expect("sessionId")
+        .to_owned();
+
+    let finished = tokio::time::timeout(Duration::from_secs(180), async {
+        loop {
+            let frame = client.next_frame().await;
+            if frame["notification"] == json!("event")
+                && frame["event"]["eventType"] == json!("session.finished")
+                && frame["event"]["payload"]["sessionId"] == json!(session_id)
+            {
+                return frame;
+            }
+        }
+    })
+    .await
+    .expect("researcher session.finished within 3 minutes");
+    let reply = finished["event"]["payload"]["finalResult"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(!reply.trim().is_empty(), "researcher produced a reply");
+
+    srv.shutdown.send(true).ok();
+    srv.task.await.expect("serve task").expect("serve clean");
+}
+
 /// `events.list` request with the pagination params filled in.
 async fn list_page_helper(client: &mut Client, id: u64, after: i64, limit: i64) -> Value {
     client
@@ -542,6 +608,244 @@ async fn list_page_helper(client: &mut Client, id: u64, after: i64, limit: i64) 
             json!({ "afterSeq": after, "limit": limit }),
         )
         .await
+}
+
+/// F-13: registry CRUD over the WS surface — seeded built-ins visible,
+/// create/update/delete round-trips, builtin delete refused, mutations
+/// journaled as `agent.*` events, skills listed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn registry_crud_roundtrips_over_ws() {
+    let srv = spawn_server(vec![]).await;
+    let mut client = connect(srv.addr).await;
+
+    // Built-ins are seeded and listed.
+    let resp = client.request(1, "registry.agents.list", json!({})).await;
+    assert_eq!(resp["ok"], json!(true));
+    let agents = resp["result"]["agents"].as_array().expect("agents");
+    let ids: Vec<&str> = agents
+        .iter()
+        .map(|a| a["id"].as_str().expect("id"))
+        .collect();
+    for expected in ["agent-creator", "orchestrator", "researcher"] {
+        assert!(
+            ids.contains(&expected),
+            "built-in {expected} seeded: {ids:?}"
+        );
+    }
+
+    // Skills list carries the built-in skills.
+    let resp = client.request(2, "registry.skills.list", json!({})).await;
+    let skills = resp["result"]["skills"].as_array().expect("skills");
+    assert!(skills
+        .iter()
+        .any(|s| s["id"] == json!("mastermind-commands")));
+
+    // Create with the minimal wire shape (server-owned fields default).
+    let resp = client
+        .request(
+            3,
+            "registry.agents.create",
+            json!({ "agent": {
+                "id": "sql-reviewer", "name": "SQL Reviewer",
+                "description": "reviews migrations",
+                "adapterId": "claude-code", "model": "claude-sonnet-5",
+                "skills": ["tech-research"]
+            }}),
+        )
+        .await;
+    assert_eq!(resp["ok"], json!(true), "{resp}");
+    assert_eq!(
+        resp["result"]["agent"]["mode"],
+        json!("plan"),
+        "safe default"
+    );
+    assert_eq!(resp["result"]["agent"]["builtin"], json!(false));
+
+    // Wire cannot forge builtin.
+    let resp = client
+        .request(
+            4,
+            "registry.agents.create",
+            json!({ "agent": {
+                "id": "fake-builtin", "name": "Fake", "description": "x",
+                "adapterId": "mock", "builtin": true
+            }}),
+        )
+        .await;
+    assert_eq!(resp["ok"], json!(true), "{resp}");
+    assert_eq!(resp["result"]["agent"]["builtin"], json!(false));
+
+    // Update: rename the created agent.
+    let resp = client
+        .request(
+            5,
+            "registry.agents.update",
+            json!({ "agent": {
+                "id": "sql-reviewer", "name": "SQL Reviewer (senior)",
+                "description": "reviews migrations", "adapterId": "claude-code"
+            }}),
+        )
+        .await;
+    assert_eq!(resp["ok"], json!(true), "{resp}");
+    assert_eq!(
+        resp["result"]["agent"]["name"],
+        json!("SQL Reviewer (senior)")
+    );
+
+    // Builtin delete is refused; user delete works and both show up in the
+    // journal as `agent.*` events.
+    let resp = client
+        .request(6, "registry.agents.delete", json!({ "id": "researcher" }))
+        .await;
+    assert_eq!(resp["ok"], json!(false));
+    assert_eq!(resp["error"]["code"], json!("invalid_params"));
+
+    let resp = client
+        .request(7, "registry.agents.delete", json!({ "id": "fake-builtin" }))
+        .await;
+    assert_eq!(resp["ok"], json!(true), "{resp}");
+
+    let conn = db::open_db(&srv.journal_path).expect("journal");
+    let batch = events::tail_with_seq(&conn, 0, u32::MAX).expect("tail");
+    let mut types = std::collections::BTreeSet::new();
+    for sequenced in &batch {
+        types.insert(sequenced.event.event_type.to_string());
+    }
+    assert!(types.contains("agent.created"), "{types:?}");
+    assert!(types.contains("agent.updated"), "{types:?}");
+    assert!(types.contains("agent.deleted"), "{types:?}");
+
+    srv.shutdown.send(true).ok();
+    srv.task.await.expect("serve task").expect("serve clean");
+}
+
+/// F-13: `registry.catalog` shape — three providers, free probes only,
+/// claude/mock static model lists, no auth requirement to enumerate.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn registry_catalog_lists_providers_and_models() {
+    let srv = spawn_server(vec![]).await;
+    let mut client = connect(srv.addr).await;
+
+    let resp = client.request(1, "registry.catalog", json!({})).await;
+    assert_eq!(resp["ok"], json!(true), "{resp}");
+    let providers = resp["result"]["providers"].as_array().expect("providers");
+    let ids: Vec<&str> = providers
+        .iter()
+        .map(|p| p["id"].as_str().expect("provider id"))
+        .collect();
+    assert!(ids.contains(&"claude-code"), "{ids:?}");
+    assert!(ids.contains(&"antigravity-agy"), "{ids:?}");
+    assert!(ids.contains(&"mock"), "{ids:?}");
+
+    let claude = providers
+        .iter()
+        .find(|p| p["id"] == json!("claude-code"))
+        .expect("claude entry");
+    let models = claude["models"].as_array().expect("claude models");
+    assert!(
+        models.iter().any(|m| m["id"] == json!("claude-opus-5")),
+        "{models:?}"
+    );
+
+    srv.shutdown.send(true).ok();
+    srv.task.await.expect("serve task").expect("serve clean");
+}
+
+/// F-13: a mock-adapter chat session over the WS API — start against a
+/// mock-backed agent, watch `session.*` events arrive through the normal
+/// subscription path, and confirm the terminal cleanup (sends refuse).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn chat_session_over_ws_journals_and_terminates() {
+    let srv = spawn_server(vec![]).await;
+    let mut client = connect(srv.addr).await;
+
+    // A mock-backed agent to chat with (credential-free).
+    let resp = client
+        .request(
+            1,
+            "registry.agents.create",
+            json!({ "agent": {
+                "id": "chatty", "name": "Chatty", "description": "mock chat",
+                "adapterId": "mock", "model": "mock-model-1", "skills": ["tech-research"]
+            }}),
+        )
+        .await;
+    assert_eq!(resp["ok"], json!(true), "{resp}");
+
+    // Subscribe first so the chat events stream to us live.
+    let resp = client
+        .request(2, "events.subscribe", json!({ "afterSeq": 0 }))
+        .await;
+    let _sub = resp["result"]["subscriptionId"]
+        .as_str()
+        .expect("sub")
+        .to_owned();
+
+    let resp = client
+        .request(
+            3,
+            "agent.session.start",
+            json!({ "agentId": "chatty", "message": "hello there" }),
+        )
+        .await;
+    assert_eq!(resp["ok"], json!(true), "{resp}");
+    let session_id = resp["result"]["sessionId"]
+        .as_str()
+        .expect("sessionId")
+        .to_owned();
+    assert!(session_id.starts_with("chat-"), "{session_id}");
+
+    // Drain notifications until session.finished for our id (bounded).
+    let finished = tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            let frame = client.next_frame().await;
+            if frame["notification"] == json!("event")
+                && frame["event"]["eventType"] == json!("session.finished")
+                && frame["event"]["payload"]["sessionId"] == json!(session_id)
+            {
+                return frame;
+            }
+        }
+    })
+    .await
+    .expect("session.finished within deadline");
+    assert_eq!(
+        finished["event"]["agentId"],
+        json!("chatty"),
+        "events carry the registry agent id"
+    );
+
+    // Finished sessions refuse follow-ups with invalid_params.
+    let resp = client
+        .request(
+            4,
+            "agent.session.send",
+            json!({ "sessionId": session_id, "message": "again" }),
+        )
+        .await;
+    assert_eq!(resp["ok"], json!(false));
+    assert_eq!(resp["error"]["code"], json!("invalid_params"));
+
+    // Unknown agents / empty messages are parameter errors.
+    let resp = client
+        .request(
+            5,
+            "agent.session.start",
+            json!({ "agentId": "ghost", "message": "hi" }),
+        )
+        .await;
+    assert_eq!(resp["error"]["code"], json!("invalid_params"));
+    let resp = client
+        .request(
+            6,
+            "agent.session.start",
+            json!({ "agentId": "chatty", "message": "" }),
+        )
+        .await;
+    assert_eq!(resp["error"]["code"], json!("invalid_params"));
+
+    srv.shutdown.send(true).ok();
+    srv.task.await.expect("serve task").expect("serve clean");
 }
 
 /// A small synthetic journal: task `a` walks to `done` (with a commit sha),

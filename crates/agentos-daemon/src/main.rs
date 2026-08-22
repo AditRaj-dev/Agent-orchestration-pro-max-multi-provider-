@@ -14,13 +14,17 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::{Arc, Mutex};
 
+use agentos_agents::AgentRegistry;
 use agentos_core::{Event, EventType};
 use tokio::sync::watch;
 use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
 
-use agentos_daemon::{db, events, seed, server};
+use agentos_daemon::{
+    agent_sessions::{AdapterSet, AgentSessions},
+    db, events, seed, server,
+};
 
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -32,7 +36,7 @@ async fn main() -> ExitCode {
 
     let args: Vec<String> = std::env::args().collect();
     match args.get(1).map(String::as_str) {
-        None | Some("serve") => serve().await,
+        None | Some("serve") => serve(&args[2..]).await,
         Some("demo-seed") => demo_seed(&args[2..]),
         Some(other) => {
             error!(
@@ -45,7 +49,28 @@ async fn main() -> ExitCode {
 }
 
 /// Default mode: F-01 startup sequence, then the F-11a WS API until ctrl-c.
-async fn serve() -> ExitCode {
+///
+/// F-13 additions: the agent registry (`agents.db` beside the journal,
+/// built-ins seeded idempotently) and the chat-session service over the
+/// three adapters (claude-code, antigravity-agy, mock — mock so the UI and
+/// tests can exercise the full surface without billing).
+async fn serve(flags: &[String]) -> ExitCode {
+    let mut project: Option<PathBuf> = None;
+    let mut rest = flags.iter();
+    while let Some(flag) = rest.next() {
+        let Some(value) = rest.next() else {
+            error!(flag, "flag requires a value");
+            return ExitCode::FAILURE;
+        };
+        match flag.as_str() {
+            "--project" => project = Some(PathBuf::from(value)),
+            other => {
+                error!(flag = other, "unknown serve flag (expected --project)");
+                return ExitCode::FAILURE;
+            }
+        }
+    }
+
     let db_path = journal_path();
     if let Some(parent) = db_path.parent() {
         if !parent.as_os_str().is_empty() {
@@ -64,6 +89,48 @@ async fn serve() -> ExitCode {
         }
     };
     info!(journal = %db_path.display(), "journal open (SQLite, WAL, busy_timeout=5000ms)");
+
+    // F-13: the agent registry lives beside the journal and seeds the
+    // mastermind trio idempotently (edited built-ins survive).
+    let registry_path = match db_path.parent() {
+        Some(parent) => parent.join("agents.db"),
+        None => PathBuf::from("agents.db"),
+    };
+    let registry = match AgentRegistry::open(&registry_path)
+        .and_then(|r| r.seed_builtins().map(|inserted| (r, inserted)))
+    {
+        Ok((registry, inserted)) => {
+            info!(
+                registry = %registry_path.display(),
+                inserted,
+                "agent registry open; built-ins seeded"
+            );
+            Arc::new(registry)
+        }
+        Err(err) => {
+            error!(path = %registry_path.display(), %err, "failed to open agent registry");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    // Chat sessions run in the project root: `--project`, else
+    // `AGENTOS_PROJECT`, else the daemon's cwd.
+    let workspace = project
+        .or_else(|| std::env::var_os("AGENTOS_PROJECT").map(PathBuf::from))
+        .or_else(|| std::env::current_dir().ok())
+        .unwrap_or_else(|| PathBuf::from("."));
+    if let Err(err) = std::fs::create_dir_all(&workspace) {
+        error!(path = %workspace.display(), %err, "failed to create the chat workspace");
+        return ExitCode::FAILURE;
+    }
+
+    let sessions = Arc::new(AgentSessions::new(
+        Arc::clone(&registry),
+        AdapterSet::wired(),
+        db_path.clone(),
+        workspace.clone(),
+    ));
+    info!(workspace = %workspace.display(), "agent chat sessions enabled (claude-code, antigravity-agy, mock)");
 
     // Startup marker. Daemon lifecycle is not run-scoped, so `run_id`
     // stays `None` ("where applicable", F-00 §3); a fresh trace id ties
@@ -86,7 +153,13 @@ async fn serve() -> ExitCode {
     // external writers append through their own connections (WAL), which
     // the subscription tail polls observe (F-11 §3.2).
     let addr = server::ws_addr_from_env();
-    let bound = match server::WsServer::new(Arc::new(Mutex::new(conn)), db_path.clone()).bind(&addr)
+    let bound = match server::WsServer::new(
+        Arc::new(Mutex::new(conn)),
+        db_path.clone(),
+        registry,
+        sessions,
+    )
+    .bind(&addr)
     {
         Ok(bound) => bound,
         Err(err) => {

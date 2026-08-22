@@ -525,6 +525,64 @@ impl TaskStore {
         Ok(())
     }
 
+    /// Retarget a task at another agent pool (OR-01 escalation to a
+    /// stronger agent), rewriting the `agent_role` of its stored node spec.
+    ///
+    /// Legal only while the task is **not executing** and not terminal: a
+    /// swap under a `Leased`/`Running` task would change the contract the
+    /// current attempt is already working against, and a terminal task has
+    /// no next attempt to route. The state check and the write share one
+    /// transaction, so a lease granted concurrently cannot slip past it.
+    ///
+    /// Returns the updated record; `Ok(None)` when the task is in a state
+    /// that refuses the retarget, so callers can report "not routed" without
+    /// treating it as a storage failure.
+    pub fn set_agent_role(
+        &self,
+        task_id: &Uuid,
+        role: Option<&str>,
+    ) -> Result<Option<TaskRecord>, CoreError> {
+        let mut conn = self.lock()?;
+        let tx = conn.transaction().map_err(map_sqlite_error)?;
+        let result = (|| -> Result<Option<TaskRecord>, CoreError> {
+            let task = task_in_tx(&tx, task_id)?;
+            if !retargetable(task.state) {
+                return Ok(None);
+            }
+            let mut node = task.node.clone();
+            node.agent_role = role.map(str::to_owned);
+            let node_json = serde_json::to_string(&node)
+                .map_err(|err| CoreError::Serialization(format!("node spec: {err}")))?;
+            let updated = tx
+                .execute(
+                    "UPDATE tasks SET node = ?2, updated_at = ?3 WHERE id = ?1 AND state = ?4",
+                    rusqlite::params![
+                        task_id.to_string(),
+                        node_json,
+                        Utc::now().to_rfc3339(),
+                        task.state.as_str()
+                    ],
+                )
+                .map_err(map_sqlite_error)?;
+            if updated != 1 {
+                // The task moved (most likely into a lease) between the read
+                // and the write: refuse rather than rewrite it mid-flight.
+                return Ok(None);
+            }
+            Ok(Some(task_in_tx(&tx, task_id)?))
+        })();
+        match result {
+            Ok(record) => {
+                tx.commit().map_err(map_sqlite_error)?;
+                Ok(record)
+            }
+            Err(err) => {
+                let _ = tx.rollback();
+                Err(err)
+            }
+        }
+    }
+
     // ------------------------------------------------- compare-and-swap ops
 
     /// Atomically move a task between states: legality is checked through
@@ -844,6 +902,21 @@ fn cas_update_state(
         1 => Ok(()),
         _ => Err(classify_cas_miss(tx, task_id, to)),
     }
+}
+
+/// States in which a task's node spec may be retargeted: it is queued or
+/// parked, so the next lease will read the new role. Executing states
+/// (`Leased`, `Running`) and terminal states are refused.
+fn retargetable(state: TaskState) -> bool {
+    matches!(
+        state,
+        TaskState::Created
+            | TaskState::Planned
+            | TaskState::Ready
+            | TaskState::Blocked
+            | TaskState::Retryable
+            | TaskState::HumanRequired
+    )
 }
 
 /// Read a run row inside an open transaction.

@@ -312,3 +312,36 @@ replay→external-writer tail→resubscribe→unsubscribe, projections over WS,
 the real binary serves `101` + `ping`/`daemon.info` round-trips on
 `127.0.0.1:8799` from a hand-rolled WS client, and `demo-seed` appends 51
 events / refuses both the default path and a reseed.
+
+## 8. F-13 addendum: registry & chat-session methods (binding)
+
+F-13 (`docs/F-13-agent-registry.md`) extends this contract's method table —
+§2 framing/error codes apply unchanged. `dispatch` became `async` for the
+adapter-facing arms; the §"Journal access" invariant survives (guards never
+cross an await).
+
+New methods: `registry.agents.list` / `registry.agents.create` /
+`registry.agents.update` / `registry.agents.delete` /
+`registry.agents.set-enabled` / `registry.skills.list` / `registry.catalog` /
+`agent.session.start` / `agent.session.send` / `agent.session.cancel` — exact
+params/results in F-13 §3. Error mapping: domain rejections (validation,
+duplicate, not-found, builtin-protected, finished-session) → `invalid_params`;
+storage/adapter failures → `internal_error`.
+
+New journal event types (all round-trip via `EventType::Other`):
+`agent.created` / `agent.updated` / `agent.deleted` (registry audit; payload
+= the full record), `session.instruction` (chat follow-up; payload =
+`{sessionId, message}`), `session.finished` (payload adds `finalResult`,
+`chat: true` on chat sessions), `agent.session_failed` (`{sessionId, error}`),
+`session.cancelled`, `agent.proposal` (`{sessionId, agent}` — a validated
+draft, never a registration), `agent.proposal_invalid` (`{sessionId, reason}`).
+Chat sessions set `agent_id` = the registry agent slug and share one
+`trace_id` per conversation; they carry **no** `run_id`/`task_id` (no
+fabricated projections). `session.spawn` payloads gain `model` and
+`objectivePreview` (first 2 000 chars, preamble included) on both the
+supervisor and chat paths.
+
+The read-only promise of §1 is narrowed, deliberately and visibly: the
+**registry** methods are the first write path in the daemon's own API surface
+(the journal stays append-only and trigger-guarded; the registry's own tables
+are mutable with the journal as their audit trail).

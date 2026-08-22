@@ -8,6 +8,7 @@ license.workspace = true
 [dependencies]
 agentos-core = { path = "../agentos-core" }
 agentos-adapters = { path = "../agentos-adapters" }
+agentos-policy = { path = "../agentos-policy" }
 agentos-workflow = { path = "../agentos-workflow" }
 tokio = { workspace = true }
 serde = { workspace = true }

@@ -382,6 +382,25 @@ pub enum OrchestratorError {
     /// The plan was refused before any durable state was created.
     #[error("plan rejected: {0}")]
     Rejected(#[from] RejectionReason),
+    /// The escalation desk (F-10 approval store) could not be reached. The
+    /// escalation is still recorded in the plan ledger and reported; only
+    /// the human-facing hand-off failed.
+    #[error("escalation desk: {detail}")]
+    Desk {
+        /// Store detail, never credential-bearing.
+        detail: String,
+    },
+}
+
+/// `PolicyError` is neither `Clone` nor `PartialEq`, so it is flattened to
+/// its message rather than carried — this error type stays comparable for
+/// the report types that embed it.
+impl From<agentos_policy::PolicyError> for OrchestratorError {
+    fn from(error: agentos_policy::PolicyError) -> Self {
+        OrchestratorError::Desk {
+            detail: error.to_string(),
+        }
+    }
 }
 
 impl OrchestratorError {
@@ -393,6 +412,9 @@ impl OrchestratorError {
             OrchestratorError::Workflow(inner) => inner.is_retryable(),
             OrchestratorError::Storage(inner) => inner.is_retryable(),
             OrchestratorError::Model { .. } => true,
+            // The approval store is SQLite: contention is transient, so
+            // the next cycle can re-raise the escalation.
+            OrchestratorError::Desk { .. } => true,
             OrchestratorError::NoRun | OrchestratorError::Rejected(_) => false,
         }
     }

@@ -73,11 +73,33 @@ pub struct SnapshotPolicies {
     pub pools: Vec<String>,
     /// Pool used for reviews when none is named.
     pub reviewer_pool: String,
+    /// The F-13 registry roster behind `pools`: who each id actually is
+    /// (provider, model, what it is for). Empty when the deployment runs
+    /// the static default pools.
+    #[serde(default)]
+    pub worker_roster: Vec<RosterEntry>,
     /// Restated invariant: the orchestrator commands, it does not write
     /// code or touch git.
     pub orchestrator_may_write_code: bool,
     /// Restated invariant: mutations are engine-validated commands.
     pub direct_state_writes: bool,
+}
+
+/// One registry agent in the orchestrator's routing view (F-13).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RosterEntry {
+    /// Registry agent id — the `pool` value operations route with.
+    pub id: String,
+    /// Human-facing name.
+    pub name: String,
+    /// What this agent is for (routing signal for the model).
+    pub description: String,
+    /// Provider adapter id (`claude-code`, `antigravity-agy`, …).
+    pub adapter: String,
+    /// Model slug, when the record pins one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
 }
 
 /// The compact state snapshot (OR-01).
@@ -137,6 +159,7 @@ impl PlanSnapshot {
             policies: SnapshotPolicies {
                 pools: plan.policy.pools.clone(),
                 reviewer_pool: plan.policy.reviewer_pool.clone(),
+                worker_roster: Vec::new(),
                 orchestrator_may_write_code: false,
                 direct_state_writes: false,
             },
@@ -148,6 +171,15 @@ impl PlanSnapshot {
             },
             rejections: rejections.to_vec(),
         }
+    }
+
+    /// Attach the F-13 worker roster (registry agents this deployment can
+    /// route to). Rendered both into the state snapshot's policies and as
+    /// a dedicated prompt section — the model needs the *descriptions* to
+    /// route, not just the ids.
+    pub fn with_roster(mut self, roster: Vec<RosterEntry>) -> Self {
+        self.policies.worker_roster = roster;
+        self
     }
 
     /// Render the prompt for one cycle: the standing contract, the phase's
@@ -184,6 +216,28 @@ impl PlanSnapshot {
             }
             lines
         };
+        // The F-13 roster section: descriptions are routing signal — an id
+        // alone tells the model nothing about *when* to pick the agent.
+        let roster = if self.policies.worker_roster.is_empty() {
+            String::new()
+        } else {
+            let mut lines = String::from("\nWORKER ROSTER (route `pool` by these ids):\n");
+            for entry in &self.policies.worker_roster {
+                lines.push_str(&format!(
+                    "  {} — {} [{}{}]\n    {}\n",
+                    entry.id,
+                    entry.name,
+                    entry.adapter,
+                    entry
+                        .model
+                        .as_deref()
+                        .map(|model| format!(", {model}"))
+                        .unwrap_or_default(),
+                    entry.description
+                ));
+            }
+            lines
+        };
 
         format!(
             "You are the master orchestrator of an agent engineering OS.\n\
@@ -212,6 +266,7 @@ impl PlanSnapshot {
              - Route only to the pools listed in policies.pools.\n\
              - Legal operations in this phase: {legal}.\n\
              - Emit at most {max_ops} operations.\n\
+             {roster}\
              {corrections}\n\
              Reply with a JSON array of operation objects and nothing else. \
              An empty array means you propose no change.\n\
@@ -220,6 +275,7 @@ impl PlanSnapshot {
              {state}\n",
             legal = legal,
             max_ops = self.budgets.max_operations_per_cycle,
+            roster = roster,
             corrections = corrections,
             state = state,
         )
@@ -326,5 +382,49 @@ mod tests {
         let prompt = PlanSnapshot::build(&plan, None, 1, &[]).render_prompt();
         assert!(prompt.contains("run_already_started"), "{prompt}");
         assert!(prompt.contains("escalate, close_goal ONLY"));
+    }
+
+    #[test]
+    fn roster_renders_ids_with_descriptions_and_survives_round_trip() {
+        let plan = planning_plan();
+        let snapshot = PlanSnapshot::build(&plan, None, 0, &[]).with_roster(vec![
+            RosterEntry {
+                id: "researcher".to_owned(),
+                name: "Researcher".to_owned(),
+                description: "Researches topics and tech stacks.".to_owned(),
+                adapter: "antigravity-agy".to_owned(),
+                model: Some("gemini-3.1-pro-high".to_owned()),
+            },
+            RosterEntry {
+                id: "coder".to_owned(),
+                name: "Coder".to_owned(),
+                description: "Writes the code.".to_owned(),
+                adapter: "claude-code".to_owned(),
+                model: None,
+            },
+        ]);
+        let prompt = snapshot.render_prompt();
+        assert!(prompt.contains("WORKER ROSTER"), "{prompt}");
+        assert!(
+            prompt.contains("researcher — Researcher [antigravity-agy, gemini-3.1-pro-high]"),
+            "{prompt}"
+        );
+        assert!(
+            prompt.contains("Researches topics and tech stacks."),
+            "descriptions are routing signal: {prompt}"
+        );
+
+        // The roster is snapshot state too (policies.workerRoster).
+        let wire = serde_json::to_value(&snapshot).unwrap();
+        assert_eq!(
+            wire["policies"]["workerRoster"].as_array().unwrap().len(),
+            2
+        );
+        let parsed: PlanSnapshot = serde_json::from_value(wire).unwrap();
+        assert_eq!(parsed, snapshot);
+
+        // No roster, no section.
+        let bare = PlanSnapshot::build(&plan, None, 0, &[]).render_prompt();
+        assert!(!bare.contains("WORKER ROSTER"));
     }
 }

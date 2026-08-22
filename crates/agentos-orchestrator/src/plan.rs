@@ -74,6 +74,15 @@ pub struct PlanPolicy {
     pub pools: Vec<String>,
     /// Pool used for `request_review` when the model names none.
     pub reviewer_pool: String,
+    /// Pool an `escalate` to a **stronger agent** retargets tasks at.
+    /// `None` (the default) means the deployment declares no higher-capability
+    /// tier, and such an escalation raises priority only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub escalation_pool: Option<String>,
+    /// Pool an `escalate` to a **supervisor** retargets tasks at (PRD OR-02
+    /// domain supervisors). `None` until those pools exist.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supervisor_pool: Option<String>,
     /// Hard ceiling on plan nodes.
     pub max_nodes: usize,
     /// Hard ceiling on operations accepted from one model response.
@@ -89,10 +98,39 @@ impl Default for PlanPolicy {
             version: 1,
             pools: DEFAULT_POOLS.iter().map(|p| (*p).to_owned()).collect(),
             reviewer_pool: DEFAULT_REVIEWER_POOL.to_owned(),
+            escalation_pool: None,
+            supervisor_pool: None,
             max_nodes: 64,
             max_operations_per_cycle: 32,
             max_cycles: 4,
         }
+    }
+}
+
+impl PlanPolicy {
+    /// Build a policy over a dynamic roster (F-13): pools are the enabled
+    /// registry agent ids, and the reviewer pool is one of them. The
+    /// daemon composes this from `AgentRegistry::enabled_roster()`; the
+    /// orchestrator crate stays registry-agnostic (strings in, strings
+    /// out).
+    pub fn for_pools(pools: Vec<String>, reviewer_pool: impl Into<String>) -> Self {
+        Self {
+            pools,
+            reviewer_pool: reviewer_pool.into(),
+            ..Self::default()
+        }
+    }
+
+    /// Declare the pool a `stronger_agent` escalation retargets tasks at.
+    pub fn with_escalation_pool(mut self, pool: impl Into<String>) -> Self {
+        self.escalation_pool = Some(pool.into());
+        self
+    }
+
+    /// Declare the pool a `supervisor` escalation retargets tasks at.
+    pub fn with_supervisor_pool(mut self, pool: impl Into<String>) -> Self {
+        self.supervisor_pool = Some(pool.into());
+        self
     }
 }
 

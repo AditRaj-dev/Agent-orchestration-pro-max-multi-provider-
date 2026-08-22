@@ -167,6 +167,11 @@ pub struct SupervisorConfig {
     /// the leased contract* ([`crate::policy::derive_permissions`]), which
     /// is the least-privilege default.
     pub role_permissions: HashMap<String, PermissionSet>,
+    /// F-13: the dynamic agent registry's database. When set, a node's
+    /// `agent_role` is first resolved as a registry agent id — the record's
+    /// adapter, model and skill preamble drive the spawn — before the
+    /// static `role_adapters` table is consulted.
+    pub agents_db: Option<PathBuf>,
     /// The permission set the git gate itself acts under. Default:
     /// [`PermissionSet::git_manager`] — the only role holding git actions
     /// (GIT-01). Narrow it to prove PRD §23.3: a gate without `Commit`
@@ -202,6 +207,7 @@ impl SupervisorConfig {
             default_adapter: "mock".to_owned(),
             role_adapters: HashMap::new(),
             role_permissions: HashMap::new(),
+            agents_db: None,
             git_gate_permissions: PermissionSet::git_manager(),
             human_approval_gate: Gate::ProdAction,
             approval_ttl_secs: 900,
@@ -220,6 +226,14 @@ impl SupervisorConfig {
     /// contract-derived default for nodes carrying that role).
     pub fn with_role_permissions(mut self, role: &str, permissions: PermissionSet) -> Self {
         self.role_permissions.insert(role.to_owned(), permissions);
+        self
+    }
+
+    /// Enable the F-13 dynamic registry: `agent_role` values resolve as
+    /// registry agent ids first (adapter + model + skill preamble per
+    /// record), falling back to the static routing table.
+    pub fn with_agents_db(mut self, path: impl Into<PathBuf>) -> Self {
+        self.agents_db = Some(path.into());
         self
     }
 
@@ -305,6 +319,8 @@ struct SupervisorCore {
     config: SupervisorConfig,
     journal: Journal,
     adapters: Vec<Arc<dyn RuntimeAdapter>>,
+    /// F-13 dynamic registry overlay, opened from `agents_db` when set.
+    registry: Option<Arc<agentos_agents::AgentRegistry>>,
     store: Arc<TaskStore>,
     worktrees: WorktreeManager,
     queue: Arc<MutationQueue>,
@@ -346,13 +362,20 @@ impl SupervisorCore {
         Ok(())
     }
 
-    /// The adapter for a node's `agent_role`: the role mapping when present,
-    /// else the configured default. Arc-cloned out of the registry.
+    /// The adapter for a node's `agent_role`: the registry record's
+    /// adapter when the role names a registered agent (F-13), else the
+    /// static role mapping, else the configured default. Registry *read*
+    /// failures degrade to the static path with a loud log — the registry
+    /// is an overlay on routing, not a load-bearing replacement.
     fn adapter_for(&self, role: Option<&str>) -> Result<Arc<dyn RuntimeAdapter>, RuntimeError> {
-        let wanted = role
-            .and_then(|role| self.config.role_adapters.get(role))
-            .cloned()
-            .unwrap_or_else(|| self.config.default_adapter.clone());
+        let wanted = if let Some(role) = role {
+            self.registry_agent(role)
+                .map(|record| record.adapter_id.clone())
+                .or_else(|| self.config.role_adapters.get(role).cloned())
+        } else {
+            None
+        }
+        .unwrap_or_else(|| self.config.default_adapter.clone());
         self.adapters
             .iter()
             .find(|adapter| adapter.id() == wanted)
@@ -361,6 +384,19 @@ impl SupervisorCore {
                 role: role.unwrap_or_default().to_owned(),
                 default: wanted,
             })
+    }
+
+    /// The registry record for a role, when the registry is enabled and
+    /// the role names a registered, enabled agent (F-13).
+    fn registry_agent(&self, role: &str) -> Option<agentos_agents::AgentRecord> {
+        let registry = self.registry.as_ref()?;
+        match registry.resolve(role) {
+            Ok(record) => record,
+            Err(error) => {
+                tracing::warn!(role, %error, "agent registry lookup failed; static routing applies");
+                None
+            }
+        }
     }
 
     /// The permission set a task executes under: the role mapping when the
@@ -701,6 +737,19 @@ fn elapsed_secs(task: &TaskRecord) -> u64 {
 
 /// Session timeout: the stricter of the node's machine budget and the
 /// contract's human-scale budget, floored at one second.
+/// First `max_chars` characters of an objective for the `session.spawn`
+/// payload — enough of the prompt (skill preambles run ~1.2k chars) to
+/// audit what a session was asked to do, without journaling the whole
+/// contract.
+fn truncate_preview(text: &str, max_chars: usize) -> String {
+    if text.chars().count() <= max_chars {
+        text.to_owned()
+    } else {
+        let truncated: String = text.chars().take(max_chars).collect();
+        format!("{truncated}…")
+    }
+}
+
 fn session_timeout(task: &TaskRecord, contract: &TaskContract) -> u64 {
     task.node
         .budgets
@@ -886,15 +935,48 @@ impl SupervisorExecutor {
         }
 
         let timeout_secs = session_timeout(task, contract);
+        // F-13: when the node's role names a registered agent, the record
+        // drives the model and its skills ride ahead of the objective as
+        // the prompt preamble. Policy-compiled constraints stay supreme:
+        // the record only *adds* deny entries (deny beats allow) and never
+        // widens access.
+        let agent_record = task
+            .node
+            .agent_role
+            .as_deref()
+            .and_then(|role| self.core.registry_agent(role));
+        let objective = match (&agent_record, &self.core.registry) {
+            (Some(record), Some(registry)) => match registry.preamble_for(record) {
+                Ok(preamble) => format!("{preamble}{}", contract.objective),
+                Err(error) => {
+                    tracing::warn!(
+                        role = %record.id,
+                        %error,
+                        "skill preamble composition failed; objective delivered bare"
+                    );
+                    contract.objective.clone()
+                }
+            },
+            _ => contract.objective.clone(),
+        };
+        if let Some(record) = &agent_record {
+            for tool in &record.tool_denylist {
+                if !tool_denylist.iter().any(|denied| denied == tool) {
+                    tool_denylist.push(tool.clone());
+                }
+            }
+        }
         let spec = SpawnSpec {
             task_id: task.id,
-            objective: contract.objective.clone(),
+            objective,
             workspace: worktree.path.clone(),
             allowed_paths: constraints.allowed_paths.clone(),
             forbidden_paths: constraints.forbidden_paths.clone(),
             tool_allowlist: constraints.tool_allowlist.clone(),
             tool_denylist: tool_denylist.clone(),
-            model: None,
+            model: agent_record
+                .as_ref()
+                .and_then(|record| record.model.clone()),
             timeout_secs,
             isolated_home: None,
         };
@@ -909,6 +991,8 @@ impl SupervisorExecutor {
                 "workspace": worktree.path.display().to_string(),
                 "branch": worktree.branch,
                 "timeoutSecs": timeout_secs,
+                "model": spec.model,
+                "objectivePreview": truncate_preview(&spec.objective, 2000),
                 "allowedPaths": constraints.allowed_paths,
                 "forbiddenPaths": constraints.forbidden_paths,
                 "toolAllowlist": constraints.tool_allowlist,
@@ -1695,6 +1779,14 @@ impl Supervisor {
         let store = Arc::new(TaskStore::open(&config.workflow_db)?);
         let queue = Arc::new(MutationQueue::open(&config.queue_db)?);
         let agent_ledger = Arc::new(AgentLedger::open(&config.ledger_db)?);
+        // F-13: open the dynamic registry when configured. A missing or
+        // corrupt registry is a hard failure here (startup), not a
+        // per-spawn degrade — misrouting work silently is worse than not
+        // starting.
+        let registry = match &config.agents_db {
+            Some(path) => Some(Arc::new(agentos_agents::AgentRegistry::open(path)?)),
+            None => None,
+        };
         ensure_parent(&config.approvals_db);
         ensure_parent(&config.audit_db);
         let policy = PolicyGate::open(
@@ -1707,6 +1799,7 @@ impl Supervisor {
             worktrees: WorktreeManager::new(config.repo.clone()),
             journal,
             adapters,
+            registry,
             store: Arc::clone(&store),
             queue,
             agent_ledger,

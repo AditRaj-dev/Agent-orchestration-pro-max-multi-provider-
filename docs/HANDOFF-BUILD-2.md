@@ -93,6 +93,7 @@ Only ignored tests: two env-gated free e2e probes (`AGENTOS_CLAUDE_E2E=1`, `AGEN
 3. **Reviewer is a deterministic stub** in F-07 (approve iff no unresolved + tests pass). Real
    reviewer pool (sonnet-class via adapters) is F-13 territory.
 4. `agentos-policy` keychain backend is an interface (EphemeralBroker only); OS-keychain impl pending.
+   (Its other debts — `Gate::GitCommit`, one-time approval consumption — are closed.)
 5. Host-level network enforcement (SEC-02) is policy-modeled, not proxy-enforced yet.
 6. Context symbols are a line-scanner stub; tree-sitter is the documented seam.
 7. Orchestrator (F-12, opus-5) not built yet — the Claude adapter (F-03) is its substrate.

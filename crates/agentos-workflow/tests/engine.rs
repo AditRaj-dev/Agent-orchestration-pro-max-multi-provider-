@@ -718,3 +718,63 @@ async fn awaiting_approval_parks_without_consuming_an_attempt_and_resumes() {
         TaskState::Done
     );
 }
+
+/// Retargeting a task at another pool (OR-01 escalation) rewrites the stored
+/// node spec, but only while the task is not executing — a swap under a
+/// leased task would change the contract the current attempt is working
+/// against.
+#[tokio::test]
+async fn set_agent_role_retargets_queued_tasks_and_refuses_executing_ones() {
+    let (_dir, store) = temp_store();
+    let engine = WorkflowEngine::new(Arc::clone(&store), Arc::new(ScriptedExecutor::new()));
+    let run_id = engine
+        .start_run(
+            &spec(
+                "feature-build",
+                vec![
+                    node("spec", NodeType::Run, &[]),
+                    node("review", NodeType::Review, &["spec"]),
+                ],
+            ),
+            "goal",
+        )
+        .expect("start run");
+    let tasks = engine.store().tasks_for_run(&run_id).unwrap();
+    let ready = tasks.iter().find(|t| t.node_id == "spec").unwrap();
+    let planned = tasks.iter().find(|t| t.node_id == "review").unwrap();
+
+    // Ready and Planned tasks both retarget: the next lease reads the role.
+    let retargeted = store
+        .set_agent_role(&ready.id, Some("stronger"))
+        .expect("retarget ready")
+        .expect("state allows it");
+    assert_eq!(retargeted.node.agent_role.as_deref(), Some("stronger"));
+    assert_eq!(retargeted.state, TaskState::Ready, "state is untouched");
+    assert!(store
+        .set_agent_role(&planned.id, Some("stronger"))
+        .expect("retarget planned")
+        .is_some());
+
+    // A leased task refuses — reported as "not routed", not an error.
+    store
+        .grant_lease(&ready.id, "someone", Duration::from_secs(60))
+        .expect("lease");
+    assert!(store
+        .set_agent_role(&ready.id, Some("even-stronger"))
+        .expect("no storage failure")
+        .is_none());
+    assert_eq!(
+        store.task(&ready.id).unwrap().node.agent_role.as_deref(),
+        Some("stronger"),
+        "the leased task keeps the role its attempt was contracted with"
+    );
+
+    // Terminal tasks refuse too: there is no next attempt to route.
+    store
+        .cas_transition(&planned.id, TaskState::Planned, TaskState::Failed)
+        .expect("fail it");
+    assert!(store
+        .set_agent_role(&planned.id, Some("stronger"))
+        .expect("no storage failure")
+        .is_none());
+}

@@ -13,15 +13,19 @@
 //!   `id: null` (§2.2). Frames with no `id` are notifications and are a
 //!   server → client-only shape, so a client frame without one is malformed.
 //! - **Journal access** — one shared `rusqlite::Connection` behind a
-//!   `std::sync::Mutex`. The API is read-only and desktop-scale (a handful
-//!   of peers, queries in the microsecond range), so the mutex is cheaper
-//!   than a connection pool and its lifecycle. Guards are never held
-//!   across an `.await`: every journal read is a synchronous block whose
-//!   result crosses the async boundary as owned data. WAL means readers
-//!   never block writers — and external processes appending to the same
-//!   journal file are the *supported* write path until the supervisor
-//!   moves in-process (§3.2), which per-subscription polling observes
-//!   because every autocommit `SELECT` takes a fresh snapshot.
+//!   `std::sync::Mutex`. The API's journal reads are synchronous and
+//!   desktop-scale (a handful of peers, queries in the microsecond
+//!   range), so the mutex is cheaper than a connection pool and its
+//!   lifecycle. Guards are never held across an `.await`: every journal
+//!   read is a synchronous block whose result crosses the async boundary
+//!   as owned data. (F-13 made `dispatch` async for the adapter-facing
+//!   registry arms — chat-session spawns and the free catalog probes —
+//!   but the guard rule stands: async arms never touch the journal
+//!   mutex.) WAL means readers never block writers — and external
+//!   processes appending to the same journal file are the *supported*
+//!   write path until the supervisor moves in-process (§3.2), which
+//!   per-subscription polling observes because every autocommit
+//!   `SELECT` takes a fresh snapshot.
 //! - **Backpressure** — each connection has a bounded outbound frame
 //!   channel ([`OUTBOUND_CAPACITY`]) drained by a writer task. Request
 //!   responses are client-paced and use a blocking `send` (the client that
@@ -37,7 +41,8 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
-use agentos_core::CoreError;
+use agentos_agents::AgentRecord;
+use agentos_core::{CoreError, Event, EventType};
 use chrono::{DateTime, SecondsFormat, Utc};
 use futures_util::stream::SplitSink;
 use futures_util::{SinkExt, StreamExt};
@@ -53,8 +58,15 @@ use tokio_tungstenite::WebSocketStream;
 use tracing::{debug, warn};
 use uuid::Uuid;
 
+use crate::agent_sessions::{AgentSessions, SessionError};
 use crate::events::{self, SequencedEvent};
 use crate::projection;
+
+/// Registry-mutation journal events (F-13 audit trail: the tables are
+/// mutable, the journal records who changed what when).
+const EVT_AGENT_CREATED: &str = "agent.created";
+const EVT_AGENT_UPDATED: &str = "agent.updated";
+const EVT_AGENT_DELETED: &str = "agent.deleted";
 
 /// Default bind address (loopback only — F-11 §2).
 pub const DEFAULT_WS_ADDR: &str = "127.0.0.1:8741";
@@ -165,24 +177,35 @@ impl ApiError {
     }
 }
 
-/// The WS server: shared journal plus daemon identity for `daemon.info`.
+/// The WS server: shared journal plus daemon identity for `daemon.info`,
+/// the F-13 agent registry, and the chat-session service.
 #[derive(Debug)]
 pub struct WsServer {
     journal: Arc<StdMutex<Connection>>,
     journal_path: PathBuf,
+    registry: Arc<agentos_agents::AgentRegistry>,
+    sessions: Arc<AgentSessions>,
     started_at: DateTime<Utc>,
     next_subscription: std::sync::atomic::AtomicU64,
 }
 
 impl WsServer {
-    /// Build a server over a shared journal connection. The connection is
-    /// shared, not pooled: see the [module docs](self) for the scale
-    /// argument. `started_at` (surfaced by `daemon.info`) is taken here, at
-    /// server construction, which `main` does once at startup.
-    pub fn new(journal: Arc<StdMutex<Connection>>, journal_path: impl Into<PathBuf>) -> Self {
+    /// Build a server over a shared journal connection, the agent registry
+    /// (F-13), and the chat-session service. The journal connection is
+    /// shared, not pooled: see the [module docs](self). `started_at`
+    /// (surfaced by `daemon.info`) is taken here, at server construction,
+    /// which `main` does once at startup.
+    pub fn new(
+        journal: Arc<StdMutex<Connection>>,
+        journal_path: impl Into<PathBuf>,
+        registry: Arc<agentos_agents::AgentRegistry>,
+        sessions: Arc<AgentSessions>,
+    ) -> Self {
         Self {
             journal,
             journal_path: journal_path.into(),
+            registry,
+            sessions,
             started_at: Utc::now(),
             next_subscription: std::sync::atomic::AtomicU64::new(1),
         }
@@ -224,7 +247,13 @@ impl WsServer {
     }
 
     /// §2.2 `{"id","ok","result"}` envelope.
-    fn dispatch(
+    ///
+    /// Async since F-13: the registry-session arms await adapter spawns
+    /// and the free provider-catalog probes. The F-11 invariant that
+    /// matters survives — journal guards never cross an await
+    /// ([`Self::with_journal`] stays synchronous); only the adapter-facing
+    /// arms hold async state.
+    async fn dispatch(
         &self,
         method: &str,
         params: &Value,
@@ -255,6 +284,50 @@ impl WsServer {
                 let agents = projection.agents(run_id.as_deref());
                 Ok(json!({ "agents": agents }))
             }
+            // ----- F-13: the dynamic agent registry ---------------------
+            "registry.agents.list" => {
+                let agents = self.registry.list_agents().map_err(registry_error)?;
+                Ok(json!({ "agents": agents }))
+            }
+            "registry.agents.create" => self.registry_create_agent(params),
+            "registry.agents.update" => self.registry_update_agent(params),
+            "registry.agents.delete" => self.registry_delete_agent(params),
+            "registry.agents.set-enabled" => self.registry_set_enabled(params),
+            "registry.skills.list" => {
+                let skills = self.registry.list_skills().map_err(registry_error)?;
+                Ok(json!({ "skills": skills }))
+            }
+            "registry.catalog" => {
+                let providers = self.sessions.provider_catalog().await;
+                Ok(json!({ "providers": providers }))
+            }
+            "agent.session.start" => {
+                let agent_id = required_string(params, "agentId")?;
+                let message = required_string(params, "message")?;
+                let session_id = self
+                    .sessions
+                    .start(agent_id, message)
+                    .await
+                    .map_err(session_error)?;
+                Ok(json!({ "sessionId": session_id }))
+            }
+            "agent.session.send" => {
+                let session_id = required_string(params, "sessionId")?;
+                let message = required_string(params, "message")?;
+                self.sessions
+                    .send(session_id, message)
+                    .await
+                    .map_err(session_error)?;
+                Ok(json!({ "sent": true }))
+            }
+            "agent.session.cancel" => {
+                let session_id = required_string(params, "sessionId")?;
+                self.sessions
+                    .cancel(session_id)
+                    .await
+                    .map_err(session_error)?;
+                Ok(json!({ "cancelled": true }))
+            }
             "git.diff" => Err(ApiError::not_supported(
                 "git.diff is a v1 seam (F-11 §6.1): the daemon does not embed agentos-git yet; \
                  UX-05 renders event-carried attribution",
@@ -262,6 +335,101 @@ impl WsServer {
             other => Err(ApiError::method_not_found(format!(
                 "unknown method {other:?}"
             ))),
+        }
+    }
+
+    /// `registry.agents.create` (F-13 §3): deserialize the `agent` param,
+    /// force the wire record to non-builtin, insert, journal `agent.created`.
+    fn registry_create_agent(&self, params: &Value) -> Result<Value, ApiError> {
+        let mut record: AgentRecord = agent_param(params)?;
+        record.builtin = false; // wire records are never builtin (API-edge policy)
+        let record = self.registry.create_agent(record).map_err(registry_error)?;
+        self.journal_agent_mutation(EVT_AGENT_CREATED, &record, None);
+        Ok(json!({ "agent": record }))
+    }
+
+    /// `registry.agents.update`: same shape, `agent.updated` journal event.
+    fn registry_update_agent(&self, params: &Value) -> Result<Value, ApiError> {
+        let mut record: AgentRecord = agent_param(params)?;
+        let previous = self
+            .registry
+            .get_agent(&record.id)
+            .map_err(registry_error)?
+            .ok_or_else(|| {
+                ApiError::invalid_params(format!("agent {:?} does not exist", record.id))
+            })?;
+        record.builtin = previous.builtin; // preserved by the registry; keep the wire honest
+        let record = self.registry.update_agent(record).map_err(registry_error)?;
+        self.journal_agent_mutation(EVT_AGENT_UPDATED, &record, None);
+        Ok(json!({ "agent": record }))
+    }
+
+    /// `registry.agents.delete`: `agent.deleted` journal event carries the
+    /// full record (the table row is gone; the journal keeps the history).
+    fn registry_delete_agent(&self, params: &Value) -> Result<Value, ApiError> {
+        let id = required_string(params, "id")?;
+        let record = self
+            .registry
+            .get_agent(id)
+            .map_err(registry_error)?
+            .ok_or_else(|| ApiError::invalid_params(format!("agent {id:?} does not exist")))?;
+        self.registry.delete_agent(id).map_err(registry_error)?;
+        self.journal_agent_mutation(EVT_AGENT_DELETED, &record, None);
+        Ok(json!({ "deleted": true, "id": id }))
+    }
+
+    /// `registry.agents.set-enabled`: routing opt-in/out, journaled as an
+    /// update (the enabled flag is part of the record).
+    fn registry_set_enabled(&self, params: &Value) -> Result<Value, ApiError> {
+        let id = required_string(params, "id")?;
+        let enabled = match params.get("enabled") {
+            Some(Value::Bool(value)) => *value,
+            _ => return Err(ApiError::invalid_params("enabled must be a boolean")),
+        };
+        self.registry
+            .set_agent_enabled(id, enabled)
+            .map_err(registry_error)?;
+        let record = self
+            .registry
+            .get_agent(id)
+            .map_err(registry_error)?
+            .unwrap_or_else(|| AgentRecord {
+                id: id.to_owned(),
+                name: String::new(),
+                description: String::new(),
+                adapter_id: String::new(),
+                model: None,
+                effort: None,
+                mode: agentos_agents::AgentMode::Plan,
+                skills: vec![],
+                tool_allowlist: vec![],
+                tool_denylist: vec![],
+                timeout_secs: 0,
+                builtin: false,
+                enabled,
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+            });
+        self.journal_agent_mutation(EVT_AGENT_UPDATED, &record, None);
+        Ok(json!({ "agent": record }))
+    }
+
+    /// Append one registry-mutation audit event (fresh connection per
+    /// append — the supervisor's WAL pattern; failures are logged loudly
+    /// but never fail the mutation they describe).
+    fn journal_agent_mutation(&self, event_type: &str, record: &AgentRecord, extra: Option<Value>) {
+        let mut payload = json!({ "agent": record });
+        if let Some(extra) = extra {
+            payload["details"] = extra;
+        }
+        let event = Event::new(EventType::Other(event_type.to_owned()))
+            .with_agent_id(record.id.clone())
+            .with_payload(payload);
+        match crate::db::open_db(&self.journal_path)
+            .and_then(|conn| events::append_event(&conn, &event))
+        {
+            Ok(_seq) => {}
+            Err(err) => tracing::error!(%err, "registry mutation journal append failed"),
         }
     }
 
@@ -354,10 +522,11 @@ impl WsServer {
         Ok(json!({ "stopped": stopped }))
     }
 
-    /// One inbound TEXT frame → one response frame. Fully synchronous: the
-    /// reader loop owns the await points, which keeps journal guards off
-    /// async boundaries by construction.
-    fn handle_text_frame(
+    /// One inbound TEXT frame → one response frame. Async since F-13 (the
+    /// registry-session arms await adapters); the invariant that matters is
+    /// unchanged: journal guards live inside synchronous closures and never
+    /// cross an await point.
+    async fn handle_text_frame(
         &self,
         out: &mpsc::Sender<Value>,
         subs: &ConnSubs,
@@ -371,7 +540,7 @@ impl WsServer {
             Err(err) => return error_response(Value::Null, err),
         };
         let params = params.unwrap_or_else(|| json!({}));
-        match self.dispatch(&method, &params, out, subs, shutdown) {
+        match self.dispatch(&method, &params, out, subs, shutdown).await {
             Ok(result) => ok_response(id, result),
             Err(err) => error_response(id, err),
         }
@@ -402,7 +571,7 @@ impl WsServer {
                 maybe = stream.next() => match maybe {
                     Some(Ok(Message::Text(text))) => {
                         let response =
-                            self.handle_text_frame(&out_tx, &subs, &shutdown, text.as_str());
+                            self.handle_text_frame(&out_tx, &subs, &shutdown, text.as_str()).await;
                         if out_tx.send(response).await.is_err() {
                             break; // writer gone; connection is dead
                         }
@@ -770,6 +939,40 @@ fn required_string<'a>(params: &'a Value, key: &str) -> Result<&'a str, ApiError
         .and_then(Value::as_str)
         .filter(|value| !value.is_empty())
         .ok_or_else(|| ApiError::invalid_params(format!("{key} must be a non-empty string")))
+}
+
+/// The `agent` parameter of the registry mutation methods: an object
+/// deserializing to an [`AgentRecord`] (wire-friendly — server-owned
+/// fields default; `builtin` is forced at the API edge).
+fn agent_param(params: &Value) -> Result<AgentRecord, ApiError> {
+    let agent = params.get("agent").ok_or_else(|| {
+        ApiError::invalid_params("agent must be an object (the full agent record)")
+    })?;
+    serde_json::from_value(agent.clone())
+        .map_err(|err| ApiError::invalid_params(format!("agent record is not valid: {err}")))
+}
+
+/// Registry failures → §2.2 codes: domain rejections are `invalid_params`
+/// (the client can fix them); storage failures are `internal_error`.
+fn registry_error(err: agentos_agents::AgentsError) -> ApiError {
+    match err {
+        agentos_agents::AgentsError::Core(core) => {
+            ApiError::internal(format!("registry storage failure: {core}"))
+        }
+        other => ApiError::invalid_params(other.to_string()),
+    }
+}
+
+/// Chat-session failures → §2.2 codes.
+fn session_error(err: SessionError) -> ApiError {
+    match err {
+        SessionError::InvalidParams(detail) => ApiError::invalid_params(detail),
+        SessionError::NotFound(detail) => ApiError::invalid_params(detail),
+        SessionError::Registry(registry) => registry_error(registry),
+        SessionError::Adapter(adapter) => ApiError::internal(format!("adapter failure: {adapter}")),
+        SessionError::Core(core) => ApiError::internal(format!("journal failure: {core}")),
+        SessionError::Internal(detail) => ApiError::internal(detail),
+    }
 }
 
 /// Optional `runId` parameter, validated as a UUID and normalized to the

@@ -27,9 +27,10 @@ use std::sync::Arc;
 
 use uuid::Uuid;
 
+use crate::desk::EscalationDesk;
 use crate::error::{excerpt, OrchestratorError, Rejection, RejectionReason};
 use crate::model::{ModelResponse, PlanningModel};
-use crate::operation::PlanOperation;
+use crate::operation::{EscalationTarget, PlanOperation};
 use crate::parse::parse_operations;
 use crate::plan::{Plan, PlanPolicy};
 use crate::sink::{PlanSink, RunView};
@@ -60,6 +61,30 @@ pub struct PlanCycleReport {
     pub rate_limited: bool,
     /// Bounded excerpt of the raw model output, for the audit trail.
     pub raw_excerpt: String,
+    /// What actually happened to each accepted escalation. An escalation
+    /// that only raised priority says so, rather than implying it reached
+    /// a stronger agent or a person.
+    pub escalations: Vec<EscalationOutcome>,
+}
+
+/// Where one accepted `escalate` operation actually went.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct EscalationOutcome {
+    /// The node escalated, or `None` for the whole run.
+    pub node_id: Option<String>,
+    /// The target the model asked for.
+    pub target: Option<EscalationTarget>,
+    /// Tasks raised to `P0` by the engine.
+    pub retuned: usize,
+    /// Pool the tasks were retargeted at, when routing applied.
+    pub retargeted_to: Option<String>,
+    /// Tasks the retarget actually moved (queued/parked ones; the engine
+    /// refuses executing and terminal tasks).
+    pub retargeted: usize,
+    /// The approval-store request a human can act on, when a desk is wired.
+    pub approval_request_id: Option<String>,
+    /// Why nothing beyond the priority raise happened, when nothing did.
+    pub unrouted_reason: Option<String>,
 }
 
 impl PlanCycleReport {
@@ -78,6 +103,10 @@ pub struct Orchestrator {
     /// Rejections from the previous cycle, replayed into the next prompt as
     /// the self-correction signal.
     pending_rejections: Vec<Rejection>,
+    /// Optional human-facing escalation surface. Without one, a `human`
+    /// escalation is recorded and prioritized but reaches nobody — and the
+    /// cycle report says exactly that.
+    desk: Option<Arc<dyn EscalationDesk>>,
 }
 
 impl Orchestrator {
@@ -94,7 +123,15 @@ impl Orchestrator {
             plan: Plan::new(goal, policy),
             cycle: 0,
             pending_rejections: Vec::new(),
+            desk: None,
         }
+    }
+
+    /// Route `human` escalations to a desk — in this system, F-10's
+    /// approval store via [`ApprovalDesk`](crate::ApprovalDesk).
+    pub fn with_desk(mut self, desk: Arc<dyn EscalationDesk>) -> Self {
+        self.desk = Some(desk);
+        self
     }
 
     /// The current plan.
@@ -268,12 +305,17 @@ impl Orchestrator {
         if let Some(run_id) = self.plan.run_id() {
             for operation in &report.accepted {
                 if let PlanOperation::Escalate(payload) = operation {
-                    match self.sink.escalate(&run_id, payload.node_id.as_deref()) {
-                        Ok(retuned) => tracing::info!(retuned, "escalation applied to the run"),
-                        Err(err) => {
-                            report.engine_error = Some(err.to_string());
-                        }
+                    let (outcome, engine_error) = route_escalation(
+                        self.sink.as_ref(),
+                        self.desk.as_deref(),
+                        &self.plan.policy,
+                        &run_id,
+                        payload,
+                    );
+                    if let Some(error) = engine_error {
+                        report.engine_error = Some(error);
                     }
+                    report.escalations.push(outcome);
                 }
             }
         }
@@ -308,6 +350,87 @@ impl Orchestrator {
         }
         reports
     }
+}
+
+/// Apply one accepted escalation to a live run.
+///
+/// Every escalation raises priority — that lever always exists. What varies
+/// is where it goes *beyond* that:
+///
+/// - `stronger_agent` / `supervisor`: retarget the task at the pool the
+///   deployment declared for that tier ([`PlanPolicy::escalation_pool`] /
+///   [`PlanPolicy::supervisor_pool`]). No pool declared, no retarget — the
+///   orchestrator cannot invent infrastructure.
+/// - `human`: raise it on the escalation desk (F-10's approval surface).
+///
+/// Anything that does not route records *why* in `unrouted_reason` rather
+/// than reporting a hand-off that never happened.
+fn route_escalation(
+    sink: &dyn PlanSink,
+    desk: Option<&dyn EscalationDesk>,
+    policy: &PlanPolicy,
+    run_id: &Uuid,
+    payload: &crate::operation::Escalate,
+) -> (EscalationOutcome, Option<String>) {
+    let node_id = payload.node_id.as_deref();
+    let mut outcome = EscalationOutcome {
+        node_id: payload.node_id.clone(),
+        target: Some(payload.target),
+        ..EscalationOutcome::default()
+    };
+    let mut engine_error = None;
+
+    match sink.escalate(run_id, node_id) {
+        Ok(retuned) => outcome.retuned = retuned,
+        Err(error) => engine_error = Some(error.to_string()),
+    }
+
+    match payload.target {
+        EscalationTarget::StrongerAgent | EscalationTarget::Supervisor => {
+            let pool = match payload.target {
+                EscalationTarget::StrongerAgent => policy.escalation_pool.as_deref(),
+                _ => policy.supervisor_pool.as_deref(),
+            };
+            match pool {
+                Some(pool) => match sink.retarget(run_id, node_id, pool) {
+                    Ok(0) => {
+                        outcome.retargeted_to = Some(pool.to_owned());
+                        outcome.unrouted_reason = Some(
+                            "no task was in a state that allows retargeting (executing or                              terminal tasks keep the role their attempt was contracted with)"
+                                .to_owned(),
+                        );
+                    }
+                    Ok(moved) => {
+                        outcome.retargeted_to = Some(pool.to_owned());
+                        outcome.retargeted = moved;
+                    }
+                    Err(error) => engine_error = Some(error.to_string()),
+                },
+                None => {
+                    outcome.unrouted_reason = Some(format!(
+                        "no pool is declared for `{}`; priority raised only",
+                        payload.target.as_str()
+                    ));
+                }
+            }
+        }
+        EscalationTarget::Human => match desk {
+            Some(desk) => {
+                match desk.raise(run_id, node_id, payload.target, &payload.reason) {
+                    Ok(request_id) => outcome.approval_request_id = Some(request_id),
+                    // A desk failure must not become engine control flow:
+                    // the escalation is still in the ledger and the priority
+                    // raise stands.
+                    Err(error) => outcome.unrouted_reason = Some(error.to_string()),
+                }
+            }
+            None => {
+                outcome.unrouted_reason =
+                    Some("no escalation desk is wired; priority raised only".to_owned());
+            }
+        },
+    }
+    (outcome, engine_error)
 }
 
 #[cfg(test)]
@@ -494,6 +617,131 @@ mod tests {
             err,
             OrchestratorError::Rejected(RejectionReason::EmptyPlan)
         ));
+    }
+
+    /// `stronger_agent` retargets the task at the declared higher tier
+    /// through the engine's guarded `set_agent_role`, on top of the
+    /// priority raise.
+    #[tokio::test]
+    async fn a_stronger_agent_escalation_retargets_the_task_at_the_declared_pool() {
+        let policy = PlanPolicy {
+            pools: vec!["backend".to_owned(), "coding_review".to_owned()],
+            ..PlanPolicy::default()
+        }
+        .with_escalation_pool("opus-tier");
+        let mut orchestrator = Orchestrator::new(
+            "ship the API",
+            policy,
+            Arc::new(ScriptedPlanningModel::new(vec![
+                PLAN_JSON,
+                r#"[{"op":"escalate","nodeId":"build","target":"stronger_agent",
+                     "reason":"the worker keeps missing the contract"}]"#,
+            ])),
+            sink(),
+        );
+        orchestrator.cycle().await;
+        let run_id = orchestrator.commit().unwrap();
+
+        let report = orchestrator.cycle().await;
+        assert!(report.engine_error.is_none(), "{:?}", report.engine_error);
+        let outcome = &report.escalations[0];
+        assert_eq!(outcome.retargeted_to.as_deref(), Some("opus-tier"));
+        assert_eq!(outcome.retargeted, 1);
+        assert_eq!(outcome.retuned, 1);
+        assert!(outcome.unrouted_reason.is_none());
+
+        let view = orchestrator.sink.run_view(&run_id).unwrap();
+        let build = view.tasks.iter().find(|t| t.node_id == "build").unwrap();
+        assert_eq!(build.pool.as_deref(), Some("opus-tier"), "routed durably");
+        assert_eq!(build.priority, agentos_core::Priority::P0);
+    }
+
+    /// With no pool declared for the tier, the escalation still raises
+    /// priority — and says plainly that nothing routed it further, rather
+    /// than implying a stronger agent picked it up.
+    #[tokio::test]
+    async fn an_escalation_with_no_declared_tier_reports_that_it_did_not_route() {
+        let mut orchestrator = orchestrator(vec![
+            PLAN_JSON,
+            r#"[{"op":"escalate","nodeId":"build","target":"stronger_agent","reason":"stuck"}]"#,
+        ]);
+        orchestrator.cycle().await;
+        orchestrator.commit().unwrap();
+
+        let report = orchestrator.cycle().await;
+        let outcome = &report.escalations[0];
+        assert_eq!(outcome.retuned, 1);
+        assert!(outcome.retargeted_to.is_none());
+        assert!(outcome
+            .unrouted_reason
+            .as_deref()
+            .expect("a reason")
+            .contains("no pool is declared"));
+    }
+
+    /// A `human` escalation with no desk wired must not pretend a person
+    /// was told.
+    #[tokio::test]
+    async fn a_human_escalation_without_a_desk_says_nobody_was_told() {
+        let mut orchestrator = orchestrator(vec![
+            PLAN_JSON,
+            r#"[{"op":"escalate","nodeId":"build","target":"human","reason":"contract unclear"}]"#,
+        ]);
+        orchestrator.cycle().await;
+        orchestrator.commit().unwrap();
+
+        let report = orchestrator.cycle().await;
+        let outcome = &report.escalations[0];
+        assert!(outcome.approval_request_id.is_none());
+        assert!(outcome
+            .unrouted_reason
+            .as_deref()
+            .expect("a reason")
+            .contains("no escalation desk"));
+    }
+
+    /// With a desk, the escalation lands on F-10's approval surface as a
+    /// pending request a human can resolve.
+    #[tokio::test]
+    async fn a_human_escalation_reaches_the_approval_surface() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let approvals = Arc::new(
+            agentos_policy::ApprovalStore::open(&dir.path().join("approvals.sqlite3"))
+                .expect("approval store"),
+        );
+        let desk = Arc::new(crate::desk::ApprovalDesk::new(
+            Arc::clone(&approvals),
+            "orchestrator",
+        ));
+        let mut orchestrator = Orchestrator::new(
+            "ship the API",
+            PlanPolicy::default(),
+            Arc::new(ScriptedPlanningModel::new(vec![
+                PLAN_JSON,
+                r#"[{"op":"escalate","nodeId":"build","target":"human",
+                     "reason":"the contract is ambiguous"}]"#,
+            ])),
+            sink(),
+        )
+        .with_desk(desk as Arc<dyn EscalationDesk>);
+        orchestrator.cycle().await;
+        orchestrator.commit().unwrap();
+
+        let report = orchestrator.cycle().await;
+        let outcome = &report.escalations[0];
+        assert!(outcome.unrouted_reason.is_none(), "{outcome:?}");
+        let request_id = outcome
+            .approval_request_id
+            .as_deref()
+            .expect("a request a human can act on");
+        assert_eq!(
+            approvals.status(request_id).expect("status"),
+            Some(agentos_policy::ApprovalStatus::Pending)
+        );
+        // Resolvable like any other decision on that surface.
+        assert!(approvals
+            .resolve(request_id, agentos_policy::ApprovalDecision::Approved)
+            .expect("resolve"));
     }
 
     #[tokio::test]

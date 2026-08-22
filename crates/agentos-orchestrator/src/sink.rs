@@ -101,6 +101,22 @@ pub trait PlanSink: Send + Sync {
     /// those land the escalation is recorded in the plan ledger and
     /// surfaced to the user, never silently swallowed.
     fn escalate(&self, run_id: &Uuid, node_id: Option<&str>) -> Result<usize, OrchestratorError>;
+
+    /// Route a live run's task(s) at another agent pool — the engine-side
+    /// effect of escalating to a stronger agent or a supervisor.
+    ///
+    /// Only tasks that are queued or parked are retargeted: the engine
+    /// refuses a swap under a `Leased`/`Running` task (its attempt is
+    /// already contracted against the old role) and under terminal ones
+    /// (no next attempt to route). Returns how many tasks actually moved,
+    /// so an escalation that changed nothing is reported rather than
+    /// claimed.
+    fn retarget(
+        &self,
+        run_id: &Uuid,
+        node_id: Option<&str>,
+        pool: &str,
+    ) -> Result<usize, OrchestratorError>;
 }
 
 /// A [`PlanSink`] over the durable task store alone.
@@ -149,6 +165,15 @@ impl PlanSink for WorkflowSink {
     fn escalate(&self, run_id: &Uuid, node_id: Option<&str>) -> Result<usize, OrchestratorError> {
         escalate(&self.store, run_id, node_id)
     }
+
+    fn retarget(
+        &self,
+        run_id: &Uuid,
+        node_id: Option<&str>,
+        pool: &str,
+    ) -> Result<usize, OrchestratorError> {
+        retarget(&self.store, run_id, node_id, pool)
+    }
 }
 
 /// The full engine is itself a sink: commits go through
@@ -181,6 +206,15 @@ impl PlanSink for WorkflowEngine {
 
     fn escalate(&self, run_id: &Uuid, node_id: Option<&str>) -> Result<usize, OrchestratorError> {
         escalate(self.store(), run_id, node_id)
+    }
+
+    fn retarget(
+        &self,
+        run_id: &Uuid,
+        node_id: Option<&str>,
+        pool: &str,
+    ) -> Result<usize, OrchestratorError> {
+        retarget(self.store(), run_id, node_id, pool)
     }
 }
 
@@ -282,6 +316,34 @@ fn escalate(
     tracing::info!(run_id = %run_id, node = node_id.unwrap_or("<run>"), retuned,
         "escalation raised task priority to P0");
     Ok(retuned)
+}
+
+/// Retarget queued/parked tasks at `pool` through the engine's guarded
+/// `set_agent_role`; tasks it refuses (executing, terminal) are skipped and
+/// simply not counted.
+fn retarget(
+    store: &TaskStore,
+    run_id: &Uuid,
+    node_id: Option<&str>,
+    pool: &str,
+) -> Result<usize, OrchestratorError> {
+    let mut moved = 0;
+    for task in store.tasks_for_run(run_id)? {
+        if let Some(wanted) = node_id {
+            if task.node_id != wanted {
+                continue;
+            }
+        }
+        if task.node.agent_role.as_deref() == Some(pool) {
+            continue;
+        }
+        if store.set_agent_role(&task.id, Some(pool))?.is_some() {
+            moved += 1;
+        }
+    }
+    tracing::info!(run_id = %run_id, node = node_id.unwrap_or("<run>"), pool, moved,
+        "escalation retargeted tasks at another pool");
+    Ok(moved)
 }
 
 #[cfg(test)]

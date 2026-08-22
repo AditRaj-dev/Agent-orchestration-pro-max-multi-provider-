@@ -103,6 +103,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod desk;
 pub mod error;
 pub mod model;
 pub mod operation;
@@ -112,6 +113,7 @@ pub mod plan;
 pub mod sink;
 pub mod snapshot;
 
+pub use desk::{ApprovalDesk, EscalationDesk};
 pub use error::{OrchestratorError, Rejection, RejectionReason};
 pub use model::{
     verify_denylist_tokens, ClaudePlanningModel, ModelResponse, PlanningModel,

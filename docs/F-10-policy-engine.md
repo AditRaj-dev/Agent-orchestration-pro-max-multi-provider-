@@ -125,9 +125,16 @@ Fingerprint semantics:
   wall-clock jump after resolve cannot resurrect a stale approval). Any
   mutation — changed value, added key, reordered array, different gate —
   yields a different fingerprint and therefore no matching row.
-- One-time *consumption* is deliberately not implemented (PRD binds
-  approvals to fingerprint + expiry only); it is a documented future
-  extension, e.g. for secret access.
+- **Scope**: an approval is reusable (fingerprint + expiry only) or
+  **single-use**. `request_once` marks it single-use and `consume(gate,
+  operation, by)` spends it — `UPDATE ... WHERE status = 'approved'`, so two
+  racing consumers cannot both cash one decision. A consumed row leaves
+  `is_approved` false forever after, inside ttl or not, and reads as
+  `ApprovalStatus::Consumed`. Consumers call it *after* the authorized side
+  effect, so a failed attempt never burns a human's decision. Reusable stays
+  the default: a gate that governs a task's *progression* asks the same
+  question on every retry. The schema migration is additive and idempotent,
+  so existing approval databases upgrade in place.
 - The gate itself is a separate SQL column, so an approval never transfers
   across gates even for an identical operation payload.
 
@@ -251,7 +258,10 @@ Coverage highlights (all inline `#[cfg(test)]`):
 - True host-level network enforcement (proxy/sandbox) and the OS-keychain
   `SecretsBroker` backend are the next seams; `EphemeralBroker` is for
   tests/dev only.
-- Approval consumption (one-time use) is not implemented (see §3).
+- ~~Approval consumption (one-time use)~~ — implemented (see §3);
+  `Gate::GitCommit` now exists too, so commit and push are separate gates and
+  `git_gate_check` demands a live approval for both (merge/rebase stay
+  permission-only — they rewrite a task branch, not integration history).
 - FNV-1a 64 is change-detection, not collision-resistant against an
   adversary; swap to the workspace `blake3` when approvals cross a trust
   boundary (format is the contract: `<alg>:<hex>`).

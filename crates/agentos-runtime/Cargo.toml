@@ -12,6 +12,7 @@ agentos-adapters = { path = "../agentos-adapters" }
 agentos-workflow = { path = "../agentos-workflow" }
 agentos-git = { path = "../agentos-git" }
 agentos-policy = { path = "../agentos-policy" }
+agentos-agents = { path = "../agentos-agents" }
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
