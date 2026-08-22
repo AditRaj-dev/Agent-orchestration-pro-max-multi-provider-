@@ -49,6 +49,8 @@
 #![forbid(unsafe_code)]
 
 pub mod adapter;
+pub mod agy;
+pub mod claude;
 pub mod error;
 pub mod events;
 pub mod mock;
