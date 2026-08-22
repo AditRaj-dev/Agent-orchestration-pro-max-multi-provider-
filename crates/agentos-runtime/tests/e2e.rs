@@ -302,13 +302,30 @@ async fn e2e_happy_path_spec_parallel_review_gitgate() {
         kinds.contains(&"git.gate".to_owned()),
         "the gate decision is audited: {kinds:?}"
     );
+    assert!(
+        kinds.contains(&"approval.consumed".to_owned()),
+        "spending the approval is audited: {kinds:?}"
+    );
+    // The commit landed, so its single-use approval is spent: it can never
+    // authorize a second mutation, ttl or no ttl.
     assert_eq!(
         supervisor
             .approvals()
             .status(&approval_id)
             .expect("approval status"),
-        Some(agentos_runtime::ApprovalStatus::Approved),
-        "approvals are immutable once resolved"
+        Some(agentos_runtime::ApprovalStatus::Consumed),
+        "a git approval authorizes exactly one mutation"
+    );
+    let (gate, operation) = supervisor
+        .gate_operation(&run_id, "commit")
+        .expect("rebuild the gate operation");
+    assert_eq!(gate.as_str(), "git_commit");
+    assert!(
+        !supervisor
+            .approvals()
+            .is_approved(gate, &operation)
+            .expect("re-check"),
+        "the spent approval must not authorize the same operation again"
     );
 
     // The ledger maps the sha to task/agent/reviewers/context/workflow.
@@ -757,7 +774,7 @@ async fn e2e_git_gate_blocks_without_an_approval() {
     );
     // The gate surfaced a decision instead of losing it.
     let required = first_payload(&supervisor, run_id, "approval.required");
-    assert_eq!(required["gate"], json!("git_push"));
+    assert_eq!(required["gate"], json!("git_commit"));
     assert!(required["requestId"].is_string());
     assert!(supervisor
         .agent_ledger()

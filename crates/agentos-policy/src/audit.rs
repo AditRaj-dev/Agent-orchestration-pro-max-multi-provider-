@@ -387,6 +387,7 @@ mod tests {
             operation_fingerprint: "fnv1a64:0123456789abcdef".to_owned(),
             requested_by: "agent-07".to_owned(),
             expires_at: Utc::now() + Duration::seconds(600),
+            single_use: true,
         };
         store
             .record_approval("user", &request, None, run)

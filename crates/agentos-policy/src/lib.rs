@@ -47,7 +47,7 @@ pub use approval::{
 };
 pub use audit::{AuditEntry, AuditStore};
 pub use compile::{
-    compile_to_spawn_spec, git_gate_check, PolicyDenial, SpawnConstraints, TaskScope,
+    approval_gate, compile_to_spawn_spec, git_gate_check, PolicyDenial, SpawnConstraints, TaskScope,
 };
 pub use error::PolicyError;
 pub use permission::{

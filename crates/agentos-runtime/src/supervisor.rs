@@ -127,11 +127,12 @@ const EVT_RUN_FAILED: &str = "run.failed";
 const GATE_GIT_ACTION: GitAction = GitAction::Commit;
 /// The mutation the gate enqueues, paired with [`GATE_GIT_ACTION`].
 const GATE_MUTATION: MutationAction = MutationAction::Commit;
-/// The approval gate a git mutation is bound to. F-10's [`Gate`] set carries
-/// exactly one git gate; the *action* lives in the operation payload, so a
-/// commit approval and a push approval have different fingerprints and never
-/// transfer (see the F-doc's integration notes).
-const GIT_MUTATION_GATE: Gate = Gate::GitPush;
+/// The approval gate a git mutation is bound to — the gate for
+/// [`GATE_GIT_ACTION`], i.e. F-10's [`Gate::GitCommit`]. Commit and push are
+/// separate gates in F-10, so an approval for one can never authorize the
+/// other even before fingerprints are compared. Kept in sync with
+/// `agentos_policy::approval_gate` by a unit test.
+const GIT_MUTATION_GATE: Gate = Gate::GitCommit;
 
 /// Where the supervisor keeps its durable run state (manifests, handoffs,
 /// content-addressed artifacts) and the four databases it composes.
@@ -1280,7 +1281,9 @@ impl SupervisorExecutor {
                 );
                 Outcome::AwaitingApproval
             }
-            GateVerdict::Denied { .. } | GateVerdict::Expired { .. } => {
+            GateVerdict::Denied { .. }
+            | GateVerdict::Expired { .. }
+            | GateVerdict::Consumed { .. } => {
                 let denial = PolicyDenial::ApprovalRequired { gate };
                 self.core.audit_or_log(
                     task,
@@ -1562,6 +1565,39 @@ impl SupervisorExecutor {
             return fail(&self.core, "ledger", &error);
         }
 
+        // The mutation landed: spend the human's single-use approval so it
+        // cannot authorize a second commit. Deliberately after the side
+        // effect — consuming first would burn the decision on an attempt
+        // that then failed.
+        let consumed = match self.core.gate_operation(task, manifest, contract) {
+            Ok((approval_gate, operation)) => {
+                self.core
+                    .policy
+                    .consume(approval_gate, &operation, gate.as_str())
+            }
+            Err(error) => {
+                tracing::error!(task_id = %task.id, %error,
+                    "could not rebuild the gate operation to consume its approval");
+                None
+            }
+        };
+        if let Some(approval) = &consumed {
+            self.core.audit_or_log(
+                task,
+                self.core.policy.audit().append(agentos_policy::AuditEntry {
+                    actor: gate.clone(),
+                    action_kind: "approval.consumed".to_owned(),
+                    resource: task.node_id.clone(),
+                    details: json!({
+                        "gate": GIT_MUTATION_GATE.as_str(),
+                        "approvalId": approval,
+                        "sha": sha,
+                    }),
+                    run_id: Some(task.run_id.to_string()),
+                }),
+            );
+        }
+
         self.core.emit_for(
             task,
             manifest,
@@ -1573,6 +1609,7 @@ impl SupervisorExecutor {
                 "requestId": request_id,
                 "branch": worktree.branch,
                 "workflowId": manifest.workflow_id,
+                "approvalConsumed": consumed,
             }),
         );
         Outcome::Success {
@@ -2057,6 +2094,18 @@ fn verify_base_commit(repo: &Path, base_commit: &str) -> Result<(), RuntimeError
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// The gate constant must stay the gate F-10 assigns to the action the
+    /// git gate actually performs — otherwise the supervisor would ask for
+    /// approval on one gate and `git_gate_check` would demand another.
+    #[test]
+    fn the_git_gate_constant_matches_the_policy_gate_for_its_action() {
+        assert_eq!(
+            agentos_policy::approval_gate(GATE_GIT_ACTION),
+            Some(GIT_MUTATION_GATE)
+        );
+        assert!(crate::policy::single_use_gate(GIT_MUTATION_GATE));
+    }
 
     fn packet(task_id: &str, unresolved: &[&str], tests: &[(&str, TestStatus)]) -> HandoffPacket {
         HandoffPacket {

@@ -40,6 +40,10 @@ const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Gate {
+    /// `git commit` on a task branch. Distinct from [`Gate::GitPush`] on
+    /// purpose: an approval for one must never authorize the other, and a
+    /// fingerprint alone would not separate them if they shared a gate.
+    GitCommit,
     /// `git push` to any remote.
     GitPush,
     /// Installing/adding a dependency.
@@ -56,6 +60,7 @@ impl Gate {
     /// Canonical snake_case storage/wire string.
     pub fn as_str(self) -> &'static str {
         match self {
+            Gate::GitCommit => "git_commit",
             Gate::GitPush => "git_push",
             Gate::PackageInstall => "package_install",
             Gate::ProdAction => "prod_action",
@@ -67,6 +72,7 @@ impl Gate {
     /// Parse the canonical storage string.
     pub fn parse(s: &str) -> Option<Self> {
         match s {
+            "git_commit" => Some(Gate::GitCommit),
             "git_push" => Some(Gate::GitPush),
             "package_install" => Some(Gate::PackageInstall),
             "prod_action" => Some(Gate::ProdAction),
@@ -113,6 +119,9 @@ pub enum ApprovalStatus {
     Approved,
     /// Human denied (or superseded).
     Denied,
+    /// A single-use approval that has already authorized its operation.
+    /// Terminal: it never authorizes anything again.
+    Consumed,
 }
 
 impl ApprovalStatus {
@@ -121,6 +130,7 @@ impl ApprovalStatus {
             "pending" => Some(ApprovalStatus::Pending),
             "approved" => Some(ApprovalStatus::Approved),
             "denied" => Some(ApprovalStatus::Denied),
+            "consumed" => Some(ApprovalStatus::Consumed),
             _ => None,
         }
     }
@@ -140,6 +150,9 @@ pub struct ApprovalRequest {
     pub requested_by: String,
     /// When the approval stops being honored (checked at read time).
     pub expires_at: DateTime<Utc>,
+    /// Whether the approval is spent by its first use ([`ApprovalStore::consume`]).
+    #[serde(default)]
+    pub single_use: bool,
 }
 
 /// Compact canonical JSON: object keys sorted recursively, no whitespace.
@@ -203,20 +216,56 @@ impl ApprovalStore {
     pub fn open(path: &Path) -> Result<Self, PolicyError> {
         let conn = open_db(path)?;
         conn.execute_batch(SCHEMA).map_err(db)?;
+        for statement in ADDED_COLUMNS {
+            match conn.execute(statement, []) {
+                Ok(_) => {}
+                // Already migrated: SQLite reports a duplicate column name.
+                Err(err) if err.to_string().contains("duplicate column name") => {}
+                Err(err) => return Err(db(err)),
+            }
+        }
         Ok(Self {
             conn: Mutex::new(conn),
         })
     }
 
-    /// Record a request for `gate` covering exactly `operation`, valid for
-    /// `ttl` after now. `ttl == 0` produces an instantly-expired request
-    /// (useful for tests/audits of the expiry path).
+    /// Record a **reusable** request for `gate` covering exactly
+    /// `operation`, valid for `ttl` after now. `ttl == 0` produces an
+    /// instantly-expired request (useful for tests/audits of the expiry
+    /// path). Reusable is right for a gate that governs a task's
+    /// *progression*: a retry of the same task asks the same question.
     pub fn request(
         &self,
         gate: Gate,
         operation: &serde_json::Value,
         requested_by: &str,
         ttl: Duration,
+    ) -> Result<ApprovalRequest, PolicyError> {
+        self.request_scoped(gate, operation, requested_by, ttl, false)
+    }
+
+    /// Record a **single-use** request: once [`Self::consume`] cashes the
+    /// approval in, it is spent and authorizes nothing further, even inside
+    /// its ttl. This is the right scope for an irreversible side effect —
+    /// a commit or a push — where "approved once" must not silently mean
+    /// "approved for the next ten minutes of retries".
+    pub fn request_once(
+        &self,
+        gate: Gate,
+        operation: &serde_json::Value,
+        requested_by: &str,
+        ttl: Duration,
+    ) -> Result<ApprovalRequest, PolicyError> {
+        self.request_scoped(gate, operation, requested_by, ttl, true)
+    }
+
+    fn request_scoped(
+        &self,
+        gate: Gate,
+        operation: &serde_json::Value,
+        requested_by: &str,
+        ttl: Duration,
+        single_use: bool,
     ) -> Result<ApprovalRequest, PolicyError> {
         if ttl < Duration::zero() {
             return Err(PolicyError::Invalid("ttl must be non-negative".to_owned()));
@@ -228,14 +277,16 @@ impl ApprovalStore {
         let conn = lock_guard(&self.conn);
         conn.execute(
             "INSERT INTO approvals (id, gate, operation_fingerprint, requested_by, status, \
-             created_at, expires_at) VALUES (?1, ?2, ?3, ?4, 'pending', ?5, ?6)",
+             created_at, expires_at, single_use) \
+             VALUES (?1, ?2, ?3, ?4, 'pending', ?5, ?6, ?7)",
             params![
                 id,
                 gate.as_str(),
                 fingerprint,
                 requested_by,
                 now_ts(),
-                expires_ts
+                expires_ts,
+                i64::from(single_use)
             ],
         )
         .map_err(db)?;
@@ -245,7 +296,56 @@ impl ApprovalStore {
             operation_fingerprint: fingerprint,
             requested_by: requested_by.to_owned(),
             expires_at,
+            single_use,
         })
+    }
+
+    /// Spend the live approval covering `gate` + `operation`, if it is
+    /// single-use. Returns the id of the approval that was consumed, or
+    /// `None` when the live approval is reusable (nothing to spend) or when
+    /// there is no live approval at all.
+    ///
+    /// Call this **after** the authorized side effect actually happened —
+    /// consuming first would burn a human's decision on an attempt that
+    /// then failed. The `UPDATE ... WHERE status = 'approved'` is the
+    /// atomic step: two racing consumers cannot both spend one approval.
+    pub fn consume(
+        &self,
+        gate: Gate,
+        operation: &serde_json::Value,
+        consumed_by: &str,
+    ) -> Result<Option<String>, PolicyError> {
+        let fingerprint = operation_fingerprint(operation);
+        let conn = lock_guard(&self.conn);
+        let id: Option<String> = conn
+            .query_row(
+                "SELECT id FROM approvals \
+                 WHERE gate = ?1 AND operation_fingerprint = ?2 AND status = 'approved' \
+                   AND single_use = 1 \
+                 ORDER BY expires_at DESC LIMIT 1",
+                params![gate.as_str(), fingerprint],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(db)?;
+        let Some(id) = id else {
+            return Ok(None);
+        };
+        let updated = conn
+            .execute(
+                "UPDATE approvals SET status = 'consumed', consumed_at = ?1, consumed_by = ?2 \
+                 WHERE id = ?3 AND status = 'approved'",
+                params![now_ts(), consumed_by, id],
+            )
+            .map_err(db)?;
+        if updated == 1 {
+            tracing::info!(approval = %id, gate = %gate, consumer = %consumed_by,
+                "single-use approval consumed");
+            Ok(Some(id))
+        } else {
+            // Another consumer won the race; the approval is already spent.
+            Ok(None)
+        }
     }
 
     /// Resolve a `pending` request. Returns whether a row transitioned
@@ -322,16 +422,128 @@ CREATE TABLE IF NOT EXISTS approvals (\
     status TEXT NOT NULL DEFAULT 'pending',\
     created_at TEXT NOT NULL,\
     expires_at TEXT NOT NULL,\
-    resolved_at TEXT\
+    resolved_at TEXT,\
+    single_use INTEGER NOT NULL DEFAULT 0,\
+    consumed_at TEXT,\
+    consumed_by TEXT\
 );\
 CREATE INDEX IF NOT EXISTS idx_approvals_gate_fp_status \
     ON approvals(gate, operation_fingerprint, status);\
 ";
 
+/// Columns added after the first release. SQLite has no
+/// `ADD COLUMN IF NOT EXISTS`, so each is attempted on open and a
+/// "duplicate column name" error means the migration already ran.
+const ADDED_COLUMNS: [&str; 3] = [
+    "ALTER TABLE approvals ADD COLUMN single_use INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE approvals ADD COLUMN consumed_at TEXT",
+    "ALTER TABLE approvals ADD COLUMN consumed_by TEXT",
+];
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn a_single_use_approval_authorizes_exactly_once() {
+        let (_dir, store) = store();
+        let op = json!({"kind": "git", "action": "commit", "taskId": "t-1"});
+        let request = store
+            .request_once(Gate::GitCommit, &op, "supervisor", Duration::seconds(600))
+            .expect("request");
+        assert!(request.single_use);
+        store
+            .resolve(&request.id, ApprovalDecision::Approved)
+            .expect("resolve");
+        assert!(store.is_approved(Gate::GitCommit, &op).unwrap());
+
+        // Cash it in after the side effect: it is spent, inside its ttl.
+        assert_eq!(
+            store.consume(Gate::GitCommit, &op, "supervisor").unwrap(),
+            Some(request.id.clone())
+        );
+        assert!(
+            !store.is_approved(Gate::GitCommit, &op).unwrap(),
+            "a consumed approval authorizes nothing further"
+        );
+        assert_eq!(
+            store.status(&request.id).unwrap(),
+            Some(ApprovalStatus::Consumed)
+        );
+        // A second consumer gets nothing — one decision, one use.
+        assert_eq!(store.consume(Gate::GitCommit, &op, "other").unwrap(), None);
+    }
+
+    #[test]
+    fn a_reusable_approval_is_never_spent_by_consume() {
+        let (_dir, store) = store();
+        let op = json!({"kind": "human", "node": "gate"});
+        let request = store
+            .request(Gate::ProdAction, &op, "supervisor", Duration::seconds(600))
+            .expect("request");
+        assert!(!request.single_use);
+        store
+            .resolve(&request.id, ApprovalDecision::Approved)
+            .expect("resolve");
+        assert_eq!(
+            store.consume(Gate::ProdAction, &op, "supervisor").unwrap(),
+            None
+        );
+        assert!(
+            store.is_approved(Gate::ProdAction, &op).unwrap(),
+            "a retry of the same node asks the same question"
+        );
+    }
+
+    #[test]
+    fn commit_and_push_approvals_never_transfer_between_gates() {
+        let (_dir, store) = store();
+        let op = json!({"kind": "git", "taskId": "t-1"});
+        let request = store
+            .request_once(Gate::GitCommit, &op, "supervisor", Duration::seconds(600))
+            .expect("request");
+        store
+            .resolve(&request.id, ApprovalDecision::Approved)
+            .expect("resolve");
+        assert!(store.is_approved(Gate::GitCommit, &op).unwrap());
+        assert!(
+            !store.is_approved(Gate::GitPush, &op).unwrap(),
+            "an approved commit is not an approved push"
+        );
+        assert_eq!(
+            store.consume(Gate::GitPush, &op, "supervisor").unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn opening_a_pre_migration_database_adds_the_consumption_columns() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("legacy.sqlite3");
+        {
+            // The pre-consumption schema, as shipped in the first release.
+            let conn = crate::store::open_db(&path).expect("open");
+            conn.execute_batch(
+                "CREATE TABLE approvals (id TEXT PRIMARY KEY, gate TEXT NOT NULL,                  operation_fingerprint TEXT NOT NULL, requested_by TEXT NOT NULL,                  status TEXT NOT NULL DEFAULT 'pending', created_at TEXT NOT NULL,                  expires_at TEXT NOT NULL, resolved_at TEXT);",
+            )
+            .expect("legacy schema");
+        }
+        let store = ApprovalStore::open(&path).expect("migrate");
+        let op = json!({"kind": "git"});
+        let request = store
+            .request_once(Gate::GitCommit, &op, "supervisor", Duration::seconds(60))
+            .expect("request on the migrated database");
+        store
+            .resolve(&request.id, ApprovalDecision::Approved)
+            .expect("resolve");
+        assert_eq!(
+            store.consume(Gate::GitCommit, &op, "supervisor").unwrap(),
+            Some(request.id)
+        );
+        // Idempotent: opening again must not fail on the added columns.
+        ApprovalStore::open(&path).expect("reopen");
+    }
 
     fn store() -> (tempfile::TempDir, ApprovalStore) {
         let dir = tempfile::tempdir().expect("tempdir");

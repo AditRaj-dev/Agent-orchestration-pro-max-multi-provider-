@@ -162,10 +162,14 @@ pub fn compile_to_spawn_spec(perms: &PermissionSet, scope: &TaskScope) -> SpawnC
 ///    `approved_by_policy` is `true` (a forged or stale flag, or a model
 ///    claiming approval — PRD §23.3: "a worker without Git permission cannot
 ///    commit/push even if instructed in prompt");
-/// 2. `Push` additionally requires a live approval
+/// 2. the *mutating* actions additionally require a live approval
 ///    (`approved_by_policy` comes from
 ///    [`crate::ApprovalStore::is_approved`], which enforces fingerprint and
-///    expiry).
+///    expiry): `Push` under [`Gate::GitPush`] and `Commit` under
+///    [`Gate::GitCommit`]. The gates are distinct so an approval for one
+///    never authorizes the other, and the denial names the gate a human
+///    would have to satisfy. `Merge` and `Rebase` stay permission-only —
+///    they rewrite a task branch, not the integration history.
 pub fn git_gate_check(
     perms: &PermissionSet,
     action: GitAction,
@@ -175,13 +179,24 @@ pub fn git_gate_check(
         tracing::debug!(action = %action, "git gate: action not in permission set");
         return Err(PolicyDenial::GitActionNotPermitted { action });
     }
-    if action == GitAction::Push && !approved_by_policy {
-        tracing::debug!("git gate: push requires a live approval bound to the exact operation");
-        return Err(PolicyDenial::ApprovalRequired {
-            gate: Gate::GitPush,
-        });
+    if let Some(gate) = approval_gate(action) {
+        if !approved_by_policy {
+            tracing::debug!(action = %action,
+                "git gate: this action requires a live approval bound to the exact operation");
+            return Err(PolicyDenial::ApprovalRequired { gate });
+        }
     }
     Ok(())
+}
+
+/// The approval gate a git action must satisfy on top of the permission,
+/// or `None` for actions that are permission-only.
+pub fn approval_gate(action: GitAction) -> Option<Gate> {
+    match action {
+        GitAction::Commit => Some(Gate::GitCommit),
+        GitAction::Push => Some(Gate::GitPush),
+        GitAction::Merge | GitAction::Rebase => None,
+    }
 }
 
 /// Why an operation was refused by policy. Denials are facts for the audit
@@ -372,7 +387,7 @@ mod tests {
     }
 
     #[test]
-    fn git_gate_push_requires_approval_even_with_permission() {
+    fn git_mutations_require_approval_even_with_permission() {
         let manager = PermissionSet::git_manager();
         let err = git_gate_check(&manager, GitAction::Push, false).expect_err("must deny");
         assert_eq!(
@@ -382,9 +397,24 @@ mod tests {
             }
         );
         assert!(git_gate_check(&manager, GitAction::Push, true).is_ok());
-        // Non-push actions need no approval flag once permitted.
-        for action in [GitAction::Commit, GitAction::Merge, GitAction::Rebase] {
+
+        // Commit carries its OWN gate: a push approval never authorizes a
+        // commit, because the denial names a different gate entirely.
+        let err = git_gate_check(&manager, GitAction::Commit, false).expect_err("must deny");
+        assert_eq!(
+            err,
+            PolicyDenial::ApprovalRequired {
+                gate: Gate::GitCommit
+            }
+        );
+        assert!(git_gate_check(&manager, GitAction::Commit, true).is_ok());
+        assert_eq!(approval_gate(GitAction::Commit), Some(Gate::GitCommit));
+        assert_eq!(approval_gate(GitAction::Push), Some(Gate::GitPush));
+
+        // Branch-local rewrites stay permission-only.
+        for action in [GitAction::Merge, GitAction::Rebase] {
             assert!(git_gate_check(&manager, action, false).is_ok());
+            assert_eq!(approval_gate(action), None);
         }
     }
 

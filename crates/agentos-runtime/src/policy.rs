@@ -80,6 +80,13 @@ pub enum GateVerdict {
         /// Fingerprint the tracked request was bound to.
         approved_fingerprint: String,
     },
+    /// The single-use approval covering this operation has already been
+    /// spent by the side effect it authorized. A deterministic refusal, not
+    /// a wait: whatever wants to act now needs a **new** human decision.
+    Consumed {
+        /// The tracked request id.
+        request_id: String,
+    },
     /// No approval has ever been requested for this operation.
     Missing,
 }
@@ -105,6 +112,7 @@ impl GateVerdict {
             GateVerdict::Denied { .. } => "denied",
             GateVerdict::Expired { .. } => "expired",
             GateVerdict::Mutated { .. } => "operation_mutated",
+            GateVerdict::Consumed { .. } => "approval_already_used",
             GateVerdict::Missing => "no_approval_requested",
         }
     }
@@ -115,6 +123,7 @@ impl GateVerdict {
             GateVerdict::Pending { request_id }
             | GateVerdict::Denied { request_id }
             | GateVerdict::Expired { request_id }
+            | GateVerdict::Consumed { request_id }
             | GateVerdict::Mutated { request_id, .. } => Some(request_id),
             GateVerdict::Approved { .. } | GateVerdict::Missing => None,
         }
@@ -199,6 +208,9 @@ impl PolicyGate {
             Some(ApprovalStatus::Approved) => GateVerdict::Expired {
                 request_id: tracked.id,
             },
+            Some(ApprovalStatus::Consumed) => GateVerdict::Consumed {
+                request_id: tracked.id,
+            },
             // The row is gone (a different installation's database): treat
             // the pointer as stale, never as an approval.
             None => GateVerdict::Missing,
@@ -208,6 +220,11 @@ impl PolicyGate {
     /// Request a human approval for `operation` and track it under
     /// `task_id`. Requests are immutable once resolved — a changed operation
     /// is a NEW request, never a rewrite (SEC-04).
+    ///
+    /// The scope follows the gate ([`single_use_gate`]): git mutations are
+    /// single-use, so one human decision authorizes exactly one commit or
+    /// push; node-progression gates stay reusable, because a retry of the
+    /// same node asks the human the same question.
     pub fn request(
         &self,
         gate: Gate,
@@ -217,9 +234,29 @@ impl PolicyGate {
         ttl_secs: u64,
     ) -> Result<ApprovalRequest, RuntimeError> {
         let ttl = chrono::Duration::seconds(i64::try_from(ttl_secs).unwrap_or(i64::MAX));
-        let request = self.approvals.request(gate, operation, requested_by, ttl)?;
+        let request = if single_use_gate(gate) {
+            self.approvals
+                .request_once(gate, operation, requested_by, ttl)?
+        } else {
+            self.approvals.request(gate, operation, requested_by, ttl)?
+        };
         self.track(task_id, &request)?;
         Ok(request)
+    }
+
+    /// Spend a single-use approval **after** its side effect happened.
+    /// Reusable approvals are untouched (`Ok(None)`), and a store failure is
+    /// logged rather than failing a task whose mutation already landed —
+    /// the alternative would be re-running an irreversible git operation.
+    pub fn consume(&self, gate: Gate, operation: &Value, consumed_by: &str) -> Option<String> {
+        match self.approvals.consume(gate, operation, consumed_by) {
+            Ok(consumed) => consumed,
+            Err(error) => {
+                tracing::error!(%error, gate = %gate,
+                    "could not consume a single-use approval after its side effect");
+                None
+            }
+        }
     }
 
     /// The request record tracked for `task_id`, if any. A corrupt or
@@ -242,6 +279,13 @@ impl PolicyGate {
     fn record_path(&self, task_id: &Uuid) -> PathBuf {
         self.requests_dir.join(format!("{task_id}.json"))
     }
+}
+
+/// Whether approvals for `gate` are spent by their first use. Git
+/// mutations are irreversible, so "approved once" must not silently mean
+/// "approved for the rest of the ttl".
+pub fn single_use_gate(gate: Gate) -> bool {
+    matches!(gate, Gate::GitCommit | Gate::GitPush)
 }
 
 /// The canonical operation payload of a git mutation. Pure function of
