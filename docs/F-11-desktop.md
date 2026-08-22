@@ -225,3 +225,90 @@ live supervisor and without any billable call. `serve` mode is unchanged by this
 3. Auth token for non-loopback binds.
 4. Daemon-owned project records (UX-01 full form).
 5. Incremental projection cache (journal-size driven; re-fold is cheap for now).
+
+## 7. F-11a implementation addendum
+
+Daemon half (a), built in `crates/agentos-daemon`: `src/server.rs` (WS API),
+`src/projection.rs` (§3.3 fold), `src/seed.rs` (§3.4 demo seeding),
+`fixtures/demo-run.json` (frozen corpus), plus small additions to
+`src/events.rs`/`src/db.rs` and the `main.rs` serve/demo-seed wiring. No wire
+deviations from §2–§3; the interpretation choices the contract left open:
+
+- **Journal access** (§3.2 implementer's choice): one shared
+  `rusqlite::Connection` behind a `std::sync::Mutex`. The API is read-only
+  and desktop-scale, so the mutex beats a pool; guards are never held
+  across an `.await` (every journal read is a synchronous block returning
+  owned data). External writers appending through their own WAL connections
+  are observed because every autocommit `SELECT` takes a fresh snapshot.
+- **Seq-carrying reads**: `events::tail_with_seq` / `events::journal_stats`
+  were added next to the F-01 primitives — §3.1 frames and the §3.3
+  `firstSeq`/`lastSeq` fields need the journal `seq` that `tail` drops.
+  `db::default_journal_path()` moved into the library so the seeder can
+  refuse that path; `main` still honors `AGENTOS_DB` first.
+- **Framing strictness**: `invalid_request` (always answered with
+  `id: null`) covers unparseable frames, non-object frames, missing/empty
+  `method`, a missing or non-number/string `id` (client→server frames must
+  carry one — notifications are server→client only, §2), and a non-object
+  `params`. `events.list` validates `afterSeq ≥ 0`, `limit` in `1..=1000`
+  (0 and floats rejected); unknown params are ignored (forward compat).
+- **Subscriptions**: per-subscription task, `events::tail(last_seq, 500)`
+  per 250 ms tick; batches drain back-to-back so replay runs at full speed
+  and the sleep only applies to idle polls. Delivery is gapless and
+  at-least-once per seq (each frame advances `last_seq` only once queued);
+  the response frame is enqueued before the task spawns, so the
+  `subscriptionId` reply precedes replay notifications. Outbound frames go
+  through a bounded 128-slot channel; a subscriber that fills it gets
+  `subscription.closed` reason `slow_consumer` (a journal read failure
+  closes with reason `journal_error` — non-contract reasons are free
+  strings by §2.3's shape). Unsubscribe of an unknown/already-closed id
+  answers `{"stopped": false}`.
+- **Shutdown**: a `tokio::sync::watch` flips on ctrl-c; every connection's
+  writer drains queued frames, sends `daemon.stopping`, then closes 1001;
+  `serve()` returns only after all connections finish.
+- **Fold interpretation** (documented in `src/projection.rs` module docs):
+  `budget.exceeded` sets `budgetExceeded` on the task only — the §3.3
+  `RunSummary` wire shape has no such field, and the exact-shape requirement
+  outranks the fold-table prose; `agent.leased`/`task.running` both map the
+  agent to `running` (the vocabulary has no `leased`); `run.completed`
+  resolves through the F-06 derivation (`RunStatus::from_tasks`: any failed
+  task → `failed`); `commitSha` reads the supervisor's payload key `sha`
+  (`commitSha` accepted as fallback); `attempts` increments only on
+  `agent.crashed` per the table (the supervisor's `attempt` payload field
+  on lease events is not folded). `dependsOn` absorbs the §3.3 node-list
+  shape `{nodes:[{id,dependsOn}]}` retroactively (workflow.started precedes
+  task.created) and tolerates today's supervisor shape where `nodes` is a
+  bare count. Agent `usage` sums `costUsd` when reported and takes
+  `totalTokens`, else `inputTokens+outputTokens` (UsageSnapshot camelCase
+  canon; codex/agy `costUsd: null` per F-00 §4).
+- **Demo fixture** (`fixtures/demo-run.json`, 51 events over ~1m45s): the
+  F-07 Appendix-E happy path — spec → parallel build-a (codex) / build-b
+  (agy) → review (stub-reviewer@f-07) → git gate (`git_push`), with the
+  adapter ids of the F-00 §6 provider mix, `usage.updated` snapshots in the
+  real `UsageSnapshot` camelCase shape, and the git-gate approval flow as
+  F-07 §5.2/§5.3 shape it: the human opens the request up front
+  (`approval.required`, non-blocking, fingerprint + expiry) and the gate
+  time sees `approval.granted` before `git.queued`. The blocking
+  (park-in-`human_required`) approval variant is covered by fold tests on
+  synthetic journals, not by the happy-path corpus.
+- **demo-seed refusals** are checked before any append: the default journal
+  path (compared case/separator-insensitively for Windows) and any journal
+  with existing events (§3.4). The seeder stamps `"demo": true` into every
+  payload even if the fixture forgot it. `main` hand-parses argv: no
+  subcommand or `serve` serves; `demo-seed --db <path> --fixture <file>`
+  seeds; both flags required, unknown flags are errors.
+- **Dependencies**: `chrono` (already a workspace dep) for RFC 3339
+  stamps; `futures-util` + `tokio-tungstenite` 0.26 were pre-wired by the
+  scaffold and are used with default features (ws:// only — no TLS crates
+  enter the lockfile).
+
+Verification (Windows reference platform, `CARGO_TARGET_DIR=target/daemon-f11a`):
+`cargo test -p agentos-daemon` — 32 tests green across lib (8),
+`demo_seed` (5, incl. seeding + folding the frozen fixture),
+`events_roundtrip` (2, F-01 regression), `projection_fold` (10),
+`ws_e2e` (7: ping/info, pagination+truncated, error ladder, subscribe
+replay→external-writer tail→resubscribe→unsubscribe, projections over WS,
+`daemon.stopping`+close 1001, slow-consumer close). `cargo clippy
+--all-targets -- -D warnings` clean; `cargo fmt` applied. External smoke:
+the real binary serves `101` + `ping`/`daemon.info` round-trips on
+`127.0.0.1:8799` from a hand-rolled WS client, and `demo-seed` appends 51
+events / refuses both the default path and a reseed.

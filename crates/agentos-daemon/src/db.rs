@@ -157,6 +157,35 @@ fn migrate(conn: &mut Connection) -> Result<(), CoreError> {
     Ok(())
 }
 
+/// `%LOCALAPPDATA%/agentos/daemon.db` on Windows (reference platform),
+/// `$HOME/.local/state/agentos/daemon.db` elsewhere (XDG state dir shape).
+///
+/// Library-level so `seed` can refuse to touch it: demo fixtures must land
+/// in an explicit `--db` path, never in the journal a real daemon owns
+/// (F-11 §3.4).
+pub fn default_journal_path() -> std::path::PathBuf {
+    if cfg!(windows) {
+        let base = match std::env::var_os("LOCALAPPDATA") {
+            Some(dir) => std::path::PathBuf::from(dir),
+            None => home_dir().join("AppData").join("Local"),
+        };
+        base.join("agentos").join("daemon.db")
+    } else {
+        home_dir()
+            .join(".local")
+            .join("state")
+            .join("agentos")
+            .join("daemon.db")
+    }
+}
+
+/// `$HOME` with a conservative fallback for environments that unset it.
+fn home_dir() -> std::path::PathBuf {
+    std::env::var_os("HOME")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from("."))
+}
+
 /// Whether a rusqlite error is any flavour of SQLITE_BUSY (primary code 5,
 /// including SQLITE_BUSY_RECOVERY and SQLITE_BUSY_SNAPSHOT).
 pub fn is_sqlite_busy(err: &rusqlite::Error) -> bool {

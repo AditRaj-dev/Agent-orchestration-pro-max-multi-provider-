@@ -156,6 +156,74 @@ pub fn tail(conn: &Connection, after_seq: i64, limit: u32) -> Result<Vec<Event>,
         .map_err(map_sqlite_error)
 }
 
+/// An [`Event`] together with the journal `seq` it was assigned.
+///
+/// The F-11 wire shape (§3.1) is the core event **plus** `seq`, and the
+/// projections (§3.3) need `firstSeq`/`lastSeq` — so the F-11a read paths
+/// return this pair instead of a bare [`Event`]. [`tail`] stays as the
+/// F-01 primitive; [`tail_with_seq`] is its F-11 sibling.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SequencedEvent {
+    /// Journal sequence number (append order, gapless per journal).
+    pub seq: i64,
+    /// The event itself.
+    pub event: Event,
+}
+
+/// Events with `seq > after_seq`, oldest first, at most `limit`, each
+/// carrying its `seq` — the F-11a read primitive behind `events.list` and
+/// the subscription replay/tail loops.
+pub fn tail_with_seq(
+    conn: &Connection,
+    after_seq: i64,
+    limit: u32,
+) -> Result<Vec<SequencedEvent>, CoreError> {
+    let mut stmt = conn
+        .prepare(&format!(
+            "SELECT seq, {EVENT_COLUMNS} FROM events WHERE seq > ?1 ORDER BY seq ASC LIMIT ?2"
+        ))
+        .map_err(map_sqlite_error)?;
+    let rows = stmt
+        .query_map(rusqlite::params![after_seq, limit], row_to_sequenced_event)
+        .map_err(map_sqlite_error)?;
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(map_sqlite_error)
+}
+
+/// Whole-journal counters for `daemon.info` and `events.list`: total event
+/// count and the highest assigned `seq` (0 for an empty journal).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct JournalStats {
+    /// `COUNT(*)` over the journal.
+    pub event_count: i64,
+    /// `COALESCE(MAX(seq), 0)`.
+    pub last_seq: i64,
+}
+
+/// One cheap aggregate query for [`JournalStats`].
+pub fn journal_stats(conn: &Connection) -> Result<JournalStats, CoreError> {
+    conn.query_row(
+        "SELECT COUNT(*), COALESCE(MAX(seq), 0) FROM events",
+        [],
+        |row| {
+            Ok(JournalStats {
+                event_count: row.get(0)?,
+                last_seq: row.get(1)?,
+            })
+        },
+    )
+    .map_err(map_sqlite_error)
+}
+
+/// Reuse [`row_to_event`]'s wire reconstruction for the seq-carrying reads.
+fn row_to_sequenced_event(row: &Row<'_>) -> Result<SequencedEvent, rusqlite::Error> {
+    let seq: i64 = row.get("seq")?;
+    Ok(SequencedEvent {
+        seq,
+        event: row_to_event(row)?,
+    })
+}
+
 /// Rebuild an [`Event`] from a row by reconstructing agentos-core's wire
 /// shape and deserializing it. Deserialization is total for event types
 /// (unknown strings become [`agentos_core::EventType::Other`]) and ignores
