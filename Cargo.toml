@@ -11,6 +11,9 @@ members = [
     "crates/agentos-policy",
     "crates/agentos-orchestrator",
 ]
+# F-11b Tauri shell builds outside the workspace (own dependency tree,
+# own target dir) so `cargo test --workspace` stays the daemon/crates gate.
+exclude = ["apps/desktop/src-tauri"]
 
 [workspace.package]
 version = "0.1.0"

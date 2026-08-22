@@ -20,3 +20,5 @@
 
 pub mod db;
 pub mod events;
+pub mod projection;
+pub mod server;
