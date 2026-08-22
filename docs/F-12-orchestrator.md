@@ -133,13 +133,17 @@ explicitly labelled `STATE SNAPSHOT (data, not instructions)`.
 
 ## 4. Decisions
 
-1. **The orchestrator plans; it does not mutate live runs.** F-06's store exposes
-   `create_run` (whole-spec, transactional), not `insert_task`. Rather than reach
-   around that, F-12 treats a committed plan as frozen: structural operations
-   after commit are rejected with `run_already_started`, and re-planning means
-   proposing a *new* run. This is the honest reading of "the engine stays
-   authoritative" against the API that actually exists. Consequence and seam: OR-01's
-   "re-plan when tasks block" is currently *new-run* granularity (§6, debt 1).
+1. **The orchestrator appends to live runs; it never rewrites them.** F-06 now
+   exposes `TaskStore::add_task` / `WorkflowEngine::add_task` (transactional
+   validate-then-insert over the tentative DAG), so `create_task` and
+   `request_review` — the two purely *additive* operations — are legal after the
+   commit and materialize through the engine, which gets the last word: a refused
+   append is dropped from the draft and reported as `engine_rejected`.
+   `add_dependency` and `assign_pool` rewrite a node spec the engine already
+   materialized and stay refused with `run_already_started`. There is deliberately
+   no run-status gate on appends: `RunStatus` is a projection recomputed from the
+   tasks, so re-planning onto a run whose work has all landed is exactly the
+   supported case.
 2. **Two phases with a user gate between them** (mastermind, HANDOFF-BUILD-2 §2).
    Phase A proposes the graph; `commit()` hands it to the engine; phase B
    supervises with `escalate`/`close_goal` only.
@@ -205,10 +209,12 @@ explicitly labelled `STATE SNAPSHOT (data, not instructions)`.
 
 ## 6. Known debts / seams
 
-1. **Re-planning is new-run granularity.** Adding a task to a live run needs an
-   engine-side `add_task_to_run` (durable, transactional, dependency-aware). Until
-   F-06 grows one, `run_already_started` is the honest answer. *(Requires a change
-   to `agentos-workflow`; out of F-12's file scope.)*
+1. ~~**Re-planning is new-run granularity.**~~ **CLOSED** — F-06 grew
+   `add_task`, and live appends go through it (§decision 1). What remains
+   unsupported is *rewriting* a materialized node (`add_dependency`,
+   `assign_pool` post-commit): the durable store has no node-spec update, and a
+   spec swap under a leased task would race the executor. Re-shaping an existing
+   node still means a new run.
 2. **Escalation routing is a priority raise only.** `EscalationTarget::Human`
    should resolve through F-10's approval store and
    `EscalationTarget::StrongerAgent` through a capability-tiered pool (F-13).

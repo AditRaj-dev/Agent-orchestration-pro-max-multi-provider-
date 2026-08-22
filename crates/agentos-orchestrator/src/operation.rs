@@ -87,6 +87,18 @@ impl PlanOperation {
     /// Structural operations are refused once the plan is materialized into
     /// durable engine state: from that moment the workflow engine owns the
     /// graph, and re-planning means proposing a new run.
+    /// Whether the operation only *appends* a node, leaving every existing
+    /// node's spec untouched. These are the structural operations that a
+    /// live run can absorb (F-06's `add_task` validates the tentative DAG
+    /// and inserts); `add_dependency` and `assign_pool` rewrite an existing
+    /// node spec, which the durable store deliberately does not support.
+    pub fn is_additive(&self) -> bool {
+        matches!(
+            self,
+            PlanOperation::CreateTask(_) | PlanOperation::RequestReview(_)
+        )
+    }
+
     pub fn is_structural(&self) -> bool {
         matches!(
             self,

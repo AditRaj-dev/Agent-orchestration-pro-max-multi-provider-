@@ -28,6 +28,7 @@ use chrono::{DateTime, Utc};
 use rusqlite::{Connection, Row, Transaction};
 use uuid::Uuid;
 
+use crate::error::WorkflowError;
 use crate::spec::{NodeSpec, TaskContract, WorkflowSpec};
 
 /// Busy-handler wait applied to every connection opened by [`open_db`].
@@ -281,6 +282,104 @@ impl TaskStore {
             Ok(()) => {
                 tx.commit().map_err(map_sqlite_error)?;
                 Ok(run_id)
+            }
+            Err(err) => {
+                let _ = tx.rollback();
+                Err(err)
+            }
+        }
+    }
+
+    /// Add one node to a **live** run — the F-12 re-planning path.
+    ///
+    /// Validate-then-insert in a single transaction: the tentative spec is
+    /// `existing nodes + node`, run through [`crate::validate`], so
+    /// duplicate ids, dangling dependencies, cycles and unbounded loops are
+    /// rejected by exactly the rules that governed `create_run`. Validating
+    /// *inside* the write transaction is what stops two concurrent adds
+    /// from closing a cycle between themselves.
+    ///
+    /// The new task lands in the state its dependencies dictate — `Ready`
+    /// when they are all `Done` (or there are none), `Blocked` when any of
+    /// them already failed or was cancelled (nothing would ever promote it),
+    /// `Planned` otherwise.
+    ///
+    /// There is deliberately **no run-status gate**: [`RunStatus`] is a
+    /// projection recomputed from the tasks, so a run whose work has all
+    /// landed reads `completed` — and re-planning onto exactly that run
+    /// (add a follow-up, add a fix behind a failure) is the case this
+    /// method exists for. The next status refresh flips the projection back
+    /// to `running`. Goal *closure* is a planning-layer concept (F-12's
+    /// `close_goal`), not a durable property of the run row.
+    pub fn add_task(&self, run_id: &Uuid, node: &NodeSpec) -> Result<Uuid, WorkflowError> {
+        let now = Utc::now();
+        let task_id = Uuid::now_v7();
+        let mut conn = self.lock()?;
+        let tx = conn.transaction().map_err(map_sqlite_error)?;
+        let result = (|| -> Result<(), WorkflowError> {
+            let run = run_in_tx(&tx, run_id)?;
+            let siblings = tasks_for_run_in_tx(&tx, run_id)?;
+
+            // Whole-DAG validation, not a local dependency check: the new
+            // edge set is only legal if the resulting graph is.
+            let mut nodes: Vec<NodeSpec> = siblings.iter().map(|task| task.node.clone()).collect();
+            nodes.push(node.clone());
+            crate::validate::validate(&WorkflowSpec {
+                id: run.workflow_id.clone(),
+                version: run.workflow_version,
+                nodes,
+            })?;
+
+            let contract = TaskContract::for_node(node, &run.goal);
+            let contract_json = serde_json::to_string(&contract)
+                .map_err(|err| CoreError::Serialization(format!("contract: {err}")))?;
+            let node_json = serde_json::to_string(node)
+                .map_err(|err| CoreError::Serialization(format!("node spec: {err}")))?;
+            tx.execute(
+                "INSERT INTO tasks (
+                    id, run_id, workflow_id, node_id, state, priority,
+                    lease_owner, lease_expires_at, heartbeat_at, attempt_count,
+                    contract, node, created_at, updated_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, NULL, NULL, 0, ?7, ?8, ?9, ?9)",
+                rusqlite::params![
+                    task_id.to_string(),
+                    run_id.to_string(),
+                    run.workflow_id,
+                    node.id,
+                    TaskState::Planned.as_str(),
+                    priority_wire(&Priority::P2),
+                    contract_json,
+                    node_json,
+                    now.to_rfc3339()
+                ],
+            )
+            .map_err(map_sqlite_error)?;
+
+            let states: std::collections::HashMap<&str, TaskState> = siblings
+                .iter()
+                .map(|task| (task.node_id.as_str(), task.state))
+                .collect();
+            let dep_state = |dep: &String| states.get(dep.as_str()).copied();
+            if node.depends_on.iter().any(|dep| {
+                matches!(
+                    dep_state(dep),
+                    Some(TaskState::Failed | TaskState::Cancelled)
+                )
+            }) {
+                cas_update_state(&tx, &task_id, TaskState::Planned, TaskState::Blocked, now)?;
+            } else if node
+                .depends_on
+                .iter()
+                .all(|dep| dep_state(dep) == Some(TaskState::Done))
+            {
+                cas_update_state(&tx, &task_id, TaskState::Planned, TaskState::Ready, now)?;
+            }
+            Ok(())
+        })();
+        match result {
+            Ok(()) => {
+                tx.commit().map_err(map_sqlite_error)?;
+                Ok(task_id)
             }
             Err(err) => {
                 let _ = tx.rollback();
@@ -745,6 +844,32 @@ fn cas_update_state(
         1 => Ok(()),
         _ => Err(classify_cas_miss(tx, task_id, to)),
     }
+}
+
+/// Read a run row inside an open transaction.
+fn run_in_tx(tx: &Transaction<'_>, run_id: &Uuid) -> Result<RunRecord, CoreError> {
+    tx.query_row(
+        "SELECT id, workflow_id, workflow_version, goal, status, created_at
+         FROM runs WHERE id = ?1",
+        rusqlite::params![run_id.to_string()],
+        row_to_run,
+    )
+    .map_err(|err| not_found_or_sqlite(err, "run", run_id))
+}
+
+/// Read every task of a run inside an open transaction.
+fn tasks_for_run_in_tx(tx: &Transaction<'_>, run_id: &Uuid) -> Result<Vec<TaskRecord>, CoreError> {
+    let mut stmt = tx
+        .prepare(&format!(
+            "SELECT {TASK_COLUMNS} FROM tasks
+             WHERE run_id = ?1 ORDER BY created_at ASC, id ASC"
+        ))
+        .map_err(map_sqlite_error)?;
+    let rows = stmt
+        .query_map(rusqlite::params![run_id.to_string()], row_to_task)
+        .map_err(map_sqlite_error)?;
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(map_sqlite_error)
 }
 
 /// Read a task row inside an open transaction.

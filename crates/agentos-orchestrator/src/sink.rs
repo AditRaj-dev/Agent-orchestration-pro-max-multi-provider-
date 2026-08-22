@@ -29,7 +29,7 @@
 use std::sync::Arc;
 
 use agentos_core::{Priority, TaskState};
-use agentos_workflow::{RunStatus, TaskStore, WorkflowEngine};
+use agentos_workflow::{NodeSpec, RunStatus, TaskStore, WorkflowEngine};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -79,6 +79,18 @@ pub trait PlanSink: Send + Sync {
     /// Read the engine's current view of a run.
     fn run_view(&self, run_id: &Uuid) -> Result<RunView, OrchestratorError>;
 
+    /// Append one node to a live run, returning the new durable task id.
+    ///
+    /// The engine validates the tentative DAG inside its insert
+    /// transaction, so a cycle, a dangling dependency or a duplicate node
+    /// id is refused here rather than being trusted from the draft.
+    fn add_node(
+        &self,
+        run_id: &Uuid,
+        node: &NodeSpec,
+        priority: Option<Priority>,
+    ) -> Result<Uuid, OrchestratorError>;
+
     /// Apply an escalation to a live run: raise the named node (or every
     /// non-terminal task when `node_id` is `None`) to `P0` so the engine's
     /// ready-queue serves it first. Returns how many tasks were retuned.
@@ -121,6 +133,15 @@ impl PlanSink for WorkflowSink {
         Ok(run_id)
     }
 
+    fn add_node(
+        &self,
+        run_id: &Uuid,
+        node: &NodeSpec,
+        priority: Option<Priority>,
+    ) -> Result<Uuid, OrchestratorError> {
+        add_node(&self.store, run_id, node, priority)
+    }
+
     fn run_view(&self, run_id: &Uuid) -> Result<RunView, OrchestratorError> {
         run_view(&self.store, run_id)
     }
@@ -139,6 +160,19 @@ impl PlanSink for WorkflowEngine {
         let run_id = self.start_run(&spec, &plan.goal)?;
         apply_priorities(self.store(), &run_id, plan)?;
         Ok(run_id)
+    }
+
+    fn add_node(
+        &self,
+        run_id: &Uuid,
+        node: &NodeSpec,
+        priority: Option<Priority>,
+    ) -> Result<Uuid, OrchestratorError> {
+        let task_id = self.add_task(run_id, node)?;
+        if let Some(priority) = priority {
+            self.store().set_priority(&task_id, priority)?;
+        }
+        Ok(task_id)
     }
 
     fn run_view(&self, run_id: &Uuid) -> Result<RunView, OrchestratorError> {
@@ -182,6 +216,23 @@ fn apply_priorities(
         }
     }
     Ok(())
+}
+
+/// Append one node to a live run through the store's transactional
+/// validate-then-insert, then stamp its priority.
+fn add_node(
+    store: &TaskStore,
+    run_id: &Uuid,
+    node: &NodeSpec,
+    priority: Option<Priority>,
+) -> Result<Uuid, OrchestratorError> {
+    let task_id = store.add_task(run_id, node)?;
+    if let Some(priority) = priority {
+        store.set_priority(&task_id, priority)?;
+    }
+    tracing::info!(run_id = %run_id, node = %node.id, task_id = %task_id,
+        "node appended to a live run");
+    Ok(task_id)
 }
 
 /// Project the engine's durable tasks into a [`RunView`].

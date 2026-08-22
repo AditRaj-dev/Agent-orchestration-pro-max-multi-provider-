@@ -915,27 +915,31 @@ async fn e2e_human_approval_node_resolves_both_ways() {
             .starts_with("fnv1a64:"));
     }
 
-    // ---- unresolved: the node waits within its retry budget, then fails.
+    // ---- unresolved: the node parks on the human, burning no retries,
+    // and resumes when the approval lands.
     {
         let (dir, repo, head) = temp_repo();
         let supervisor = supervisor_for(&repo, &dir.path().join("state"), success_adapter());
         let run_id = supervisor
-            .start_run(&approval_spec, "nobody answers", contracts_for_gate(&head))
+            .start_run(
+                &approval_spec,
+                "nobody answers yet",
+                contracts_for_gate(&head),
+            )
             .expect("start run");
 
         let summary = supervisor.drive(&run_id, 30).await.expect("drive");
-        assert_eq!(summary.status, RunStatus::Failed);
+        assert_eq!(summary.status, RunStatus::Running, "parked, not failed");
         let tasks = tasks_by_node(&supervisor, run_id);
-        assert_eq!(tasks["gate"].state, TaskState::Failed);
+        assert_eq!(tasks["gate"].state, TaskState::HumanRequired);
         assert_eq!(
-            tasks["review"].state,
-            TaskState::Blocked,
-            "the dependent is parked, never run unapproved"
+            tasks["gate"].attempt_count, 0,
+            "waiting on a person is not a failed attempt"
         );
         assert_eq!(
-            tasks["gate"].attempt_count, 3,
-            "waiting consumes the transient retry budget (2 retries) before \
-             the gate fails terminally"
+            tasks["review"].state,
+            TaskState::Planned,
+            "the dependent waits behind the gate, never run unapproved"
         );
         let types = event_types(&supervisor, run_id);
         assert!(types.contains(&"approval.required".to_owned()), "{types:?}");
@@ -943,6 +947,23 @@ async fn e2e_human_approval_node_resolves_both_ways() {
             !types.contains(&"approval.granted".to_owned()),
             "nothing self-approves: {types:?}"
         );
+
+        // The human answers late: approve, un-park, drive again.
+        approve_gate(&supervisor, run_id, "gate");
+        supervisor
+            .engine()
+            .store()
+            .cas_transition(
+                &tasks["gate"].id,
+                TaskState::HumanRequired,
+                TaskState::Ready,
+            )
+            .expect("resume the parked gate");
+        let summary = supervisor.drive(&run_id, 30).await.expect("drive again");
+        assert_eq!(summary.status, RunStatus::Completed);
+        let tasks = tasks_by_node(&supervisor, run_id);
+        assert_eq!(tasks["gate"].state, TaskState::Done);
+        assert_eq!(tasks["review"].state, TaskState::Done);
     }
 
     // ---- denied: the node fails deterministically with the typed denial.

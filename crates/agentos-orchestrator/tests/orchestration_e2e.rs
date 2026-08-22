@@ -400,3 +400,71 @@ async fn a_committed_plan_survives_a_restart_of_everything() {
         RunStatus::Completed
     );
 }
+
+/// Live re-planning (F-06 `add_task`): after the run is committed and its
+/// first wave has landed, the orchestrator appends a follow-up node; the
+/// engine validates and materializes it, and the very same run executes it.
+/// A dangling append in the same batch is refused by the engine and leaves
+/// no trace in either the draft or the store.
+#[tokio::test]
+async fn appended_nodes_join_a_live_run_and_bad_ones_are_refused() {
+    let executor = RecordingExecutor::new();
+    let (_dir, engine) = engine(Arc::clone(&executor));
+
+    let model = Arc::new(ScriptedPlanningModel::new([
+        r#"[{"op":"create_task","nodeId":"spec","pool":"backend"}]"#,
+        r#"[{"op":"create_task","nodeId":"followup","dependsOn":["spec"],"pool":"backend"},
+            {"op":"request_review","nodeId":"followup"},
+            {"op":"create_task","nodeId":"orphan","dependsOn":["never-planned"]}]"#,
+    ]));
+    let mut orchestrator = Orchestrator::new(
+        "ship, then follow up",
+        PlanPolicy::default(),
+        model,
+        Arc::clone(&engine) as Arc<dyn PlanSink>,
+    );
+
+    orchestrator.cycle().await;
+    let run_id = orchestrator.commit().expect("commit");
+    engine.run_until_idle(12).await.expect("drive first wave");
+    assert_eq!(executor.order(), vec!["spec".to_owned()]);
+    assert_eq!(engine.run_status(&run_id).unwrap(), RunStatus::Completed);
+
+    // The second cycle appends onto the settled run.
+    let report = orchestrator.cycle().await;
+    assert_eq!(report.accepted.len(), 2, "{:?}", report.rejected);
+    assert_eq!(report.rejected.len(), 1);
+    assert_eq!(report.rejected[0].reason.code(), "unknown_node");
+    assert!(
+        orchestrator.plan().node("orphan").is_none(),
+        "the refused append left no draft node"
+    );
+
+    let view: RunView = engine.run_view(&run_id).unwrap();
+    let nodes: Vec<&str> = view.tasks.iter().map(|t| t.node_id.as_str()).collect();
+    assert_eq!(nodes, vec!["spec", "followup", "review-followup"]);
+    assert_eq!(view.status, RunStatus::Running, "the run reopened");
+    assert_eq!(
+        view.tasks
+            .iter()
+            .find(|t| t.node_id == "followup")
+            .unwrap()
+            .state,
+        TaskState::Ready,
+        "its dependency is already Done"
+    );
+
+    engine
+        .run_until_idle(12)
+        .await
+        .expect("drive the follow-up");
+    assert_eq!(
+        executor.order(),
+        vec![
+            "spec".to_owned(),
+            "followup".to_owned(),
+            "review-followup".to_owned()
+        ]
+    );
+    assert_eq!(engine.run_status(&run_id).unwrap(), RunStatus::Completed);
+}

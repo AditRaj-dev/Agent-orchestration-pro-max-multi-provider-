@@ -26,8 +26,12 @@
 //!   [`WorkflowEngine::start_run`](agentos_workflow::WorkflowEngine::start_run)
 //!   (or the store's `create_run`), which validates again before creating
 //!   any durable state.
-//! - Once a plan is committed the task graph is frozen to the orchestrator:
-//!   structural operations are refused with `run_already_started`.
+//! - Once a plan is committed the materialized node specs are frozen:
+//!   `add_dependency` and `assign_pool` are refused with
+//!   `run_already_started`. Appends (`create_task`, `request_review`) stay
+//!   legal and go through the engine's own `add_task`, which validates the
+//!   tentative DAG on insert; a refused append is dropped from the draft
+//!   and reported as `engine_rejected`.
 //! - Every refusal is a machine-readable [`RejectionReason`] carrying the
 //!   fields — and a [`hint`](RejectionReason::hint) — the model needs to
 //!   self-correct on the next cycle.

@@ -44,8 +44,13 @@
 //!   agent-ledger attribution (sha -> task/agent/reviewers/context
 //!   versions/workflow, GIT-03) and emit `git.queued` + `git.committed`.
 //! - **HumanApproval nodes** — resolved against the F-10 approval store,
-//!   never self-approved: a pending decision is a bounded wait (transient
-//!   requeue), a refusal/expiry/mutation is a deterministic failure.
+//!   never self-approved: a pending decision parks the task in
+//!   `HumanRequired` via `Outcome::AwaitingApproval` (no attempt consumed,
+//!   no retry budget burned — the engine will not re-run it until someone
+//!   resolves the approval and transitions it out), while a refusal or
+//!   expiry is a deterministic failure. An approval store that cannot
+//!   answer is still a transient failure: that is infrastructure, not a
+//!   human.
 //! - **Policy at spawn** — the task's `PermissionSet` (role mapping, else
 //!   derived from the leased contract) is compiled into `SpawnConstraints`
 //!   and carried into the `SpawnSpec`; a permission set that cannot cover
@@ -1262,7 +1267,7 @@ impl SupervisorExecutor {
                 ) {
                     tracing::error!(task_id = %task.id, %error, "approval request failed");
                 }
-                Outcome::TransientFailure
+                Outcome::AwaitingApproval
             }
             GateVerdict::Pending { request_id } => {
                 self.core.emit_for(
@@ -1273,7 +1278,7 @@ impl SupervisorExecutor {
                     json!({"node": task.node_id, "gate": gate.as_str(),
                            "requestId": request_id, "blocking": true, "waiting": true}),
                 );
-                Outcome::TransientFailure
+                Outcome::AwaitingApproval
             }
             GateVerdict::Denied { .. } | GateVerdict::Expired { .. } => {
                 let denial = PolicyDenial::ApprovalRequired { gate };

@@ -86,8 +86,9 @@ them. WAL + the F-01 busy canon make per-append opens safe.
                           git.committed
   HumanApproval ────────►  ApprovalStore verdict: approved ⇒ approval.granted +
                           Success; pending/missing ⇒ approval.required +
-                          TransientFailure (bounded wait); denied/expired/
-                          mutated ⇒ approval.denied + ReasoningFailure
+                          AwaitingApproval (parks in HumanRequired, no
+                          attempt consumed); denied/expired/mutated ⇒
+                          approval.denied + ReasoningFailure
                           (never self-approves)
                                     ▼ after each tick
   post_tick: task.ready / task.done / task.failed diff events ─► cost-escalation
@@ -313,7 +314,7 @@ new `TaskState` and no new `Outcome`:
 | Verdict | Outcome | Lifecycle effect |
 |---|---|---|
 | `Approved` | `Success` | `Running → Done`; emits `approval.granted` |
-| `Pending` / `Missing` | `TransientFailure` | `Running → Retryable → Ready`: a **bounded wait** governed by `retry.transient_retries` (default 2 ⇒ 3 attempts), then terminal `Failed`; emits `approval.required` |
+| `Pending` / `Missing` | `AwaitingApproval` | `Running → HumanRequired`: an **open park**, no attempt consumed, lease released; the engine will not re-run it until someone CASes it out (`→ Ready` resume, `→ Approved` sign-off, `→ Failed`/`→ Cancelled` abandon); emits `approval.required` |
 | `Denied` / `Expired` / `Mutated` | `ReasoningFailure` | governed by `retry.reasoning_retries` (default 1 ⇒ 2 attempts), then `Failed`; emits `approval.denied` carrying the typed `RuntimeError::PolicyDenied` text |
 
 The node never self-approves, and a failed gate parks its dependents through
@@ -383,15 +384,15 @@ flows into ledger attribution.
   bound to a fingerprint stays valid for its whole ttl, so a *retried* attempt
   of the same task reuses it. That is intended for retries (same operation),
   but a one-time-use gate would need F-10 to add consumption.
-- **The workflow engine has no "waiting" outcome**, so a pending human
-  approval is expressed as `TransientFailure` — a bounded wait sized by
-  `retry.transient_retries`, not an open-ended park in `HumanRequired`.
-  `TaskState::HumanRequired` exists in `agentos-core` and `can_transition`
-  allows `Running → HumanRequired → Ready/Approved`, but the executor's return
-  type cannot request it and CASing behind the engine's back would race its
-  own outcome recording. Adding an `Outcome::AwaitingApproval` (parking the
-  task in `HumanRequired` without consuming an attempt) is an
-  `agentos-workflow` change — noted, not made.
+- **A pending human approval parks, it does not retry.** F-06 grew
+  `Outcome::AwaitingApproval`, so the supervisor returns it and the engine
+  CASes `Running → HumanRequired` without consuming an attempt or holding the
+  lease. Resuming is an explicit transition by whoever resolves the approval
+  (`→ Ready` rework/resume, `→ Approved` sign-off, `→ Failed`/`→ Cancelled`
+  abandon), and the driver goes idle instead of spinning on a parked task. An
+  approval **store** that cannot answer is still `TransientFailure` — that is
+  infrastructure, not a human. `GitGate` is unchanged: no live approval there
+  is a denial, not a park.
 - **Approvals survive a supervisor crash**: both the SQLite row and the
   task-keyed pointer live under `state_dir`, so the successor supervisor
   inherits them (asserted by the crash-recovery e2e, which approves the gate
@@ -405,7 +406,7 @@ flows into ledger attribution.
 | ~~HumanApproval node plumbing~~ | **CLOSED (this PR)** — resolved against the approval store |
 | ~~Permission compilation into `SpawnSpec`~~ | **CLOSED (this PR)** — `compile_to_spawn_spec`, fail-closed |
 | `Gate::GitCommit` (commit approvals ride `GitPush`) | agentos-policy follow-up |
-| `Outcome::AwaitingApproval` (park in `HumanRequired` without consuming an attempt) | agentos-workflow follow-up |
+| ~~`Outcome::AwaitingApproval`~~ | **CLOSED** — F-06 has it; HumanApproval parks in `HumanRequired` |
 | One-time approval consumption | agentos-policy follow-up (F-10 §3) |
 | Deterministic stub reviewer | later PR (reviewer pool) |
 | Cross-stage ownership holds (until commit, not per attempt) | orchestration PR |

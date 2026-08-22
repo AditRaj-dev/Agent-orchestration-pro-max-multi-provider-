@@ -86,9 +86,10 @@ Only ignored tests: two env-gated free e2e probes (`AGENTOS_CLAUDE_E2E=1`, `AGEN
 
 1. ~~**F-09 branch-name collision**~~ — FIXED: shorts now come from the UUID tail
    (`worktree.rs::short_hex`), F-07's byte-swap shim removed.
-2. **F-07 GitGate hardcodes `approved=true`** — the seam for F-10 approval gates. Wire
-   `agentos-policy` into the supervisor: Push/Commit gating through `git_gate_check` +
-   `approval.rs`; HumanApproval nodes must resolve via the approval store (currently fail loudly).
+2. ~~**F-07 GitGate hardcodes `approved=true`**~~ — CLOSED: policy wired into the supervisor
+   (approvals, permission compile, audit). Follow-ups left open: `Gate::GitCommit` in
+   `agentos-policy` (commit approvals currently ride `GitPush`), one-time approval
+   consumption, and `SecretsBroker` into the spawn env.
 3. **Reviewer is a deterministic stub** in F-07 (approve iff no unresolved + tests pass). Real
    reviewer pool (sonnet-class via adapters) is F-13 territory.
 4. `agentos-policy` keychain backend is an interface (EphemeralBroker only); OS-keychain impl pending.

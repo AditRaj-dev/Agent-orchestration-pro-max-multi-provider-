@@ -30,7 +30,7 @@ use uuid::Uuid;
 
 use crate::error::WorkflowError;
 use crate::scheduler::{Scheduler, DEFAULT_LEASE_TTL};
-use crate::spec::{TaskContract, WorkflowSpec};
+use crate::spec::{NodeSpec, TaskContract, WorkflowSpec};
 use crate::store::{RunStatus, TaskRecord, TaskStore};
 use crate::validate;
 
@@ -50,6 +50,15 @@ pub enum Outcome {
     /// The failure is transient infrastructure (worker crash, IO, provider
     /// outage) — governed by `retry.transient_retries`.
     TransientFailure,
+    /// The task cannot proceed without a human decision (an approval gate
+    /// with no live approval). The task parks in `HumanRequired` and
+    /// **consumes no attempt** — waiting on a person is not a failed try.
+    ///
+    /// Nothing in the engine un-parks it: resuming is an explicit
+    /// `HumanRequired -> Ready` (rework/resume) or `-> Approved` (sign-off)
+    /// CAS by whoever resolves the approval, and `-> Failed`/`-> Cancelled`
+    /// stay available so a parked task is never un-cancellable.
+    AwaitingApproval,
 }
 
 /// Executes one leased task against its contract (the F-02 adapter layer
@@ -116,6 +125,10 @@ pub struct TickReport {
     /// Outcomes dropped because another writer moved the task first (e.g. a
     /// second engine reclaimed the lease mid-run); the durable row wins.
     pub conflicted: usize,
+    /// Tasks parked in `HumanRequired` awaiting a human decision. No
+    /// attempt was consumed and the engine will not pick them up again
+    /// until someone transitions them out.
+    pub awaiting_approval: usize,
 }
 
 impl TickReport {
@@ -129,6 +142,7 @@ impl TickReport {
             || self.escalated_over_budget > 0
             || self.blocked > 0
             || self.conflicted > 0
+            || self.awaiting_approval > 0
     }
 }
 
@@ -200,6 +214,17 @@ impl WorkflowEngine {
             "run started"
         );
         Ok(run_id)
+    }
+
+    /// Add a node to a live run (F-12 re-planning): the store validates the
+    /// tentative DAG and inserts the task in one transaction; the next tick
+    /// picks it up. Rejections carry the same machine-readable
+    /// [`ValidationError`](crate::ValidationError) codes as `start_run`.
+    pub fn add_task(&self, run_id: &Uuid, node: &NodeSpec) -> Result<Uuid, WorkflowError> {
+        let task_id = self.store.add_task(run_id, node)?;
+        tracing::info!(run_id = %run_id, node = %node.id, task_id = %task_id,
+            "node added to live run");
+        Ok(task_id)
     }
 
     /// Live status of a run, computed from its durable tasks (the stored
@@ -356,6 +381,24 @@ impl WorkflowEngine {
                 }
                 Err(err) => return Err(err.into()),
             },
+            Outcome::AwaitingApproval => {
+                match self.store.cas_transition(
+                    &task_id,
+                    TaskState::Running,
+                    TaskState::HumanRequired,
+                ) {
+                    Ok(_) => {
+                        tracing::info!(task_id = %task_id, node = %node_id,
+                            "task parked awaiting a human decision");
+                        report.awaiting_approval += 1;
+                    }
+                    Err(CoreError::IllegalTransition { .. }) => {
+                        tracing::warn!(task_id = %task_id, "outcome dropped; task moved on");
+                        report.conflicted += 1;
+                    }
+                    Err(err) => return Err(err.into()),
+                }
+            }
             Outcome::TransientFailure | Outcome::ReasoningFailure => {
                 let reasoning = outcome == Outcome::ReasoningFailure;
                 let task = self.store.task(&task_id)?;

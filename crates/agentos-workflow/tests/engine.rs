@@ -63,6 +63,14 @@ impl ScriptedExecutor {
         }
     }
 
+    fn then_outcomes(&self, node: &str, outcomes: Vec<Outcome>) {
+        let mut scripted = self.scripted.lock().unwrap();
+        let queue = scripted.entry(node.to_owned()).or_default();
+        for outcome in outcomes {
+            queue.push_back(outcome);
+        }
+    }
+
     fn then_transient_failures(&self, node: &str, count: usize) {
         let mut scripted = self.scripted.lock().unwrap();
         let queue = scripted.entry(node.to_owned()).or_default();
@@ -520,4 +528,193 @@ async fn start_run_rejects_invalid_specs_without_side_effects() {
         "no run row may be created for an invalid spec"
     );
     assert!(engine.store().tasks().unwrap().is_empty());
+}
+
+// ------------------------------------------- live re-planning (add_task)
+
+/// F-12 re-planning: a node added to a live run is picked up by the next
+/// tick, and its dependency edge is honoured — it stays `Planned` until the
+/// dependency is `Done`.
+#[tokio::test]
+async fn add_task_extends_a_live_run_and_respects_the_new_edge() {
+    let (_dir, store) = temp_store();
+    let engine = WorkflowEngine::new(store, Arc::new(ScriptedExecutor::new()));
+    let run_id = engine
+        .start_run(
+            &spec("feature-build", vec![node("spec", NodeType::Run, &[])]),
+            "goal",
+        )
+        .expect("start run");
+
+    // Added before `spec` finishes: depends on it, so it must not be Ready.
+    let task_id = engine
+        .add_task(&run_id, &node("review", NodeType::Review, &["spec"]))
+        .expect("add task");
+    assert_eq!(
+        engine.store().task(&task_id).unwrap().state,
+        TaskState::Planned
+    );
+
+    let driver = engine.run_until_idle(8).await.expect("drive");
+    let states = states_by_node(&engine, run_id);
+    assert_eq!(states["spec"], TaskState::Done);
+    assert_eq!(states["review"], TaskState::Done, "added node ran too");
+    assert_eq!(driver.succeeded.len(), 2);
+    assert_eq!(engine.run_status(&run_id).unwrap(), RunStatus::Completed);
+}
+
+/// A node whose dependencies are already `Done` is immediately `Ready`; one
+/// added with no dependencies is too.
+#[tokio::test]
+async fn add_task_lands_ready_when_its_dependencies_are_already_done() {
+    let (_dir, store) = temp_store();
+    let engine = WorkflowEngine::new(store, Arc::new(ScriptedExecutor::new()));
+    let run_id = engine
+        .start_run(
+            &spec("feature-build", vec![node("spec", NodeType::Run, &[])]),
+            "goal",
+        )
+        .expect("start run");
+    engine.run_until_idle(4).await.expect("drive");
+
+    let dependent = engine
+        .add_task(&run_id, &node("review", NodeType::Review, &["spec"]))
+        .expect("add dependent");
+    let free = engine
+        .add_task(&run_id, &node("docs", NodeType::Run, &[]))
+        .expect("add free");
+    assert_eq!(
+        engine.store().task(&dependent).unwrap().state,
+        TaskState::Ready
+    );
+    assert_eq!(engine.store().task(&free).unwrap().state, TaskState::Ready);
+}
+
+/// A node added behind an already-failed dependency parks as `Blocked` —
+/// nothing would ever promote it, so it must not sit `Planned` forever.
+#[tokio::test]
+async fn add_task_blocks_behind_a_failed_dependency() {
+    let (_dir, store) = temp_store();
+    let executor = Arc::new(ScriptedExecutor::new());
+    executor.then_outcomes("spec", vec![Outcome::ReasoningFailure; 4]);
+    let engine = WorkflowEngine::new(store, Arc::clone(&executor) as Arc<dyn TaskExecutor>);
+    let run_id = engine
+        .start_run(
+            &spec("feature-build", vec![node("spec", NodeType::Run, &[])]),
+            "goal",
+        )
+        .expect("start run");
+    engine.run_until_idle(12).await.expect("drive");
+    assert_eq!(states_by_node(&engine, run_id)["spec"], TaskState::Failed);
+
+    let task_id = engine
+        .add_task(&run_id, &node("review", NodeType::Review, &["spec"]))
+        .expect("add task");
+    assert_eq!(
+        engine.store().task(&task_id).unwrap().state,
+        TaskState::Blocked
+    );
+}
+
+/// The engine stays authoritative over re-planning: cycles, duplicate ids,
+/// dangling dependencies and terminal runs are all rejected, and nothing is
+/// written when they are.
+#[tokio::test]
+async fn add_task_rejects_illegal_plans_and_terminal_runs() {
+    let (_dir, store) = temp_store();
+    let engine = WorkflowEngine::new(store, Arc::new(ScriptedExecutor::new()));
+    let run_id = engine
+        .start_run(
+            &spec(
+                "feature-build",
+                vec![
+                    node("spec", NodeType::Run, &[]),
+                    node("review", NodeType::Review, &["spec"]),
+                ],
+            ),
+            "goal",
+        )
+        .expect("start run");
+
+    // A cycle: `spec` already depends on nothing, but `review` depends on
+    // `spec`, so a node `spec` depends on via `review` would close a loop.
+    let cyclic = NodeSpec {
+        depends_on: vec!["review".to_owned()],
+        ..node("spec", NodeType::Run, &[])
+    };
+    assert!(matches!(
+        engine.add_task(&run_id, &cyclic),
+        // duplicate id is caught before the cycle rule
+        Err(WorkflowError::Validation(_))
+    ));
+    assert!(matches!(
+        engine.add_task(&run_id, &node("ship", NodeType::Run, &["nope"])),
+        Err(WorkflowError::Validation(_))
+    ));
+    assert_eq!(
+        engine.store().tasks_for_run(&run_id).unwrap().len(),
+        2,
+        "rejected adds write nothing"
+    );
+
+    // An unknown run is NotFound, not a silent insert.
+    assert!(matches!(
+        engine.add_task(&Uuid::now_v7(), &node("late", NodeType::Run, &[])),
+        Err(WorkflowError::Storage(agentos_core::CoreError::NotFound(_)))
+    ));
+
+    // Re-planning onto a run whose work has all landed is legal: the
+    // `completed` projection is derived, not a freeze.
+    engine.run_until_idle(8).await.expect("drive");
+    assert_eq!(engine.run_status(&run_id).unwrap(), RunStatus::Completed);
+    engine
+        .add_task(&run_id, &node("followup", NodeType::Run, &[]))
+        .expect("re-plan onto a settled run");
+    assert_eq!(engine.run_status(&run_id).unwrap(), RunStatus::Running);
+    engine.run_until_idle(8).await.expect("drive follow-up");
+    assert_eq!(states_by_node(&engine, run_id)["followup"], TaskState::Done);
+}
+
+// ------------------------------------------ human approval parking
+
+/// `Outcome::AwaitingApproval` parks the task in `HumanRequired` without
+/// consuming an attempt, the driver goes idle instead of spinning, and the
+/// run stays `Running`. Resuming is an explicit CAS by whoever resolves the
+/// approval; the task then executes normally.
+#[tokio::test]
+async fn awaiting_approval_parks_without_consuming_an_attempt_and_resumes() {
+    let (_dir, store) = temp_store();
+    let executor = Arc::new(ScriptedExecutor::new());
+    executor.then_outcomes("gate", vec![Outcome::AwaitingApproval]);
+    let engine = WorkflowEngine::new(store, Arc::clone(&executor) as Arc<dyn TaskExecutor>);
+    let run_id = engine
+        .start_run(
+            &spec("feature-build", vec![node("gate", NodeType::GitGate, &[])]),
+            "goal",
+        )
+        .expect("start run");
+
+    let driver = engine.run_until_idle(8).await.expect("drive");
+    let parked = engine.store().tasks_for_run(&run_id).unwrap().remove(0);
+    assert_eq!(parked.state, TaskState::HumanRequired);
+    assert_eq!(
+        parked.attempt_count, 0,
+        "waiting on a human is not an attempt"
+    );
+    assert!(parked.lease_owner.is_none(), "lease released while parked");
+    assert!(driver.failed.is_empty());
+    assert!(driver.succeeded.is_empty());
+    assert!(driver.ticks <= 3, "parked work must not spin the driver");
+    assert_eq!(engine.run_status(&run_id).unwrap(), RunStatus::Running);
+
+    // The human resumes it: HumanRequired -> Ready, then it runs.
+    engine
+        .store()
+        .cas_transition(&parked.id, TaskState::HumanRequired, TaskState::Ready)
+        .expect("resume");
+    engine.run_until_idle(8).await.expect("drive again");
+    assert_eq!(
+        engine.store().task(&parked.id).unwrap().state,
+        TaskState::Done
+    );
 }

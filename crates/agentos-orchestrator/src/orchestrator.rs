@@ -219,9 +219,44 @@ impl Orchestrator {
             .map(|(index, operation)| (*index, operation))
             .collect();
         let apply_rejections = self.plan.apply_all(indexed);
-        let refused: std::collections::BTreeSet<usize> =
+        let mut refused: std::collections::BTreeSet<usize> =
             apply_rejections.iter().map(|r| r.index).collect();
         rejections.extend(apply_rejections);
+
+        // 7. Append accepted nodes to a live run. Nodes drafted before the
+        //    commit were materialized by it; anything the draft still holds
+        //    without a durable task is pushed here, in operation order, and
+        //    the engine gets the last word — a refusal drops the node from
+        //    the draft and demotes the operation to a rejection.
+        if let Some(run_id) = self.plan.run_id() {
+            let mut pending = self.plan.pending_materialization().into_iter();
+            for (index, operation) in &within_budget {
+                if refused.contains(index) || !operation.is_additive() {
+                    continue;
+                }
+                let Some(node) = pending.next() else { break };
+                match self.sink.add_node(&run_id, &node.spec, node.priority) {
+                    Ok(task_id) => {
+                        tracing::info!(node = %node.spec.id, %task_id,
+                            "appended node materialized on the live run");
+                        self.plan.mark_materialized(&node.spec.id);
+                    }
+                    Err(error) => {
+                        tracing::warn!(node = %node.spec.id, %error,
+                            "engine refused an appended node; dropping it from the draft");
+                        self.plan.drop_node(&node.spec.id);
+                        refused.insert(*index);
+                        rejections.push(Rejection::new(
+                            *index,
+                            serde_json::to_value(operation).unwrap_or(serde_json::Value::Null),
+                            RejectionReason::EngineRejected {
+                                detail: error.to_string(),
+                            },
+                        ));
+                    }
+                }
+            }
+        }
 
         report.accepted = within_budget
             .into_iter()
@@ -229,7 +264,7 @@ impl Orchestrator {
             .map(|(_, operation)| operation)
             .collect();
 
-        // 7. Engine-side effect of accepted escalations on a live run.
+        // 8. Engine-side effect of accepted escalations on a live run.
         if let Some(run_id) = self.plan.run_id() {
             for operation in &report.accepted {
                 if let PlanOperation::Escalate(payload) = operation {
@@ -392,7 +427,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn commit_is_an_explicit_user_gate_and_freezes_the_graph() {
+    async fn commit_is_an_explicit_user_gate_and_freezes_materialized_specs() {
         let mut orchestrator =
             orchestrator(vec![PLAN_JSON, r#"[{"op":"create_task","nodeId":"late"}]"#]);
         orchestrator.cycle().await;
@@ -410,10 +445,45 @@ mod tests {
             OrchestratorError::Rejected(RejectionReason::RunAlreadyStarted { .. })
         ));
 
-        // Structural proposals after the commit are refused by the plan.
+        // Appending to the live run is legal and materializes durably...
+        let report = orchestrator.cycle().await;
+        assert_eq!(report.accepted.len(), 1);
+        assert!(report.rejected.is_empty(), "{:?}", report.rejected);
+        let tasks = orchestrator
+            .sink
+            .run_view(&run_id)
+            .expect("run view")
+            .tasks
+            .into_iter()
+            .map(|task| task.node_id)
+            .collect::<Vec<_>>();
+        assert!(tasks.contains(&"late".to_owned()), "{tasks:?}");
+    }
+
+    /// ...but rewriting a node the engine already materialized is refused,
+    /// and an append the engine rejects is dropped from the draft rather
+    /// than left claiming durable work.
+    #[tokio::test]
+    async fn live_runs_refuse_spec_rewrites_and_engine_refused_appends() {
+        let mut orchestrator = orchestrator(vec![
+            PLAN_JSON,
+            r#"[{"op":"assign_pool","nodeId":"a","pool":"backend"}]"#,
+            r#"[{"op":"create_task","nodeId":"dangling","dependsOn":["ghost"]}]"#,
+        ]);
+        orchestrator.cycle().await;
+        orchestrator.commit().unwrap();
+
         let report = orchestrator.cycle().await;
         assert!(report.accepted.is_empty());
         assert_eq!(report.rejected[0].reason.code(), "run_already_started");
+
+        let report = orchestrator.cycle().await;
+        assert!(report.accepted.is_empty());
+        assert_eq!(report.rejected[0].reason.code(), "unknown_node");
+        assert!(
+            orchestrator.plan().node("dangling").is_none(),
+            "a node with no durable task must not linger in the draft"
+        );
     }
 
     #[tokio::test]

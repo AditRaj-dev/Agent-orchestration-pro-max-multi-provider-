@@ -21,15 +21,19 @@
 //! back to the model inside
 //! [`RejectionReason::SpecInvalid`](crate::RejectionReason::SpecInvalid).
 //!
-//! ## Committed plans are frozen
+//! ## Committed plans are append-only
 //!
-//! Once a plan is materialized into a run, structural operations are
-//! rejected with `run_already_started`. The engine is authoritative over a
-//! live task graph; re-planning means proposing a new run. Only `escalate`
-//! (which retunes priority through the engine's own
-//! [`TaskStore::set_priority`](agentos_workflow::TaskStore::set_priority))
-//! and `close_goal` (which the engine can veto with `run_not_terminal`)
-//! remain legal.
+//! Once a plan is materialized into a run, the *existing* node specs are
+//! frozen: `add_dependency` and `assign_pool` rewrite a materialized node
+//! and are rejected with `run_already_started`. Appending is different —
+//! `create_task` and `request_review` go through the engine's own
+//! `add_task`, which validates the tentative DAG (cycles, dangling
+//! dependencies, duplicate ids) inside the insert transaction and can
+//! refuse. A refused append is dropped from the draft and reported as
+//! `engine_rejected`, so the draft never claims work that has no durable
+//! task. `escalate` retunes priority through
+//! [`TaskStore::set_priority`](agentos_workflow::TaskStore::set_priority)
+//! and `close_goal` stays vetoable with `run_not_terminal`.
 
 use std::collections::BTreeSet;
 
@@ -107,6 +111,11 @@ pub struct PlannedNode {
     /// The orchestrator's stated objective for the node (UI + audit).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub objective: Option<String>,
+    /// Whether a durable task exists for this node yet. Nodes drafted
+    /// before the commit are materialized by it; nodes appended to a live
+    /// run are materialized one at a time through the sink.
+    #[serde(default)]
+    pub materialized: bool,
 }
 
 /// The orchestrator's plan for one goal.
@@ -192,6 +201,36 @@ impl Plan {
     pub fn mark_committed(&mut self, run_id: Uuid) {
         self.run_id = Some(run_id);
         self.run_status = Some(RunStatus::Running);
+        for node in &mut self.nodes {
+            node.materialized = true;
+        }
+    }
+
+    /// Draft nodes with no durable task yet, in insertion order — what the
+    /// orchestrator still has to push into a live run.
+    pub fn pending_materialization(&self) -> Vec<PlannedNode> {
+        self.nodes
+            .iter()
+            .filter(|node| !node.materialized)
+            .cloned()
+            .collect()
+    }
+
+    /// Record that the engine created a durable task for `node_id`.
+    pub fn mark_materialized(&mut self, node_id: &str) {
+        if let Some(node) = self.nodes.iter_mut().find(|node| node.spec.id == node_id) {
+            node.materialized = true;
+        }
+    }
+
+    /// Drop a node the engine refused, so the draft never claims work that
+    /// does not exist durably. Any draft edge into it is dropped with it —
+    /// the engine would reject those adds as dangling anyway.
+    pub fn drop_node(&mut self, node_id: &str) {
+        self.nodes.retain(|node| node.spec.id != node_id);
+        for node in &mut self.nodes {
+            node.spec.depends_on.retain(|dep| dep != node_id);
+        }
     }
 
     /// Refresh the cached engine run status.
@@ -241,7 +280,10 @@ impl Plan {
                 op: operation.op().to_owned(),
             });
         }
-        if operation.is_structural() {
+        // A committed run absorbs appended nodes (the engine validates the
+        // tentative DAG on insert), but never a rewrite of a node spec it
+        // already materialized.
+        if operation.is_structural() && !operation.is_additive() {
             if let Some(run_id) = self.run_id {
                 return Err(RejectionReason::RunAlreadyStarted {
                     op: operation.op().to_owned(),
@@ -339,6 +381,7 @@ impl Plan {
             },
             priority: payload.priority,
             objective: payload.objective.clone(),
+            materialized: false,
         };
         self.commit_nodes({
             let mut candidate = self.nodes.clone();
@@ -430,6 +473,7 @@ impl Plan {
             },
             priority: None,
             objective: Some(format!("independent review of `{}`", payload.node_id)),
+            materialized: false,
         });
         self.commit_nodes(candidate)
     }
@@ -825,13 +869,12 @@ mod tests {
     }
 
     #[test]
-    fn structural_operations_are_refused_once_the_engine_owns_the_run() {
+    fn spec_rewrites_are_refused_once_the_engine_owns_the_run_but_appends_are_not() {
         let mut plan = plan();
         plan.apply(&create("api", &[])).unwrap();
         plan.mark_committed(Uuid::now_v7());
 
         for operation in [
-            create("more", &[]),
             PlanOperation::AddDependency(AddDependency {
                 node_id: "api".to_owned(),
                 depends_on: "api2".to_owned(),
@@ -840,19 +883,30 @@ mod tests {
                 node_id: "api".to_owned(),
                 pool: "backend".to_owned(),
             }),
-            PlanOperation::RequestReview(RequestReview {
-                node_id: "api".to_owned(),
-                reviewer_pool: None,
-                review_node_id: None,
-            }),
         ] {
             assert_eq!(
                 plan.apply(&operation).unwrap_err().code(),
                 "run_already_started",
-                "{} should be refused on a live run",
+                "{} rewrites a materialized node spec and must be refused",
                 operation.op()
             );
         }
+
+        // Appends are legal on a live run and land unmaterialized, waiting
+        // for the orchestrator to push them through the engine.
+        plan.apply(&PlanOperation::RequestReview(RequestReview {
+            node_id: "api".to_owned(),
+            reviewer_pool: None,
+            review_node_id: None,
+        }))
+        .expect("appending a review node to a live run is legal");
+        let pending = plan.pending_materialization();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].spec.id, "review-api");
+        assert!(
+            plan.node("api").expect("api").materialized,
+            "the committed node keeps its durable task"
+        );
         // Escalation stays legal on a live run — that is its purpose.
         plan.apply(&PlanOperation::Escalate(Escalate {
             node_id: Some("api".to_owned()),
