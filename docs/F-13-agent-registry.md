@@ -23,6 +23,15 @@ to create or change a worker without recompiling. F-13 makes the system
   of the session objective — provider-agnostic by construction (the F-03
   adapter delivers the objective on stdin; F-05 as the equals-form
   `--print=<objective>`; both carry the preamble with zero adapter changes).
+  Two compact application-level invariants are compiled in: `/caveman`
+  governs terse, exact communication; `ponytail` governs minimal correct
+  implementation through YAGNI, reuse, standard-library and native-first
+  discipline. `preamble_for` injects them in that order for every existing
+  and future agent regardless of editable assignments. Static and error
+  fallback workers receive the same preamble, so no spawn path silently loses
+  either rule. Ponytail is a pinned MIT-attributed adaptation of
+  <https://github.com/DietrichGebert/ponytail>; startup performs no network
+  update.
 - The **Agent Creator** (built-in agent, agy → `claude-sonnet-4-6`) interviews
   the user and drafts agent definitions; a **human clicks Register** — the
   mastermind gate, applied to the registry itself.
@@ -41,7 +50,7 @@ to create or change a worker without recompiling. F-13 makes the system
 |---|---|
 | `agentos-agents/src/record.rs` | `AgentRecord` (+ `AgentMode`, `AgentEffort`, `KNOWN_ADAPTERS`). Wire-friendly serde defaults: timestamps default, `mode` defaults to **plan** (read-only — a wire payload that names no mode cannot accidentally gain write access), `builtin` forced false at the API edge. |
 | `agentos-agents/src/skill.rs` | `SkillRecord` (id, name, description, body ≤ 12k chars, builtin). |
-| `agentos-agents/src/seeds.rs` | Built-in skills `mastermind-commands` / `agent-creation` / `tech-research` and agents `orchestrator` / `agent-creator` / `researcher`. |
+| `agentos-agents/src/seeds.rs` | Built-in global Caveman and Ponytail disciplines plus the role skills (`mastermind-commands`, `agent-creation`, `tech-research`, and specialist methods) and the seeded agent roster. |
 | `agentos-agents/src/registry.rs` | `AgentRegistry` over SQLite (private F-01 canon copy). CRUD, builtin guards (editable, never deletable), skill-reference guard (a skill assigned to an agent cannot be deleted), idempotent `seed_builtins()` (insert-if-absent — edited built-ins survive reseeds), `resolve()` (enabled only), `enabled_roster()`, `preamble_for()`. |
 | `agentos-daemon/src/agent_sessions.rs` | `AgentSessions` + `AdapterSet`: chat sessions over the wired adapters (claude-code / antigravity-agy / mock), the fenced-JSON proposal parser, and the free provider catalog. |
 | `agentos-daemon/src/server.rs` | The `registry.*` + `agent.session.*` method arms (§3) and the `agent.created/updated/deleted` audit journaling. |
@@ -64,7 +73,7 @@ not-found, builtin-protected) map to `invalid_params`; storage failures to
 | `registry.agents.delete` | `{id}` | `{deleted: true}` — built-ins refused |
 | `registry.agents.set-enabled` | `{id, enabled: bool}` | `{agent}` |
 | `registry.skills.list` | — | `{skills: SkillRecord[]}` |
-| `registry.catalog` | — | `{providers: [{id, version, path, auth, models[]}]}` — **free probes only** (agy = `agy models`, 60s cache; claude = observed slugs; mock static) |
+| `registry.catalog` | — | `{providers: [{id, version, path, auth, models[]}]}` — **free probes only** (agy = `agy models`, 60s cache; Codex = maintained Sol/Terra/Luna/5.5/5.4 catalog; claude = observed slugs; mock static) |
 | `agent.session.start` | `{agentId, message}` | `{sessionId}` (`chat-…`); session runs async, events journal (§4) |
 | `agent.session.send` | `{sessionId, message}` | `{sent: true}` — live sessions only (adapter resume path: claude `--resume`, agy `--conversation`) |
 | `agent.session.cancel` | `{sessionId}` | `{cancelled: true}` — process-kill semantics |
@@ -118,7 +127,8 @@ human — the mastermind gate applied to the registry itself.
   (dedup) with policy-compiled constraints — **deny-only, additive**: a
   record can never widen what policy compiled.
 - `session.spawn` payloads now carry `model` and `objectivePreview`
-  (first 2 000 chars — preambles included), making routing auditable.
+  (2 000-char capped head/tail preview — global/role skills plus the task
+  objective), making routing auditable without journaling the full prompt.
 - Disabled agents do not route (`resolve` is enabled-only) — the static
   default serves the spawn.
 
@@ -144,7 +154,21 @@ human — the mastermind gate applied to the registry itself.
 | `orchestrator` | claude-code | `claude-opus-5` | plan | `mastermind-commands` | F-12's model as a registry citizen. |
 | `agent-creator` | antigravity-agy | `claude-sonnet-4-6` | plan | `agent-creation` | Interviews; drafts; never registers. |
 | `researcher` | antigravity-agy | `gemini-3.1-pro-high` | plan | `tech-research` | Exact catalog slug from the free `agy models` probe. |
-| `ui-designer` | antigravity-agy | `claude-sonnet-4-6` | **accept_edits** | `product-design` | The mastermind design phase (Phases 6–7) as an agent, distilled from the user's `~/.claude/agents/ui-designer.md`: writes `docs/DESIGN.md`, `wireframe/tokens.css` and hi-fi `wireframe/*.html` + `INDEX.md` into the chat workspace. The only built-in with write access (design ships artifacts); 1800s timeout; PRD fit: §6's "Domain Supervisors (Frontend, Backend, QA, Research, etc.)" Level-2 roster and the §"design system" context node (line 914). Sonnet via agy keeps design load off the rate-pressured claude account; the agy real-dir write path is verified (`--add-dir`). |
+| `ui-designer` | antigravity-agy | `gemini-3.1-pro-high` | **accept_edits** | `product-design` | The mastermind design phase (Phases 6–7) as an agent, distilled from the user's `~/.claude/agents/ui-designer.md`: writes `docs/DESIGN.md`, `wireframe/tokens.css` and hi-fi `wireframe/*.html` + `INDEX.md` into the chat workspace. Gemini 3.1 Pro High is the selected design model; the agy real-dir write path is verified (`--add-dir`). |
+
+| `dependency-manager` | antigravity-agy | `claude-sonnet-4-6` | **accept_edits** | `dependency-management` | Added 2026-08-23. Owns every version number in a project. Exists because a model's training cutoff makes it confidently wrong about versions — it writes `next@15` when 16 has been stable for months. Its skill's iron law is that **no version comes from memory**: each one is read from the live registry (`npm view`, `pip index versions`, `cargo search`, `go list -m -versions`) in the same session it is used, with the command output pasted into the report. Selection rule: newest STABLE major the whole peer set supports, a ~14-day soak window on brand-new `x.0.0`s, deprecated packages disqualified. Deliverables include the lockfile and `docs/DEPENDENCIES.md`. Sonnet because peer-set resolution is reasoning, not lookup. |
+| `code-reviewer` | codex | `gpt-5.6-terra` | plan | `code-review` | The mastermind read-only review tier. Approval requires freshly run checks; it names fixes and workers apply them. |
+| `test-engineer` | claude-code | `claude-sonnet-5` | **accept_edits** | `test-engineer` | Seam-level behavior tests, deterministic fixtures, and regression tests that fail against the unfixed code. |
+| `database-engineer` | claude-code | `claude-sonnet-5` | **accept_edits** | `database-engineer` | Schema, migrations, constraints, and `EXPLAIN`-driven query paths. |
+
+| `devops-deployer` | claude-code | `claude-sonnet-5` | **accept_edits** | `devops-deploy` | Pipelines, containers, rollback-first delivery, pinned supply chains, and health gates. |
+| `security-reviewer` | claude-code | `claude-sonnet-5` | plan | `security-review` | The read-only threat pass over a diff, ranked by exploitability and impact. |
+| `debugger` | codex | `gpt-5.6-terra` | **accept_edits** | `systematic-debugging` | First root-cause attempt. A reasoning failure is atomically retargeted to `debugger-sol-escalation`. |
+| `debugger-sol-escalation` | codex | `gpt-5.6-sol` | **accept_edits** | `systematic-debugging` | Escalation-only retry after Terra stalls. It receives the reproduction and falsified hypotheses, cannot recursively escalate, and hands verified work to review and the Git Manager. |
+| `react-native-dev` | claude-code | `claude-sonnet-5` | **accept_edits** | `react-native-dev` | React Native / Expo mobile domain worker. |
+| `rust-specialist` | claude-code | `claude-sonnet-5` | **accept_edits** | `rust-specialist` | Typed Rust services, CLIs, async, and systems work. |
+| `docs-writer` | claude-code | `claude-sonnet-5` | **accept_edits** | `docs-writer` | Documentation written and verified against the code as it actually is. |
+| `nextjs-dev`, `react-dev`, `flutter-dev`, `nodejs-dev`, `typescript-specialist`, `python-specialist` | claude-code | `claude-sonnet-5` | **accept_edits** | matching stack skill | The original stack worker pool, unchanged modes and scopes. |
 
 Built-ins: editable, never deletable; `seed_builtins()` never overwrites an
 edited row — an existing `agents.db` picks the designer up on the next daemon

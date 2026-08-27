@@ -52,7 +52,8 @@ pub enum RunStatus {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AgentStatus {
-    /// Seen in the journal but never spawned/parked (also the default).
+    /// Seen in the journal but never spawned/parked, or its session was
+    /// cancelled (also the default).
     Idle,
     /// `session.spawn` observed, session not yet started.
     Planning,
@@ -64,9 +65,11 @@ pub enum AgentStatus {
     Reviewing,
     /// Reserved vocabulary; no event in the v1 table emits it.
     Blocked,
-    /// `agent.spawn_failed`.
+    /// `agent.spawn_failed` / `agent.session_failed`.
     Failed,
-    /// Run/task terminal — the agent has no pending work.
+    /// Run/task terminal, or `session.finished` — no pending work. A chat
+    /// session stays instructable here; the next turn flips it back to
+    /// `Running`.
     Complete,
 }
 
@@ -324,6 +327,22 @@ impl FoldState {
                     }
                 }
             }
+            // An operator returned a failed run's work to the queue
+            // (`mastermind.reopenRun`). The run is live again, so the
+            // terminal marks come off — otherwise the run list would keep
+            // showing `failed` with an `endedAt` for a run that is once
+            // more executing. The per-task correction rides the
+            // `task.ready` events the supervisor emits alongside this one;
+            // `taskCounts` then re-derives in `finish`.
+            "run.reopened" => {
+                if let Some(ix) = run_key
+                    .as_deref()
+                    .and_then(|id| self.run_ix.get(id).copied())
+                {
+                    self.runs[ix].status = RunStatus::Running;
+                    self.runs[ix].ended_at = None;
+                }
+            }
             _ => {}
         }
 
@@ -387,8 +406,15 @@ impl FoldState {
                         agent.model = Some(model.to_owned());
                     }
                 }
+                "session.instruction" => agent.status = AgentStatus::Running,
                 "agent.tool_use" => agent.status = AgentStatus::Running,
                 "agent.rate_limit" => agent.status = AgentStatus::Waiting,
+                // Terminal arms. Without these an agent that ever reached
+                // `Running` stayed Running for the life of the journal, so
+                // finished and cancelled sessions still read as live.
+                "session.finished" => agent.status = AgentStatus::Complete,
+                "session.cancelled" => agent.status = AgentStatus::Idle,
+                "agent.session_failed" => agent.status = AgentStatus::Failed,
                 "agent.spawn_failed" => agent.status = AgentStatus::Failed,
                 "agent.leased" | "task.running" => agent.status = AgentStatus::Running,
                 "review.requested" => agent.status = AgentStatus::Reviewing,

@@ -7,6 +7,7 @@
 //! completion/cancellation is [`OwnershipMap::release`]; crash-timeout
 //! release is the daemon's lease-expiry job once the map is journaled.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
 use crate::store::{lock_guard, now_ts};
@@ -73,6 +74,23 @@ pub enum OwnershipError {
         /// Strength of the held glob.
         held: HoldKind,
     },
+    /// The glob is free right now, but another task has been waiting for it
+    /// longer. Yielding to the older waiter is what stops a task from
+    /// losing the race indefinitely; the oldest waiter never yields, so the
+    /// queue always drains.
+    #[error(
+        "ownership queued: task `{task_id}` yields `{glob}` to task `{ahead_of}`,          which has been waiting longer"
+    )]
+    Queued {
+        /// Task that requested the hold.
+        task_id: String,
+        /// Glob the task wanted.
+        glob: String,
+        /// The task ahead of it in the queue.
+        ahead_of: String,
+        /// How many tasks are queued ahead of this one.
+        queued_ahead: usize,
+    },
     /// A path glob failed validation (empty or whitespace).
     #[error("invalid path glob: `{0}` (must be a non-empty repo-relative pattern)")]
     InvalidGlob(String),
@@ -81,13 +99,41 @@ pub enum OwnershipError {
     InvalidTask(String),
 }
 
+/// One task queued behind an overlapping hold.
+///
+/// Recorded the first time a task loses the race for a glob and kept until
+/// that task acquires or releases, so "who has been waiting longest" is a
+/// fact rather than a guess.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Waiter {
+    /// Task waiting for the glob.
+    pub task_id: String,
+    /// Normalized glob it is waiting for.
+    pub glob: String,
+    /// Monotonic ticket; lower is older. Ties are impossible, which is why
+    /// this is a counter rather than a timestamp.
+    pub ticket: u64,
+    /// First time this task queued for this glob (RFC 3339 UTC).
+    pub since: String,
+}
+
 /// In-memory ownership map with exclusive/advisory locking over path globs.
 ///
 /// Sharing across threads is by `&self` (internal mutex), so the daemon can
 /// hold one map for the whole process.
+///
+/// Acquisition is **FIFO-fair**: a task that loses the race is recorded as a
+/// waiter, and a task whose glob is free still yields while an older waiter
+/// is queued for it. Without this, a serialized graph (every task holding
+/// `**` under a shared workspace) lets the same task lose every round
+/// indefinitely — observed as one task deferring 364 times while its peers
+/// took turns. The oldest waiter is by construction never behind anyone, so
+/// it always proceeds and the queue drains.
 #[derive(Debug, Default)]
 pub struct OwnershipMap {
     holds: Mutex<Vec<Hold>>,
+    waiters: Mutex<Vec<Waiter>>,
+    next_ticket: AtomicU64,
 }
 
 impl OwnershipMap {
@@ -132,6 +178,7 @@ impl OwnershipMap {
             wants.push(normalized);
         }
 
+        // Lock order is always holds -> waiters.
         let mut holds = lock_guard(&self.holds);
         for want in &wants {
             for held in holds.iter() {
@@ -140,17 +187,32 @@ impl OwnershipMap {
                 }
                 let incompatible = held.kind == HoldKind::Exclusive || exclusive;
                 if incompatible && glob_overlap(&held.glob, want) {
-                    return Err(OwnershipError::Conflict {
+                    let conflict = OwnershipError::Conflict {
                         task_id: task_id.to_string(),
                         glob: want.clone(),
                         desired,
                         held_by: held.task_id.clone(),
                         held_glob: held.glob.clone(),
                         held: held.kind,
-                    });
+                    };
+                    self.enqueue(task_id, &wants);
+                    return Err(conflict);
                 }
             }
         }
+
+        // Nothing holds these globs, but someone may have been waiting for
+        // them longer. Yield to them rather than jumping the queue.
+        if let Some((ahead_of, queued_ahead, glob)) = self.older_waiter(task_id, &wants) {
+            self.enqueue(task_id, &wants);
+            return Err(OwnershipError::Queued {
+                task_id: task_id.to_string(),
+                glob,
+                ahead_of,
+                queued_ahead,
+            });
+        }
+
         for want in wants {
             holds.retain(|held| !(held.task_id == task_id && held.glob == want));
             holds.push(Hold {
@@ -160,16 +222,89 @@ impl OwnershipMap {
                 acquired_at: now_ts(),
             });
         }
+        // The task is running now, so it is no longer waiting for anything.
+        self.dequeue(task_id);
         Ok(())
+    }
+
+    /// Record `task_id` as waiting for each of `globs`, preserving the
+    /// ticket of any glob it is already queued for — re-queuing must not
+    /// send a task to the back of the line, or it could never reach the
+    /// front.
+    fn enqueue(&self, task_id: &str, globs: &[String]) {
+        let mut waiters = lock_guard(&self.waiters);
+        for glob in globs {
+            let already = waiters
+                .iter()
+                .any(|waiter| waiter.task_id == task_id && waiter.glob == *glob);
+            if already {
+                continue;
+            }
+            waiters.push(Waiter {
+                task_id: task_id.to_string(),
+                glob: glob.clone(),
+                ticket: self.next_ticket.fetch_add(1, Ordering::Relaxed),
+                since: now_ts(),
+            });
+        }
+    }
+
+    /// Drop every queue entry for `task_id`.
+    fn dequeue(&self, task_id: &str) {
+        lock_guard(&self.waiters).retain(|waiter| waiter.task_id != task_id);
+    }
+
+    /// The oldest *other* task queued for a glob overlapping `wants`, when
+    /// it is older than this task's own oldest ticket. Returns the task, how
+    /// many distinct tasks are ahead, and the glob at issue.
+    fn older_waiter(&self, task_id: &str, wants: &[String]) -> Option<(String, usize, String)> {
+        let waiters = lock_guard(&self.waiters);
+        // A task not yet queued is the newest arrival: everyone waiting for
+        // an overlapping glob is ahead of it.
+        let mine = waiters
+            .iter()
+            .filter(|waiter| waiter.task_id == task_id)
+            .map(|waiter| waiter.ticket)
+            .min()
+            .unwrap_or(u64::MAX);
+        let mut ahead: Vec<&Waiter> = waiters
+            .iter()
+            .filter(|waiter| waiter.task_id != task_id && waiter.ticket < mine)
+            .filter(|waiter| wants.iter().any(|want| glob_overlap(&waiter.glob, want)))
+            .collect();
+        ahead.sort_by_key(|waiter| waiter.ticket);
+        let first = ahead.first()?;
+        let mut distinct: Vec<&str> = ahead.iter().map(|waiter| waiter.task_id.as_str()).collect();
+        distinct.sort_unstable();
+        distinct.dedup();
+        Some((first.task_id.clone(), distinct.len(), first.glob.clone()))
+    }
+
+    /// Tasks currently queued for `glob`, oldest first (diagnostics).
+    pub fn waiters_for(&self, glob: &str) -> Vec<Waiter> {
+        let normalized = normalize_glob(glob);
+        let mut queued: Vec<Waiter> = lock_guard(&self.waiters)
+            .iter()
+            .filter(|waiter| glob_overlap(&waiter.glob, &normalized))
+            .cloned()
+            .collect();
+        queued.sort_by_key(|waiter| waiter.ticket);
+        queued
     }
 
     /// Release every hold of `task_id` (completion/cancellation path).
     /// Returns whether any hold was dropped.
     pub fn release(&self, task_id: &str) -> bool {
-        let mut holds = lock_guard(&self.holds);
-        let before = holds.len();
-        holds.retain(|held| held.task_id != task_id);
-        before != holds.len()
+        let dropped = {
+            let mut holds = lock_guard(&self.holds);
+            let before = holds.len();
+            holds.retain(|held| held.task_id != task_id);
+            before != holds.len()
+        };
+        // A finished task must not stay in the queue: a dead waiter at the
+        // front would stall everyone behind it forever.
+        self.dequeue(task_id);
+        dropped
     }
 
     /// All holds whose globs overlap `glob` (a concrete path is a legal,
@@ -346,5 +481,98 @@ mod tests {
         ] {
             assert_eq!(glob_overlap(a, b), glob_overlap(b, a), "({a}, {b})");
         }
+    }
+    /// The defect this queue exists for: under a shared workspace every task
+    /// holds `**`, so one runs and the rest lose. Without fairness the same
+    /// task can lose every single round — observed as 364 consecutive
+    /// deferrals for one node while its peers took turns. The invariant is
+    /// not "everyone wins equally", it is "nobody loses forever".
+    #[test]
+    fn contending_tasks_take_turns_instead_of_one_starving() {
+        let map = OwnershipMap::new();
+        let contenders = ["a", "b", "c"];
+        let mut wins = [0_u32; 3];
+        let mut worst_streak = [0_u32; 3];
+        let mut streak = [0_u32; 3];
+
+        for _ in 0..60 {
+            for (index, task) in contenders.iter().enumerate() {
+                match map.acquire(task, &["**"], true) {
+                    Ok(()) => {
+                        wins[index] += 1;
+                        streak[index] = 0;
+                        map.release(task);
+                    }
+                    Err(_) => {
+                        streak[index] += 1;
+                        worst_streak[index] = worst_streak[index].max(streak[index]);
+                    }
+                }
+            }
+        }
+
+        for (index, task) in contenders.iter().enumerate() {
+            assert!(
+                wins[index] > 0,
+                "{task} never acquired in 60 rounds: wins={wins:?}"
+            );
+            assert!(
+                worst_streak[index] <= contenders.len() as u32,
+                "{task} lost {} rounds in a row; the queue is not fair: {worst_streak:?}",
+                worst_streak[index]
+            );
+        }
+    }
+
+    /// Yielding must never deadlock: with everyone queued, whoever is oldest
+    /// still gets in, and releasing drains the queue in arrival order.
+    #[test]
+    fn the_queue_drains_in_arrival_order_and_never_deadlocks() {
+        let map = OwnershipMap::new();
+        map.acquire("holder", &["src/**"], true).unwrap();
+        for task in ["a", "b", "c"] {
+            assert!(map.acquire(task, &["src/**"], true).is_err());
+        }
+        assert_eq!(
+            map.waiters_for("src/**")
+                .iter()
+                .map(|waiter| waiter.task_id.clone())
+                .collect::<Vec<_>>(),
+            vec!["a".to_owned(), "b".to_owned(), "c".to_owned()]
+        );
+        map.release("holder");
+        for expected in ["a", "b", "c"] {
+            map.acquire(expected, &["src/**"], true)
+                .unwrap_or_else(|err| panic!("{expected} should be next: {err}"));
+            map.release(expected);
+        }
+        assert!(map.waiters_for("src/**").is_empty());
+    }
+
+    /// A task that finishes must not linger in the queue — a dead waiter at
+    /// the front would stall everyone behind it.
+    #[test]
+    fn releasing_removes_the_task_from_the_queue() {
+        let map = OwnershipMap::new();
+        map.acquire("holder", &["**"], true).unwrap();
+        assert!(map.acquire("waiter", &["**"], true).is_err());
+        assert_eq!(map.waiters_for("**").len(), 1);
+        map.release("waiter");
+        assert!(map.waiters_for("**").is_empty());
+        map.release("holder");
+        // With the queue empty, a fresh task acquires immediately.
+        map.acquire("fresh", &["**"], true)
+            .expect("no stale waiter blocks");
+    }
+
+    /// Non-overlapping globs are independent: a queue on one must not make
+    /// an unrelated task yield.
+    #[test]
+    fn queuing_is_scoped_to_overlapping_globs() {
+        let map = OwnershipMap::new();
+        map.acquire("holder", &["src/api/**"], true).unwrap();
+        assert!(map.acquire("queued", &["src/api/**"], true).is_err());
+        map.acquire("elsewhere", &["docs/**"], true)
+            .expect("an unrelated glob is unaffected by another glob's queue");
     }
 }

@@ -442,6 +442,62 @@ impl ClaudeResult {
 /// Terminal event for a finished headless run from the machine-reliable
 /// signals (exit code + result payload) plus payload-content hooks.
 ///
+/// Carry the CLI's own account of the failure into the classified error.
+///
+/// The classifier decides *what kind* of failure this is from exit code and
+/// typed provider codes, which is right — but it never sees the result
+/// payload, so its detail says only "final result event present but exit code
+/// 1". That sentence is true and useless: the reason the run failed is sitting
+/// in `result.result` and was being dropped on the floor, leaving the phase
+/// review with "the author returned an empty response" and no way to tell a
+/// crash from a refusal without probing the CLI by hand.
+///
+/// The `is_error` branch above already keeps that text; this makes the
+/// classified path keep it too.
+fn with_result_context(failure: AdapterFailure, result: &ClaudeResult) -> AdapterFailure {
+    let Some(text) = result
+        .result
+        .as_deref()
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+    else {
+        return failure;
+    };
+    let context = format!(" | claude subtype {:?}: {text}", result.subtype);
+    let extend = |detail: String| format!("{detail}{context}");
+    match failure {
+        AdapterFailure::AuthFailure { detail } => AdapterFailure::AuthFailure {
+            detail: extend(detail),
+        },
+        AdapterFailure::BillingFailure {
+            provider_code,
+            detail,
+        } => AdapterFailure::BillingFailure {
+            provider_code,
+            detail: extend(detail),
+        },
+        AdapterFailure::BotGateOrCaptcha {
+            provider_code,
+            detail,
+        } => AdapterFailure::BotGateOrCaptcha {
+            provider_code,
+            detail: extend(detail),
+        },
+        AdapterFailure::PolicyDenial { detail } => AdapterFailure::PolicyDenial {
+            detail: extend(detail),
+        },
+        AdapterFailure::Transient { detail } => AdapterFailure::Transient {
+            detail: extend(detail),
+        },
+        AdapterFailure::TaskFailure { detail } => AdapterFailure::TaskFailure {
+            detail: extend(detail),
+        },
+        AdapterFailure::SpawnFailure { detail } => AdapterFailure::SpawnFailure {
+            detail: extend(detail),
+        },
+    }
+}
+
 /// Success is the F-00 §4 conjunction (exit 0 AND final result event)
 /// *plus* claude's own `is_error == false` — a result event can be present
 /// with exit 0 while the payload reports an error, and that is a failed
@@ -472,11 +528,9 @@ fn terminal_event(exit_code: i32, result: Option<&ClaudeResult>) -> AdapterEvent
             ),
         });
     }
-    AdapterEvent::Failed(Classifier::classify(
-        exit_code,
-        true,
-        provider_code,
-        denial_observed,
+    AdapterEvent::Failed(with_result_context(
+        Classifier::classify(exit_code, true, provider_code, denial_observed),
+        result,
     ))
 }
 
@@ -617,9 +671,10 @@ fn assistant_events(value: &Value) -> Vec<AdapterEvent> {
                 let tool = string_field(block, "name").unwrap_or_else(|| "unknown".to_owned());
                 let input = block.get("input").cloned().unwrap_or(Value::Null);
                 events.push(AdapterEvent::ToolUse {
-                    tool,
+                    tool: tool.clone(),
                     args_summary: summarize_tool_input(&input),
                 });
+                events.extend(crate::decision::from_tool_input(&tool, &input));
             }
             other => {
                 tracing::debug!(block_type = ?other,
@@ -723,11 +778,11 @@ impl SessionBackend for ClaudeSessionBackend {
             return Err(AdapterError::SessionNotActive(state.handle_id.clone()));
         }
         if state.run_active.swap(true, Ordering::Relaxed) {
-            return Err(AdapterError::Internal(
-                "a claude headless run is active; deliver instructions between runs \
-                 (after the current run's terminal event)"
-                    .to_owned(),
-            ));
+            // Alive, just mid-turn. Distinct from a dead session:
+            // the caller must wait for the terminal event, never open
+            // a second session — a fresh session has none of the
+            // conversation and re-asks everything it already asked.
+            return Err(AdapterError::Busy(state.handle_id.clone()));
         }
         let session_id = state
             .session_id
@@ -799,6 +854,57 @@ impl ClaudeAdapter {
             sessions: Mutex::new(Vec::new()),
         }
     }
+    /// Spawn one session from a ready invocation. Shared by
+    /// `start_session` (fresh) and `resume_session` (`--resume <session_id>`).
+    async fn launch(&self, invocation: ClaudeInvocation) -> Result<SessionHandle, AdapterError> {
+        let binary = resolve_binary().ok_or_else(|| {
+            AdapterError::Internal(format!(
+                "claude binary not found (checked ${}, %USERPROFILE%\\.local\\bin\\claude.exe, PATH)",
+                CLAUDE_BIN_ENV
+            ))
+        })?;
+        // Spawn synchronously so machinery failures (bad cwd, missing
+        // binary) are `Result` errors, per the F-02 contract.
+        let child = claude_command(&binary, &invocation)
+            .spawn()
+            .map_err(|error| {
+                AdapterError::Internal(format!(
+                    "failed to spawn claude in {}: {error}",
+                    invocation.workspace.display()
+                ))
+            })?;
+
+        let session_no = self.next_session.fetch_add(1, Ordering::Relaxed) + 1;
+        let handle_id = format!("claude-{session_no}");
+        let (events, _) = broadcast::channel(1024);
+        let state = std::sync::Arc::new(ClaudeSessionState {
+            handle_id: handle_id.clone(),
+            binary,
+            base_invocation: invocation.clone(),
+            session_id: Mutex::new(None),
+            child: tokio::sync::Mutex::new(None),
+            cancelled: AtomicBool::new(false),
+            dead: AtomicBool::new(false),
+            run_active: AtomicBool::new(true),
+        });
+        let backend = std::sync::Arc::new(ClaudeSessionBackend {
+            state: state.clone(),
+            events: events.clone(),
+        });
+        let handle = SessionHandle::new(handle_id, events.clone(), backend);
+        self.sessions
+            .lock()
+            .expect("claude session registry poisoned")
+            .push(handle.clone());
+
+        let driver_state = state;
+        let driver_invocation = invocation;
+        let driver_events = events;
+        tokio::spawn(async move {
+            drive_headless_run(driver_state, driver_invocation, driver_events, child).await;
+        });
+        Ok(handle)
+    }
 }
 
 impl Default for ClaudeAdapter {
@@ -850,54 +956,18 @@ impl RuntimeAdapter for ClaudeAdapter {
     }
 
     async fn start_session(&self, spec: SpawnSpec) -> Result<SessionHandle, AdapterError> {
-        let invocation = ClaudeInvocation::from_spec(&spec);
-        let binary = resolve_binary().ok_or_else(|| {
-            AdapterError::Internal(format!(
-                "claude binary not found (checked ${}, %USERPROFILE%\\.local\\bin\\claude.exe, PATH)",
-                CLAUDE_BIN_ENV
-            ))
-        })?;
-        // Spawn synchronously so machinery failures (bad cwd, missing
-        // binary) are `Result` errors, per the F-02 contract.
-        let child = claude_command(&binary, &invocation)
-            .spawn()
-            .map_err(|error| {
-                AdapterError::Internal(format!(
-                    "failed to spawn claude in {}: {error}",
-                    invocation.workspace.display()
-                ))
-            })?;
+        self.launch(ClaudeInvocation::from_spec(&spec)).await
+    }
 
-        let session_no = self.next_session.fetch_add(1, Ordering::Relaxed) + 1;
-        let handle_id = format!("claude-{session_no}");
-        let (events, _) = broadcast::channel(1024);
-        let state = std::sync::Arc::new(ClaudeSessionState {
-            handle_id: handle_id.clone(),
-            binary,
-            base_invocation: invocation.clone(),
-            session_id: Mutex::new(None),
-            child: tokio::sync::Mutex::new(None),
-            cancelled: AtomicBool::new(false),
-            dead: AtomicBool::new(false),
-            run_active: AtomicBool::new(true),
-        });
-        let backend = std::sync::Arc::new(ClaudeSessionBackend {
-            state: state.clone(),
-            events: events.clone(),
-        });
-        let handle = SessionHandle::new(handle_id, events.clone(), backend);
-        self.sessions
-            .lock()
-            .expect("claude session registry poisoned")
-            .push(handle.clone());
-
-        let driver_state = state;
-        let driver_invocation = invocation;
-        let driver_events = events;
-        tokio::spawn(async move {
-            drive_headless_run(driver_state, driver_invocation, driver_events, child).await;
-        });
-        Ok(handle)
+    /// Continue an earlier provider conversation: same invocation,
+    /// plus `--resume <session_id>`.
+    async fn resume_session(
+        &self,
+        spec: SpawnSpec,
+        provider_session_id: String,
+    ) -> Result<SessionHandle, AdapterError> {
+        self.launch(ClaudeInvocation::from_spec(&spec).with_resume_session(provider_session_id))
+            .await
     }
 
     async fn shutdown(&self) -> Result<(), AdapterError> {
@@ -1457,6 +1527,93 @@ mod tests {
                 ("HOME", PathBuf::from("temp-homes/worker-1")),
             ]
         );
+    }
+
+    /// Plan-mode surfaces become structured [`AdapterEvent::Decision`]s so
+    /// the desktop can render real buttons: one per `AskUserQuestion`
+    /// question, one for the `ExitPlanMode` plan. The `ToolUse` event still
+    /// lands beside them for the timeline.
+    #[test]
+    fn plan_mode_tools_yield_decisions_with_options() {
+        let ask = json!({
+            "type": "assistant",
+            "message": {"content": [{
+                "type": "tool_use",
+                "name": "AskUserQuestion",
+                "input": {"questions": [
+                    {
+                        "question": "Which database?",
+                        "header": "Database",
+                        "multiSelect": false,
+                        "options": [
+                            {"label": "Postgres", "description": "relational"},
+                            {"label": "SQLite", "description": "embedded"}
+                        ]
+                    },
+                    {
+                        "question": "Which extras?",
+                        "multiSelect": true,
+                        "options": [{"label": "Auth", "description": "sign-in"}]
+                    },
+                    {"question": "No options here", "options": []}
+                ]}
+            }]}
+        });
+        let events = assistant_events(&ask);
+        let kinds: Vec<&str> = events.iter().map(AdapterEvent::kind).collect();
+        assert_eq!(kinds, vec!["tool_use", "decision", "decision"]);
+        assert_eq!(
+            events[1],
+            AdapterEvent::Decision {
+                tool: "AskUserQuestion".to_owned(),
+                prompt: "Which database?".to_owned(),
+                options: vec!["Postgres".to_owned(), "SQLite".to_owned()],
+                multi_select: false,
+            }
+        );
+        match &events[2] {
+            AdapterEvent::Decision {
+                prompt,
+                multi_select,
+                ..
+            } => {
+                assert_eq!(prompt, "Which extras?");
+                assert!(multi_select, "multiSelect carries through");
+            }
+            other => panic!("expected Decision, got {other:?}"),
+        }
+
+        let plan = json!({
+            "type": "assistant",
+            "message": {"content": [{
+                "type": "tool_use",
+                "name": "ExitPlanMode",
+                "input": {"plan": "1. scaffold\\n2. schema"}
+            }]}
+        });
+        let events = assistant_events(&plan);
+        match &events[1] {
+            AdapterEvent::Decision {
+                tool,
+                prompt,
+                options,
+                ..
+            } => {
+                assert_eq!(tool, "ExitPlanMode");
+                assert!(prompt.contains("scaffold"));
+                assert_eq!(options.len(), 2, "approve or keep planning");
+            }
+            other => panic!("expected Decision, got {other:?}"),
+        }
+
+        // Ordinary tools stay ordinary.
+        let bash = json!({
+            "type": "assistant",
+            "message": {"content": [{
+                "type": "tool_use", "name": "Bash", "input": {"command": "ls"}
+            }]}
+        });
+        assert_eq!(assistant_events(&bash).len(), 1);
     }
 
     // -- frozen-fixture parser (T4: allowlist run with a real tool use) -----

@@ -39,5 +39,5 @@ pub use executor::{
 };
 pub use scheduler::{CostLedger, NoCostLedger, Scheduler, DEFAULT_LEASE_TTL};
 pub use spec::{Budgets, NodeSpec, NodeType, RetryPolicy, TaskContract, WorkflowSpec};
-pub use store::{RunRecord, RunStatus, TaskRecord, TaskStore};
+pub use store::{ReopenReport, RunRecord, RunStatus, TaskRecord, TaskStore};
 pub use validate::{topological_order, validate};

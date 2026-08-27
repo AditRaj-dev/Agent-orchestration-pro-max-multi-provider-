@@ -13,7 +13,10 @@
 //! isolation canon keeps `~/.agents` out of worker sessions, so skills are
 //! *injected*, not mounted). [`AgentRegistry::preamble_for`] renders an
 //! agent's assigned skills into one block that the caller prepends to the
-//! session objective. This is deliberately provider-agnostic: the F-03
+//! session objective. The compact Caveman communication and Ponytail
+//! implementation disciplines are always injected first as application
+//! invariants, including for future and fallback agents. This is deliberately
+//! provider-agnostic: the F-03
 //! claude adapter delivers the objective on stdin and the F-05 agy adapter
 //! delivers it as the equals-form `--print=<objective>`, so both carry the
 //! preamble without any adapter change.
@@ -30,12 +33,16 @@
 //! ## Built-ins
 //!
 //! [`seed_builtins`](crate::AgentRegistry::seed_builtins) installs the
-//! mastermind trio idempotently (insert-if-absent, never overwriting an
+//! mastermind roster idempotently (insert-if-absent, never overwriting an
 //! edited row): the `orchestrator` (claude-opus-5, mastermind-commands
 //! skill), the `agent-creator` (agy → claude-sonnet-4-6, interviews the
-//! user and drafts agent definitions), and the `researcher` (agy →
-//! gemini-3.1-pro-high, topic and tech-stack research). Built-ins can be edited
-//! but not deleted.
+//! user and drafts agent definitions), the `researcher` (agy →
+//! gemini-3.1-pro-high, topic and tech-stack research), the `spec-writer`
+//! (claude-opus-5, the planning phases: discovery → PRD → feature docs →
+//! implementation plan), the `ui-designer` (agy → claude-sonnet-4-6, the
+//! design phase) and six stack coders (agy → gpt-oss-120b-medium, each
+//! holding its stack skill plus `code-graph-discipline`). Built-ins can be
+//! edited but not deleted.
 
 pub mod error;
 pub mod record;
@@ -46,5 +53,8 @@ pub mod skill;
 pub use error::AgentsError;
 pub use record::{AgentEffort, AgentMode, AgentRecord, KNOWN_ADAPTERS};
 pub use registry::AgentRegistry;
-pub use seeds::{builtin_agents, builtin_skills};
-pub use skill::SkillRecord;
+pub use seeds::{
+    builtin_agents, builtin_skills, caveman_preamble, global_skills_preamble, CAVEMAN_SKILL_ID,
+    PONYTAIL_SKILL_ID, SKILL_CAVEMAN, SKILL_PONYTAIL,
+};
+pub use skill::{SkillRecord, BODY_MAX_CHARS};

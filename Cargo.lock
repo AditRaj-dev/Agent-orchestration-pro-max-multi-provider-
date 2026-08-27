@@ -19,6 +19,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "agentos-agents"
+version = "0.1.0"
+dependencies = [
+ "agentos-core",
+ "chrono",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "tracing",
+]
+
+[[package]]
 name = "agentos-context"
 version = "0.1.0"
 dependencies = [
@@ -49,7 +63,13 @@ dependencies = [
 name = "agentos-daemon"
 version = "0.1.0"
 dependencies = [
+ "agentos-adapters",
+ "agentos-agents",
  "agentos-core",
+ "agentos-journal",
+ "agentos-orchestrator",
+ "agentos-runtime",
+ "agentos-workflow",
  "chrono",
  "futures-util",
  "rusqlite",
@@ -81,11 +101,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "agentos-journal"
+version = "0.1.0"
+dependencies = [
+ "agentos-core",
+ "rusqlite",
+ "serde_json",
+ "tempfile",
+ "uuid",
+]
+
+[[package]]
 name = "agentos-orchestrator"
 version = "0.1.0"
 dependencies = [
  "agentos-adapters",
  "agentos-core",
+ "agentos-policy",
  "agentos-workflow",
  "async-trait",
  "chrono",
@@ -118,9 +150,10 @@ name = "agentos-runtime"
 version = "0.1.0"
 dependencies = [
  "agentos-adapters",
+ "agentos-agents",
  "agentos-core",
- "agentos-daemon",
  "agentos-git",
+ "agentos-journal",
  "agentos-policy",
  "agentos-workflow",
  "async-trait",

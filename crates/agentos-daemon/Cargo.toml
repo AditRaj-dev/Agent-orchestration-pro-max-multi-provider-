@@ -7,8 +7,12 @@ license.workspace = true
 
 [dependencies]
 agentos-core = { path = "../agentos-core" }
+agentos-journal = { path = "../agentos-journal" }
 agentos-agents = { path = "../agentos-agents" }
 agentos-adapters = { path = "../agentos-adapters" }
+agentos-workflow = { path = "../agentos-workflow" }
+agentos-runtime = { path = "../agentos-runtime" }
+agentos-orchestrator = { path = "../agentos-orchestrator" }
 tokio = { workspace = true, features = ["net"] }
 rusqlite = { workspace = true }
 serde = { workspace = true }

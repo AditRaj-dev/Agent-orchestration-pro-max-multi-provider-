@@ -69,21 +69,23 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use agentos_adapters::{AdapterEvent, AdapterFailure, RuntimeAdapter, SpawnSpec};
+
+use crate::git_advisor::{CommitFacts, GitAdvisor, RebaseAdvice, StaleBaseFacts, GIT_ADVISOR_ROLE};
 use agentos_core::{Event, EventType, TaskState};
-use agentos_daemon::db::open_db;
-use agentos_daemon::events::{append_event, events_for_run};
 use agentos_git::cli;
 use agentos_git::ledger::{AgentLedger, LedgerEntry};
 use agentos_git::ownership::OwnershipMap;
 use agentos_git::queue::{MutationAction, MutationQueue};
 use agentos_git::worktree::{WorktreeManager, WorktreeRef};
+use agentos_journal::db::open_db;
+use agentos_journal::events::{append_event, events_for_run};
 use agentos_policy::{
     git_gate_check, ApprovalRequest, ApprovalStore, AuditStore, Gate, GitAction, PermissionSet,
     PolicyDenial,
 };
 use agentos_workflow::{
-    NodeType, Outcome, RunStatus, Scheduler, TaskExecutor, TaskRecord, TaskStore, TickReport,
-    WorkflowEngine, WorkflowSpec, DEFAULT_LEASE_TTL,
+    NodeType, Outcome, ReopenReport, RunStatus, Scheduler, TaskExecutor, TaskRecord, TaskStore,
+    TickReport, WorkflowEngine, WorkflowSpec, DEFAULT_LEASE_TTL,
 };
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -94,7 +96,10 @@ use uuid::Uuid;
 use crate::contract::{GitPolicy, TaskContract};
 use crate::digest::sha256_hex;
 use crate::error::RuntimeError;
-use crate::handoff::{HandoffPacket, TestStatus};
+use crate::graphify::{
+    reconcile_changes, GraphRefresh, Graphifier, GraphifyOutcome, GraphifySkip, GRAPHIFY_OUT_DIR,
+};
+use crate::handoff::{HandoffPacket, HandoffStatus, TestStatus};
 use crate::policy::{self, GateVerdict, PolicyGate};
 use crate::usage_ledger::UsageLedger;
 
@@ -107,6 +112,7 @@ pub const STUB_REVIEWER: &str = "stub-reviewer@f-07";
 const EVT_SESSION_SPAWN: &str = "session.spawn";
 const EVT_SESSION_STARTED: &str = "session.started";
 const EVT_AGENT_TOOL_USE: &str = "agent.tool_use";
+const EVT_AGENT_DECISION: &str = "agent.decision";
 const EVT_AGENT_RATE_LIMIT: &str = "agent.rate_limit";
 const EVT_AGENT_SPAWN_FAILED: &str = "agent.spawn_failed";
 const EVT_USAGE_UPDATED: &str = "usage.updated";
@@ -120,6 +126,59 @@ const EVT_POLICY_DENIED: &str = "policy.denied";
 const EVT_GIT_GATE_FAILED: &str = "git.gate_failed";
 const EVT_GIT_STALE_BASE: &str = "git.stale_base";
 const EVT_RUN_FAILED: &str = "run.failed";
+/// An operator returned a failed run's work to the queue. Journaled as its
+/// own event because a run leaving `failed` without any task succeeding is
+/// otherwise indistinguishable from a projection bug: the audit trail has to
+/// name the human action, the nodes it revived and the ones it un-parked.
+const EVT_RUN_REOPENED: &str = "run.reopened";
+const EVT_GRAPH_UPDATED: &str = "graph.updated";
+const EVT_GRAPH_SKIPPED: &str = "graph.skipped";
+const EVT_GRAPH_FAILED: &str = "graph.failed";
+
+/// Tool identity stamped on graph events, the way `STUB_REVIEWER` names the
+/// deterministic reviewer.
+const GRAPHIFY_AGENT: &str = "graphify";
+
+/// Ceiling on consecutive ownership deferrals for one task.
+///
+/// A deferral bills no retry attempt — queueing behind a peer is not a
+/// failed try — but that also removes the termination bound, so a task that
+/// can never acquire would spin forever instead of failing. Past this many
+/// consecutive deferrals the task degrades to a transient failure and the
+/// ordinary retry budget applies. The ownership queue is FIFO-fair, so a
+/// task reaching this ceiling means something is wrong beyond contention.
+const MAX_CONSECUTIVE_DEFERRALS: u32 = 25;
+
+/// Appended to every worker objective.
+///
+/// Review approves on the evidence in a task's handoff packet, and the only
+/// structured channel a provider CLI reliably has is its own final message.
+/// Asking for the block here — rather than through a `SpawnSpec` schema
+/// field no adapter carries — makes the evidence portable across claude,
+/// codex and agy alike. A worker that skips it reports no evidence and
+/// fails review, which is the same outcome as reporting a failing test.
+const COMPLETION_REPORT_CONTRACT: &str = r#"
+
+# Completion report (required)
+
+End your final message with a fenced `json` block, and nothing after it:
+
+```json
+{
+  "summary": "one or two sentences on what you changed",
+  "filesChanged": ["relative/path.rs"],
+  "tests": [{"name": "cargo test -p thing", "status": "passed", "count": 12}],
+  "decisions": ["anything you chose that the task did not dictate"],
+  "unresolved": ["anything you could not finish — leave empty if nothing"]
+}
+```
+
+`tests` is the evidence review runs on, so it must describe commands you
+actually ran in this session. `status` is `passed`, `failed`, or `skipped`;
+use `skipped` with the reason in `unresolved` when a suite could not run
+here. Never report a test you did not run — a fabricated pass is a worse
+failure than an honest `skipped`. A non-empty `unresolved` list fails
+review, which is correct: say so rather than hiding it."#;
 
 /// The git action every gate node requests today. The gate commits the run's
 /// audit bundle on its own branch; merge/rebase/push travel the same code
@@ -162,11 +221,24 @@ pub struct SupervisorConfig {
     pub default_adapter: String,
     /// `agent_role` -> adapter id routing table.
     pub role_adapters: HashMap<String, String>,
+    /// `agent_role` -> model override. Explicit session routing wins over
+    /// the persisted registry record; this lets a user-selected planning
+    /// provider carry the planning-document worker too.
+    pub role_models: HashMap<String, String>,
+    /// Run write tasks in the selected project checkout instead of hidden
+    /// per-task worktrees. Mastermind enables this because its task graph is
+    /// serialized by broad ownership holds and users must see staged files.
+    pub shared_task_workspace: bool,
     /// `agent_role` -> permission set (F-10 SEC-01). Roles without an entry
     /// — and nodes that declare no role — execute under a set *derived from
     /// the leased contract* ([`crate::policy::derive_permissions`]), which
     /// is the least-privilege default.
     pub role_permissions: HashMap<String, PermissionSet>,
+    /// A worker role's reasoning failure may retarget its next permitted
+    /// attempt at a stronger role. The workflow engine applies the swap
+    /// atomically with requeueing, so the original worker cannot be leased
+    /// again in between.
+    pub reasoning_escalations: HashMap<String, String>,
     /// F-13: the dynamic agent registry's database. When set, a node's
     /// `agent_role` is first resolved as a registry agent id — the record's
     /// adapter, model and skill preamble drive the spawn — before the
@@ -186,6 +258,12 @@ pub struct SupervisorConfig {
     pub approval_ttl_secs: u64,
     /// Lease ttl the supervisor's engine grants.
     pub lease_ttl: Duration,
+    /// Rebuild the code graph after a worker node writes. Reviewers have no
+    /// shell and cannot build one themselves, so if the harness does not do
+    /// this the graph is only ever as fresh as a worker chose to make it.
+    pub graph_refresh: GraphRefresh,
+    /// Wall-clock ceiling for one graph refresh.
+    pub graph_refresh_timeout_secs: u64,
 }
 
 impl SupervisorConfig {
@@ -206,12 +284,17 @@ impl SupervisorConfig {
             orchestrator: "agentos-supervisor".to_owned(),
             default_adapter: "mock".to_owned(),
             role_adapters: HashMap::new(),
+            role_models: HashMap::new(),
+            shared_task_workspace: false,
             role_permissions: HashMap::new(),
+            reasoning_escalations: HashMap::new(),
             agents_db: None,
             git_gate_permissions: PermissionSet::git_manager(),
             human_approval_gate: Gate::ProdAction,
             approval_ttl_secs: 900,
             lease_ttl: DEFAULT_LEASE_TTL,
+            graph_refresh: GraphRefresh::default(),
+            graph_refresh_timeout_secs: 120,
         }
     }
 
@@ -222,10 +305,39 @@ impl SupervisorConfig {
         self
     }
 
+    /// Pin a role to a model for this supervisor session.
+    pub fn with_role_model(mut self, role: &str, model: &str) -> Self {
+        self.role_models.insert(role.to_owned(), model.to_owned());
+        self
+    }
+
+    /// Make worker edits land in the selected checkout. Broad path
+    /// ownership still prevents overlapping writers.
+    pub fn with_shared_task_workspace(mut self) -> Self {
+        self.shared_task_workspace = true;
+        self
+    }
+
+    /// Turn the post-task code-graph refresh off (tests use this so the
+    /// suite does not depend on whether graphify is installed locally).
+    pub fn with_graph_refresh(mut self, refresh: GraphRefresh) -> Self {
+        self.graph_refresh = refresh;
+        self
+    }
+
     /// Bind `agent_role` to an explicit permission set (overrides the
     /// contract-derived default for nodes carrying that role).
     pub fn with_role_permissions(mut self, role: &str, permissions: PermissionSet) -> Self {
         self.role_permissions.insert(role.to_owned(), permissions);
+        self
+    }
+
+    /// On a reasoning failure, send this role's next allowed retry to a
+    /// stronger role. Transient infrastructure failures keep their original
+    /// role so provider outages do not masquerade as reasoning escalation.
+    pub fn with_reasoning_escalation(mut self, role: &str, target: &str) -> Self {
+        self.reasoning_escalations
+            .insert(role.to_owned(), target.to_owned());
         self
     }
 
@@ -326,6 +438,10 @@ struct SupervisorCore {
     queue: Arc<MutationQueue>,
     agent_ledger: Arc<AgentLedger>,
     ownership: OwnershipMap,
+    /// Consecutive ownership deferrals per task; cleared the moment a task
+    /// acquires. In memory on purpose: a restart drops every hold too, so a
+    /// carried-over count would describe a world that no longer exists.
+    deferrals: Mutex<HashMap<Uuid, u32>>,
     ledger: UsageLedger,
     policy: PolicyGate,
     manifests: Mutex<HashMap<Uuid, RunManifest>>,
@@ -397,6 +513,42 @@ impl SupervisorCore {
                 None
             }
         }
+    }
+
+    /// The git manager's model half, when one is configured (F-09 + F-13).
+    /// Resolved the same way a worker's runtime is: an explicit role
+    /// mapping first, then the `git-manager` registry record. No record and
+    /// no mapping means `None`, and every caller falls back to the
+    /// deterministic path — the advisor is an addition to the git manager,
+    /// never a dependency of it.
+    fn git_advisor(&self) -> Option<GitAdvisor> {
+        let record = self.registry_agent(GIT_ADVISOR_ROLE);
+        let adapter_id = self
+            .config
+            .role_adapters
+            .get(GIT_ADVISOR_ROLE)
+            .cloned()
+            .or_else(|| record.as_ref().map(|record| record.adapter_id.clone()))?;
+        let adapter = self
+            .adapters
+            .iter()
+            .find(|adapter| adapter.id() == adapter_id)
+            .cloned()?;
+        let model = self
+            .config
+            .role_models
+            .get(GIT_ADVISOR_ROLE)
+            .cloned()
+            .or_else(|| record.as_ref().and_then(|record| record.model.clone()));
+        let timeout = record
+            .as_ref()
+            .map(|record| record.timeout_secs)
+            .unwrap_or(300);
+        Some(GitAdvisor::new(
+            adapter,
+            model,
+            Duration::from_secs(timeout),
+        ))
     }
 
     /// The permission set a task executes under: the role mapping when the
@@ -535,6 +687,39 @@ impl SupervisorCore {
     }
 
     /// Run-scoped event whose failure the caller propagates.
+    /// The graph refresher for this supervisor, or `None` when the refresh
+    /// is off or graphify is not installed. Mirrors `git_advisor`: absent
+    /// configuration means the behavior that existed before this module.
+    fn graphifier(&self) -> Option<Graphifier> {
+        Graphifier::resolve(
+            &self.config.graph_refresh,
+            Duration::from_secs(self.config.graph_refresh_timeout_secs),
+        )
+    }
+
+    /// Count one consecutive deferral for `task`, returning the new total.
+    fn record_deferral(&self, task: Uuid) -> u32 {
+        let mut deferrals = match self.deferrals.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let entry = deferrals.entry(task).or_insert(0);
+        *entry += 1;
+        *entry
+    }
+
+    /// Forget a task's deferral streak — it acquired, so the streak is over.
+    fn clear_deferrals(&self, task: Uuid) {
+        match self.deferrals.lock() {
+            Ok(mut guard) => {
+                guard.remove(&task);
+            }
+            Err(poisoned) => {
+                poisoned.into_inner().remove(&task);
+            }
+        }
+    }
+
     fn emit_run_checked(
         &self,
         run_id: &Uuid,
@@ -606,6 +791,17 @@ impl SupervisorCore {
         task_id: &Uuid,
         base_commit: &str,
     ) -> Result<WorktreeRef, RuntimeError> {
+        if self.config.shared_task_workspace {
+            let branch =
+                cli::current_branch(&self.config.repo).unwrap_or_else(|_| "HEAD".to_owned());
+            return Ok(WorktreeRef {
+                repo: self.config.repo.clone(),
+                path: self.config.repo.clone(),
+                branch,
+                task_id: task_id.to_string(),
+                base_commit: base_commit.to_owned(),
+            });
+        }
         let key = *task_id;
         let expected = self.worktrees.managed_root().join(key.to_string());
         if expected.exists() {
@@ -681,6 +877,140 @@ impl SupervisorCore {
 
     /// Packets of every task the given node transitively depends on (the
     /// review input set).
+    /// Render the upstream completion records a task builds on, for its prompt.
+    ///
+    /// Every dependent task's objective has always ended with "Upstream tasks
+    /// whose output you build on: … Read their handoff packets before
+    /// starting." That instruction was unfulfillable: packets live in the
+    /// daemon state dir, outside the worker's `allowed_paths`, and no tool
+    /// reaches them. Workers therefore started cold apart from shared checkout
+    /// file state, while being told to read something they could not open.
+    ///
+    /// Delivering the packets at lease time closes that gap without touching
+    /// the contract, which is immutable after lease.
+    ///
+    /// Bounded on purpose: a packet's `summary` and `files_changed` are
+    /// model-written and unbounded, and a wide fan-in would otherwise spend the
+    /// whole downstream context window on upstream prose.
+    fn render_upstream_packets(packets: &[HandoffPacket]) -> String {
+        const MAX_SUMMARY: usize = 1200;
+        const MAX_FILES: usize = 40;
+        const MAX_LIST: usize = 10;
+
+        if packets.is_empty() {
+            return String::new();
+        }
+
+        fn clip(text: &str, max: usize) -> String {
+            let trimmed = text.trim();
+            match trimmed.char_indices().nth(max) {
+                Some((cut, _)) => format!("{}… (truncated)", &trimmed[..cut]),
+                None => trimmed.to_owned(),
+            }
+        }
+
+        fn bullets(label: &str, items: &[String], out: &mut String) {
+            if items.is_empty() {
+                return;
+            }
+            out.push_str(&format!(
+                "{label}:
+"
+            ));
+            for item in items.iter().take(MAX_LIST) {
+                out.push_str(&format!(
+                    "- {}
+",
+                    clip(item, 300)
+                ));
+            }
+            if items.len() > MAX_LIST {
+                out.push_str(&format!(
+                    "- … and {} more
+",
+                    items.len() - MAX_LIST
+                ));
+            }
+        }
+
+        let mut out = String::from(
+            "
+
+# Upstream work already completed
+
+These are the handoff packets from the tasks you build on. They are the record of what was actually done — prefer them over re-deriving it from the files.
+",
+        );
+        for packet in packets {
+            let status = match packet.status {
+                HandoffStatus::Completed => "completed",
+                HandoffStatus::OutputReady => "output ready",
+                HandoffStatus::Blocked => "blocked",
+                HandoffStatus::Failed => "failed",
+            };
+            out.push_str(&format!(
+                "
+## {} — {}
+",
+                packet.task_id, status
+            ));
+            if !packet.summary.trim().is_empty() {
+                out.push_str(&format!(
+                    "{}
+",
+                    clip(&packet.summary, MAX_SUMMARY)
+                ));
+            }
+            if !packet.files_changed.is_empty() {
+                out.push_str(
+                    "
+Files changed:
+",
+                );
+                for file in packet.files_changed.iter().take(MAX_FILES) {
+                    out.push_str(&format!(
+                        "- {file}
+"
+                    ));
+                }
+                if packet.files_changed.len() > MAX_FILES {
+                    out.push_str(&format!(
+                        "- … and {} more
+",
+                        packet.files_changed.len() - MAX_FILES
+                    ));
+                }
+            }
+            bullets(
+                "
+Decisions",
+                &packet.decisions,
+                &mut out,
+            );
+            bullets(
+                "
+Still unresolved",
+                &packet.unresolved,
+                &mut out,
+            );
+            if !packet.tests.is_empty() {
+                let failed = packet
+                    .tests
+                    .iter()
+                    .filter(|report| report.status == TestStatus::Failed)
+                    .count();
+                out.push_str(&format!(
+                    "
+Tests: {} reported, {} failed
+",
+                    packet.tests.len(),
+                    failed
+                ));
+            }
+        }
+        out
+    }
+
     fn dependency_packets(&self, task: &TaskRecord) -> Vec<HandoffPacket> {
         let Ok(tasks) = self.store.tasks_for_run(&task.run_id) else {
             return Vec::new();
@@ -744,9 +1074,31 @@ fn elapsed_secs(task: &TaskRecord) -> u64 {
 fn truncate_preview(text: &str, max_chars: usize) -> String {
     if text.chars().count() <= max_chars {
         text.to_owned()
+    } else if max_chars == 0 {
+        String::new()
     } else {
-        let truncated: String = text.chars().take(max_chars).collect();
-        format!("{truncated}…")
+        const MARKER: &str = "\n… [middle truncated] …\n";
+        let marker_chars = MARKER.chars().count();
+        if max_chars <= marker_chars + 2 {
+            return text.chars().take(max_chars).collect();
+        }
+
+        // Keep most of the beginning for global/role skill auditability and
+        // the tail for the actual task objective. A head-only preview loses
+        // the objective as soon as skill preambles become substantial.
+        let available = max_chars - marker_chars;
+        let head_chars = available * 3 / 4;
+        let tail_chars = available - head_chars;
+        let head: String = text.chars().take(head_chars).collect();
+        let tail: String = text
+            .chars()
+            .rev()
+            .take(tail_chars)
+            .collect::<String>()
+            .chars()
+            .rev()
+            .collect();
+        format!("{head}{MARKER}{tail}")
     }
 }
 
@@ -836,20 +1188,55 @@ impl SupervisorExecutor {
         let task_key = task.id.to_string();
         let globs: Vec<&str> = contract.allowed_paths.iter().map(String::as_str).collect();
         if let Err(conflict) = self.core.ownership.acquire(&task_key, &globs, true) {
-            // Another task holds overlapping paths: retryable — the hold
-            // frees when that task's attempt ends.
+            // Another task holds overlapping paths, or an older waiter is
+            // ahead in the queue. This is queueing, not failing: the task
+            // goes back to `Ready` without billing a retry. Under a shared
+            // workspace every write task holds `**`, and charging an attempt
+            // per conflict exhausted the retry budget of tasks that had not
+            // run a single time.
+            //
+            // The ceiling is the termination bound: the queue is FIFO-fair,
+            // so a task that still cannot acquire after this many rounds is
+            // not merely unlucky, and spinning forever is worse than failing
+            // honestly.
+            let deferrals = self.core.record_deferral(task.id);
+            let exhausted = deferrals > MAX_CONSECUTIVE_DEFERRALS;
             self.core.emit_for(
                 task,
                 manifest,
                 EventType::Other(EVT_OWNERSHIP_CONFLICT.to_owned()),
                 None,
-                json!({"node": task.node_id, "error": conflict.to_string()}),
+                json!({
+                    "node": task.node_id,
+                    "error": conflict.to_string(),
+                    "deferred": !exhausted,
+                    "consecutiveDeferrals": deferrals,
+                }),
             );
-            return Outcome::TransientFailure;
+            if exhausted {
+                self.core.clear_deferrals(task.id);
+                return Outcome::TransientFailure;
+            }
+            return Outcome::Deferred {
+                reason: conflict.to_string(),
+            };
         }
+        self.core.clear_deferrals(task.id);
 
         let outcome = self.drive_session(task, manifest, contract).await;
         self.core.ownership.release(&task_key);
+        if outcome == Outcome::ReasoningFailure {
+            if let Some(target) = task
+                .node
+                .agent_role
+                .as_deref()
+                .and_then(|role| self.core.config.reasoning_escalations.get(role))
+            {
+                return Outcome::EscalatedReasoningFailure {
+                    agent_role: target.clone(),
+                };
+            }
+        }
         outcome
     }
 
@@ -952,13 +1339,27 @@ impl SupervisorExecutor {
                     tracing::warn!(
                         role = %record.id,
                         %error,
-                        "skill preamble composition failed; objective delivered bare"
+                        "skill preamble composition failed; global skill fallback applied"
                     );
-                    contract.objective.clone()
+                    format!(
+                        "{}{}",
+                        agentos_agents::global_skills_preamble(),
+                        contract.objective
+                    )
                 }
             },
-            _ => contract.objective.clone(),
+            _ => format!(
+                "{}{}",
+                agentos_agents::global_skills_preamble(),
+                contract.objective
+            ),
         };
+        // Fan the upstream completion records out to this worker. The contract
+        // stays immutable after lease; this is context delivered at spawn.
+        let objective = format!(
+            "{objective}{}",
+            SupervisorCore::render_upstream_packets(&self.core.dependency_packets(task)),
+        );
         if let Some(record) = &agent_record {
             for tool in &record.tool_denylist {
                 if !tool_denylist.iter().any(|denied| denied == tool) {
@@ -966,17 +1367,28 @@ impl SupervisorExecutor {
                 }
             }
         }
+        // The report contract is identical on every spawn, so it rides on
+        // the prompt but stays out of the journal preview — a fixed block
+        // repeated on every session.spawn event is noise, and it would push
+        // the task's own text out of the truncation window.
         let spec = SpawnSpec {
             task_id: task.id,
-            objective,
+            objective: format!("{objective}{COMPLETION_REPORT_CONTRACT}"),
             workspace: worktree.path.clone(),
             allowed_paths: constraints.allowed_paths.clone(),
             forbidden_paths: constraints.forbidden_paths.clone(),
             tool_allowlist: constraints.tool_allowlist.clone(),
             tool_denylist: tool_denylist.clone(),
-            model: agent_record
-                .as_ref()
-                .and_then(|record| record.model.clone()),
+            model: task
+                .node
+                .agent_role
+                .as_deref()
+                .and_then(|role| self.core.config.role_models.get(role).cloned())
+                .or_else(|| {
+                    agent_record
+                        .as_ref()
+                        .and_then(|record| record.model.clone())
+                }),
             timeout_secs,
             isolated_home: None,
         };
@@ -992,7 +1404,7 @@ impl SupervisorExecutor {
                 "branch": worktree.branch,
                 "timeoutSecs": timeout_secs,
                 "model": spec.model,
-                "objectivePreview": truncate_preview(&spec.objective, 2000),
+                "objectivePreview": truncate_preview(&objective, 2000),
                 "allowedPaths": constraints.allowed_paths,
                 "forbiddenPaths": constraints.forbidden_paths,
                 "toolAllowlist": constraints.tool_allowlist,
@@ -1068,6 +1480,28 @@ impl SupervisorExecutor {
                                 EventType::Other(EVT_AGENT_TOOL_USE.to_owned()),
                                 Some(adapter.id()),
                                 json!({"tool": tool, "argsSummary": args_summary}),
+                            );
+                        }
+                        // A worker asking for a human choice is journaled,
+                        // not answered here: unattended runs have nobody to
+                        // click. The desktop surfaces it from the journal.
+                        AdapterEvent::Decision {
+                            tool,
+                            prompt,
+                            options,
+                            multi_select,
+                        } => {
+                            self.core.emit_for(
+                                task,
+                                manifest,
+                                EventType::Other(EVT_AGENT_DECISION.to_owned()),
+                                Some(adapter.id()),
+                                json!({
+                                    "tool": tool,
+                                    "prompt": prompt,
+                                    "options": options,
+                                    "multiSelect": multi_select,
+                                }),
                             );
                         }
                         AdapterEvent::RateLimit { provider_notice } => {
@@ -1214,6 +1648,8 @@ impl SupervisorExecutor {
             &artifact,
             &format!("sha256:{hash}"),
         );
+        self.refresh_code_graph(task, manifest, &worktree, &packet)
+            .await;
         Outcome::Success {
             packet: serde_json::to_value(&packet).unwrap_or(Value::Null),
         }
@@ -1505,6 +1941,183 @@ impl SupervisorExecutor {
         );
         Ok(false)
     }
+    /// Rebuild the code graph after this worker's edits.
+    ///
+    /// Never fails the task: reviewers cannot build a graph themselves (no
+    /// shell), so a stale graph degrades their review, but a graph problem
+    /// must not lose a worker's completed work. Runs while the task still
+    /// holds its ownership lease, so graphify parses a tree nobody is
+    /// writing to.
+    async fn refresh_code_graph(
+        &self,
+        task: &TaskRecord,
+        manifest: &RunManifest,
+        worktree: &WorktreeRef,
+        packet: &HandoffPacket,
+    ) {
+        let Some(graphifier) = self.core.graphifier() else {
+            // `Disabled` emits nothing at all: a supervisor with the refresh
+            // off must journal exactly what it journaled before this existed.
+            if self.core.config.graph_refresh != GraphRefresh::Disabled {
+                self.core.emit_for(
+                    task,
+                    manifest,
+                    EventType::Other(EVT_GRAPH_SKIPPED.to_owned()),
+                    Some(GRAPHIFY_AGENT),
+                    json!({"node": task.node_id, "reason": GraphifySkip::BinaryMissing.as_str()}),
+                );
+            }
+            return;
+        };
+
+        // `git status`, not the packet: the worker's file list is prose it
+        // wrote about itself. Edits are uncommitted until the git gate, so a
+        // base..HEAD diff would be empty here.
+        let observed = cli::status_paths(&worktree.path).unwrap_or_else(|error| {
+            // Fail open. A spurious cache-warm update costs about a second;
+            // a graph that silently went stale costs a review.
+            tracing::debug!(task_id = %task.id, %error, "git status unavailable; refreshing anyway");
+            Vec::new()
+        });
+        let changes = reconcile_changes(&observed, &packet.files_changed, &worktree.path);
+
+        if !changes.has_code_changes() {
+            let mut payload = changes.payload();
+            payload["node"] = json!(task.node_id);
+            payload["reason"] = json!(GraphifySkip::NoCodeChanges.as_str());
+            self.core.emit_for(
+                task,
+                manifest,
+                EventType::Other(EVT_GRAPH_SKIPPED.to_owned()),
+                Some(GRAPHIFY_AGENT),
+                payload,
+            );
+            return;
+        }
+
+        match graphifier.update(&worktree.path).await {
+            GraphifyOutcome::Updated { elapsed_ms } => {
+                let mut payload = changes.payload();
+                payload["node"] = json!(task.node_id);
+                payload["elapsedMs"] = json!(elapsed_ms);
+                payload["graphPath"] = json!(format!("{GRAPHIFY_OUT_DIR}/graph.json"));
+                self.core.emit_for(
+                    task,
+                    manifest,
+                    EventType::Other(EVT_GRAPH_UPDATED.to_owned()),
+                    Some(GRAPHIFY_AGENT),
+                    payload,
+                );
+            }
+            GraphifyOutcome::Failed {
+                reason,
+                exit_code,
+                stderr_tail,
+            } => {
+                tracing::warn!(task_id = %task.id, %reason, "code graph refresh failed");
+                self.core.emit_for(
+                    task,
+                    manifest,
+                    EventType::Other(EVT_GRAPH_FAILED.to_owned()),
+                    Some(GRAPHIFY_AGENT),
+                    json!({
+                        "node": task.node_id,
+                        "reason": reason,
+                        "exitCode": exit_code,
+                        "stderrTail": stderr_tail,
+                    }),
+                );
+            }
+            GraphifyOutcome::Skipped(skip) => {
+                self.core.emit_for(
+                    task,
+                    manifest,
+                    EventType::Other(EVT_GRAPH_SKIPPED.to_owned()),
+                    Some(GRAPHIFY_AGENT),
+                    json!({"node": task.node_id, "reason": skip.as_str()}),
+                );
+            }
+        }
+    }
+
+    /// The commit message for a run's audit bundle: a deterministic subject
+    /// line, plus — when the git manager has a model configured — a short
+    /// body describing what changed. The subject is never model text, the
+    /// body is sanitized, and a missing, slow, or unusable answer simply
+    /// leaves the message as it has always been (GIT-03 attribution still
+    /// lives in the ledger, not here).
+    async fn commit_message(&self, task: &TaskRecord, worktree: &WorktreeRef) -> String {
+        let subject = format!("agentos: audit bundle for run {}", task.run_id);
+        let Some(advisor) = self.core.git_advisor() else {
+            return subject;
+        };
+        let files = match cli::status_paths(&worktree.path) {
+            Ok(files) if !files.is_empty() => files,
+            Ok(_) => return subject,
+            Err(error) => {
+                tracing::warn!(task_id = %task.id, %error,
+                    "could not list pending paths for the commit detail");
+                return subject;
+            }
+        };
+        let facts = CommitFacts {
+            node_id: task.node_id.clone(),
+            run_id: task.run_id.to_string(),
+            branch: worktree.branch.clone(),
+            files,
+        };
+        match advisor.commit_detail(&facts).await {
+            Some(detail) => format!("{subject}\n\n{detail}"),
+            None => subject,
+        }
+    }
+
+    /// Where a stale-base rejection goes. Without an advisor this is the
+    /// long-standing `rebase-or-review` hand-off. With one, the model
+    /// chooses between the two commits the harness already knows about;
+    /// the sha it picks is re-resolved through `git rev-parse` before any
+    /// argv is built, and the replay happens in the task's own isolated
+    /// worktree — never on a shared branch, and never past the push gate.
+    /// The mutation is retried either way; a successful rebase just means
+    /// the retry finds a fresh base.
+    async fn stale_base_routing(
+        &self,
+        task: &TaskRecord,
+        repo: &Path,
+        worktree: &WorktreeRef,
+        contract: &TaskContract,
+        head: &str,
+    ) -> (&'static str, String) {
+        let Some(advisor) = self.core.git_advisor() else {
+            return ("rebase-or-review", "no advisor configured".to_owned());
+        };
+        let facts = StaleBaseFacts {
+            node_id: task.node_id.clone(),
+            base_commit: contract.base_commit.clone(),
+            head_commit: head.to_owned(),
+            files: cli::diff_name_only(repo, &contract.base_commit, head).unwrap_or_default(),
+        };
+        match advisor.rebase_advice(&facts).await {
+            RebaseAdvice::Escalate { reason } => ("review", reason),
+            RebaseAdvice::Rebase { onto } => match cli::rev_parse_verify(repo, &onto) {
+                Ok(Some(resolved)) => {
+                    match cli::rebase_onto(&worktree.path, &resolved, &contract.base_commit) {
+                        Ok(()) => ("rebased", resolved),
+                        Err(error) => {
+                            tracing::warn!(task_id = %task.id, %error,
+                                "advised rebase failed; the worktree was left unchanged");
+                            ("rebase-or-review", error.to_string())
+                        }
+                    }
+                }
+                Ok(None) => (
+                    "review",
+                    format!("advised rebase target {onto} is not a commit here"),
+                ),
+                Err(error) => ("rebase-or-review", error.to_string()),
+            },
+        }
+    }
 
     /// The git gate: authorize the mutation against F-10 (gate permission +
     /// a live, fingerprint-bound human approval), then enqueue it on the
@@ -1614,20 +2227,23 @@ impl SupervisorExecutor {
         match self.core.queue.stale_base_check(&request.id, &head) {
             Ok(true) => {}
             Ok(false) => {
+                let (routing, note) = self
+                    .stale_base_routing(task, &repo, &worktree, contract, &head)
+                    .await;
                 self.core.emit_for(
                     task,
                     manifest,
                     EventType::Other(EVT_GIT_STALE_BASE.to_owned()),
                     Some(gate.as_str()),
                     json!({"node": task.node_id, "requestId": request.id,
-                           "routing": "rebase-or-review"}),
+                           "routing": routing, "advisor": note}),
                 );
                 return Outcome::TransientFailure;
             }
             Err(error) => return fail(&self.core, "stale-base", &error),
         }
 
-        let message = format!("agentos: audit bundle for run {}", task.run_id);
+        let message = self.commit_message(task, &worktree).await;
         let sha = match cli::add_all_and_commit(&worktree.path, "agentos", &message) {
             Ok(sha) => sha,
             Err(error) => return fail(&self.core, "commit", &error),
@@ -1804,6 +2420,7 @@ impl Supervisor {
             queue,
             agent_ledger,
             ownership: OwnershipMap::new(),
+            deferrals: Mutex::new(HashMap::new()),
             ledger: UsageLedger::new(),
             policy,
             manifests: Mutex::new(HashMap::new()),
@@ -1826,6 +2443,12 @@ impl Supervisor {
     /// external workers inject crash-simulating ghost leases in tests).
     pub fn engine(&self) -> &WorkflowEngine {
         &self.engine
+    }
+
+    /// The durable task/run store, for embedders that need to read or
+    /// mutate run state through another façade (F-12's plan sink).
+    pub fn store(&self) -> &Arc<TaskStore> {
+        &self.store
     }
 
     /// The usage/cost ledger.
@@ -2013,6 +2636,17 @@ impl Supervisor {
             .map(|task| (task.id, task.state))
             .collect();
 
+        // A terminal run is immutable. Repeated UI clicks must not execute
+        // another scheduler tick or append duplicate run.failed events.
+        let initial_tasks = self.store.tasks_for_run(run_id)?;
+        let initial_status = RunStatus::from_tasks(&initial_tasks);
+        if initial_status != RunStatus::Running {
+            return Ok(DriveSummary {
+                ticks: 0,
+                status: initial_status,
+            });
+        }
+
         let mut ticks = 0u32;
         loop {
             if ticks >= max_ticks {
@@ -2043,6 +2677,94 @@ impl Supervisor {
                 return Ok(DriveSummary { ticks, status });
             }
         }
+    }
+
+    /// Return a failed run's work to the queue after its cause has cleared
+    /// (a provider quota window that has since reset, a flaky dependency
+    /// that is back up) — the operator-initiated counterpart to `drive`
+    /// giving up.
+    ///
+    /// The state change is [`TaskStore::reopen_run`]'s explicit CAS, which
+    /// is the only path out of `Failed` in the whole system and is never
+    /// reachable from a scheduler tick. All this adds is the audit trail:
+    /// one `run.reopened` event naming the revived and un-parked nodes, so
+    /// a run that leaves `failed` without any task succeeding is explicable
+    /// afterwards.
+    ///
+    /// Total by design: reopening a run with nothing failed returns an
+    /// empty report. Callers that consider that a user error (the daemon's
+    /// `mastermind.reopenRun` does) check
+    /// [`ReopenReport::changed_anything`] themselves.
+    pub fn reopen_run(&self, run_id: &Uuid) -> Result<ReopenReport, RuntimeError> {
+        let manifest = self.core.manifest(run_id)?;
+        let report = self.store.reopen_run(run_id)?;
+        self.core.emit_run_checked(
+            run_id,
+            &manifest,
+            EventType::Other(EVT_RUN_REOPENED.to_owned()),
+            json!({
+                "reopened": report.reopened,
+                "unblocked": report.unblocked,
+                "status": report.status.as_str(),
+            }),
+        )?;
+
+        // A reopened task's last journaled state is `task.failed`, and
+        // `post_tick` will never correct it: the next drive reads the store
+        // as its baseline, so the Failed -> Ready move happened outside any
+        // tick's before/after diff. Without this the desktop's projection
+        // would keep rendering a revived task as failed indefinitely.
+        for task in self.store.tasks_for_run(run_id)? {
+            if report.reopened.contains(&task.node_id) {
+                self.core.emit_for(
+                    &task,
+                    &manifest,
+                    EventType::TaskReady,
+                    None,
+                    json!({"node": task.node_id, "from": "failed", "reopened": true}),
+                );
+            }
+        }
+
+        tracing::info!(
+            run_id = %run_id,
+            reopened = ?report.reopened,
+            unblocked = ?report.unblocked,
+            "run reopened; drive it again to resume the stranded work"
+        );
+        Ok(report)
+    }
+
+    /// Actionable failure events for the desktop instead of a bare Failed
+    /// status. Most recent provider/runtime detail for each event is kept.
+    pub fn failure_details(&self, run_id: &Uuid) -> Result<Vec<Value>, RuntimeError> {
+        let failure_types = [
+            EVT_AGENT_SPAWN_FAILED,
+            EVT_TASK_FAILED,
+            EVT_GIT_GATE_FAILED,
+            "agent.crashed",
+            "review.failed",
+            "budget.exceeded",
+        ];
+        Ok(self
+            .core
+            .journal
+            .events_for_run(run_id)?
+            .into_iter()
+            .filter(|event| failure_types.contains(&event.event_type.as_str()))
+            .map(|event| {
+                json!({
+                    "event": event.event_type.as_str(),
+                    "taskId": event.task_id.map(|id| id.to_string()),
+                    "agent": event.agent_id,
+                    "node": event.payload.get("node").and_then(Value::as_str),
+                    "kind": event.payload.get("kind").and_then(Value::as_str),
+                    "detail": event.payload.get("detail").and_then(Value::as_str)
+                        .or_else(|| event.payload.get("error").and_then(Value::as_str))
+                        .or_else(|| event.payload.get("reason").and_then(Value::as_str)),
+                })
+            })
+            .collect())
     }
 
     /// Post-tick journal projection: state-transition diffs plus the
@@ -2186,6 +2908,33 @@ fn verify_base_commit(repo: &Path, base_commit: &str) -> Result<(), RuntimeError
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn objective_preview_preserves_skill_head_and_task_tail_within_budget() {
+        let text = format!("GLOBAL:{}:TASK OBJECTIVE", "x".repeat(100));
+        let preview = truncate_preview(&text, 80);
+        assert!(preview.starts_with("GLOBAL:"));
+        assert!(preview.ends_with("TASK OBJECTIVE"));
+        assert!(preview.contains("middle truncated"));
+        assert!(preview.chars().count() <= 80);
+    }
+
+    #[test]
+    fn session_routing_can_pin_planning_worker_to_selected_provider() {
+        let config = SupervisorConfig::for_repo("state", "repo")
+            .with_role_adapter("spec-writer", "codex")
+            .with_role_model("spec-writer", "gpt-5.6-sol")
+            .with_shared_task_workspace();
+        assert_eq!(
+            config.role_adapters.get("spec-writer").map(String::as_str),
+            Some("codex")
+        );
+        assert_eq!(
+            config.role_models.get("spec-writer").map(String::as_str),
+            Some("gpt-5.6-sol")
+        );
+        assert!(config.shared_task_workspace);
+    }
     use serde_json::json;
 
     /// The gate constant must stay the gate F-10 assigns to the action the
@@ -2223,6 +2972,58 @@ mod tests {
             requested_action: crate::handoff::RequestedAction::Review,
             transcript_ref: None,
         }
+    }
+
+    #[test]
+    fn upstream_packets_reach_the_prompt_and_stay_bounded() {
+        assert!(
+            SupervisorCore::render_upstream_packets(&[]).is_empty(),
+            "a task with no dependencies must not carry an empty upstream section"
+        );
+
+        let mut upstream = packet(
+            "T01",
+            &["migration not run"],
+            &[("test:auth", TestStatus::Passed)],
+        );
+        upstream.summary = "Added the auth route handler.".to_owned();
+        upstream.decisions = vec!["Chose JWT over sessions".to_owned()];
+        upstream.files_changed = (0..60).map(|n| format!("src/file{n}.rs")).collect();
+
+        let rendered = SupervisorCore::render_upstream_packets(&[upstream]);
+
+        // The record itself reaches the worker: this is what makes
+        // `contract_for`'s "read their handoff packets" instruction truthful.
+        assert!(rendered.contains("T01"), "the upstream task id must appear");
+        assert!(rendered.contains("Added the auth route handler."));
+        assert!(rendered.contains("Chose JWT over sessions"));
+        assert!(rendered.contains("migration not run"));
+        assert!(rendered.contains("src/file0.rs"));
+
+        // Bounded: a wide fan-in must not spend the downstream context window.
+        assert!(
+            !rendered.contains("src/file59.rs"),
+            "files beyond the cap must be elided, not rendered"
+        );
+        assert!(
+            rendered.contains("and 20 more"),
+            "elision must be stated, not silent: {rendered}"
+        );
+    }
+
+    #[test]
+    fn a_long_upstream_summary_is_truncated_rather_than_dropped() {
+        let mut upstream = packet("T02", &[], &[]);
+        upstream.summary = "x".repeat(5000);
+
+        let rendered = SupervisorCore::render_upstream_packets(&[upstream]);
+
+        assert!(rendered.contains("truncated"), "truncation must be visible");
+        assert!(
+            rendered.len() < 3000,
+            "an unbounded model-written summary must not pass through whole: {} chars",
+            rendered.len()
+        );
     }
 
     #[test]

@@ -132,6 +132,17 @@ pub enum AdapterError {
     /// instructions are accepted.
     #[error("session {0} is not active")]
     SessionNotActive(String),
+    /// A turn is still streaming; the instruction can be delivered once the
+    /// current run reaches its terminal event. Distinct from
+    /// [`AdapterError::SessionNotActive`] because the session is very much
+    /// alive — the caller should wait, never open a second session.
+    #[error("session {0} is mid-turn; retry after the current run finishes")]
+    Busy(String),
+    /// The adapter does not offer the requested capability (e.g. resuming
+    /// a provider session on a runtime that has no resume surface). A
+    /// contract statement, not a failure of the run.
+    #[error("unsupported: {0}")]
+    Unsupported(String),
     /// Adapter-internal infrastructure error (channel, process plumbing).
     #[error("adapter internal error: {0}")]
     Internal(String),
@@ -143,7 +154,13 @@ impl AdapterError {
     pub fn is_retryable(&self) -> bool {
         match self {
             AdapterError::SessionFailed(failure) => failure.is_retryable(),
-            AdapterError::SessionNotActive(_) | AdapterError::Internal(_) => false,
+            // Busy clears on its own when the turn lands.
+            AdapterError::Busy(_) => true,
+            // A capability the adapter does not have will not appear on a
+            // retry, and machinery errors are never automatically retried.
+            AdapterError::SessionNotActive(_)
+            | AdapterError::Unsupported(_)
+            | AdapterError::Internal(_) => false,
         }
     }
 }

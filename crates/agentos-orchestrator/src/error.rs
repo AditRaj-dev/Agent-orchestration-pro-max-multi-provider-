@@ -133,6 +133,14 @@ pub enum RejectionReason {
         /// The configured roster.
         known: Vec<String>,
     },
+    /// A worker task tries to postpone product discovery until after the
+    /// human gate. Discovery belongs to the orchestrator and must be
+    /// resolved before a task graph can be committed.
+    #[error("node `{node}` defers unresolved human discovery to a worker")]
+    DeferredHumanDiscovery {
+        /// The task that attempted to interview or gather requirements.
+        node: String,
+    },
     /// The dependency edge already exists.
     #[error("node `{node}` already depends on `{dependency}`")]
     DuplicateDependency {
@@ -172,6 +180,42 @@ pub enum RejectionReason {
         /// The rejected operation name.
         op: String,
         /// The live run.
+        run_id: String,
+    },
+    /// An `escalate` named a task the engine has no next attempt for: it is
+    /// terminal (`Done`, `Failed`, `Cancelled`).
+    ///
+    /// Escalation retunes priority and retargets the *agent role of the
+    /// next attempt*. A terminal task never gets another attempt, so every
+    /// lever escalation owns is inert against it. Observed: a Phase-8 build
+    /// whose `T07` failed on a provider quota outage was escalated to
+    /// `supervisor`, then `stronger_agent`, then `human` across three
+    /// cycles — each reported `accepted: 1`, and the task stayed `Failed`
+    /// with five dependents `Blocked`. The planner climbed its whole
+    /// escalation ladder because nothing ever told it the rung was empty.
+    #[error(
+        "`{op}` rejected: task `{node}` is terminally {state}; escalation cannot grant it \
+         another attempt — reopen the run instead"
+    )]
+    TaskTerminal {
+        /// The rejected operation name.
+        op: String,
+        /// The node named by the operation.
+        node: String,
+        /// The task's terminal state, in its wire spelling.
+        state: String,
+    },
+    /// An `escalate` named a node the live run does not carry a task for.
+    /// The plan may still hold it as an un-materialized draft node; there
+    /// is simply nothing durable to retune or route.
+    #[error("`{op}` rejected: run {run_id} has no task for node `{node}`")]
+    #[serde(rename_all = "camelCase")]
+    TaskNotInRun {
+        /// The rejected operation name.
+        op: String,
+        /// The dangling node reference.
+        node: String,
+        /// The live run that was searched.
         run_id: String,
     },
     /// The goal was already closed; the plan is sealed.
@@ -225,11 +269,14 @@ impl RejectionReason {
             RejectionReason::DuplicateNode { .. } => "duplicate_node",
             RejectionReason::UnknownNode { .. } => "unknown_node",
             RejectionReason::UnknownPool { .. } => "unknown_pool",
+            RejectionReason::DeferredHumanDiscovery { .. } => "deferred_human_discovery",
             RejectionReason::DuplicateDependency { .. } => "duplicate_dependency",
             RejectionReason::SelfDependency { .. } => "self_dependency",
             RejectionReason::PlanTooLarge { .. } => "plan_too_large",
             RejectionReason::OperationBudgetExceeded { .. } => "operation_budget_exceeded",
             RejectionReason::RunAlreadyStarted { .. } => "run_already_started",
+            RejectionReason::TaskTerminal { .. } => "task_terminal",
+            RejectionReason::TaskNotInRun { .. } => "task_not_in_run",
             RejectionReason::GoalClosed { .. } => "goal_closed",
             RejectionReason::NothingToClose => "nothing_to_close",
             RejectionReason::RunNotTerminal { .. } => "run_not_terminal",
@@ -279,6 +326,10 @@ impl RejectionReason {
                     known.join(", ")
                 )
             }
+            RejectionReason::DeferredHumanDiscovery { .. } => {
+                "Ask and resolve the product question during Mastermind discovery, then propose implementation work that applies the answer."
+                    .to_owned()
+            }
             RejectionReason::DuplicateDependency { .. } => {
                 "The edge is already in the plan; no operation is needed.".to_owned()
             }
@@ -294,6 +345,17 @@ impl RejectionReason {
                  further structural changes belong to a new run."
                     .to_owned()
             }
+            RejectionReason::TaskTerminal { node, state, .. } => format!(
+                "`{node}` is terminally {state}: escalation only retunes priority and routes the \
+                 next attempt, and a terminal task has no next attempt. Do not try another \
+                 escalation target — that ladder cannot reach it. Ask the operator to reopen the \
+                 run (`mastermind.reopenRun`), which returns the failed task to `ready` with a \
+                 fresh attempt budget and un-parks its blocked dependents."
+            ),
+            RejectionReason::TaskNotInRun { node, .. } => format!(
+                "The live run carries no task for `{node}`; re-read the run snapshot and escalate \
+                 a node the engine actually materialized."
+            ),
             RejectionReason::GoalClosed { .. } => {
                 "The goal is closed; start a new goal to plan further work.".to_owned()
             }
@@ -376,6 +438,14 @@ pub enum OrchestratorError {
         /// Provider/adapter detail, never credential-bearing.
         detail: String,
     },
+    /// The provider explicitly reported that its quota or rate-limit window
+    /// is exhausted. Kept distinct from a generic model outage so callers can
+    /// safely fail over to another configured provider.
+    #[error("planning provider limit reached: {detail}")]
+    ProviderLimit {
+        /// Provider-authored, structured failure detail.
+        detail: String,
+    },
     /// An operation was attempted that needs a committed run.
     #[error("no run has been committed for this plan")]
     NoRun,
@@ -411,7 +481,7 @@ impl OrchestratorError {
         match self {
             OrchestratorError::Workflow(inner) => inner.is_retryable(),
             OrchestratorError::Storage(inner) => inner.is_retryable(),
-            OrchestratorError::Model { .. } => true,
+            OrchestratorError::Model { .. } | OrchestratorError::ProviderLimit { .. } => true,
             // The approval store is SQLite: contention is transient, so
             // the next cycle can re-raise the escalation.
             OrchestratorError::Desk { .. } => true,
@@ -512,6 +582,9 @@ mod tests {
                 pool: "p".to_owned(),
                 known: vec![],
             },
+            RejectionReason::DeferredHumanDiscovery {
+                node: "discovery".to_owned(),
+            },
             RejectionReason::DuplicateDependency {
                 node: "n".to_owned(),
                 dependency: "d".to_owned(),
@@ -523,6 +596,16 @@ mod tests {
             RejectionReason::OperationBudgetExceeded { limit: 1, index: 2 },
             RejectionReason::RunAlreadyStarted {
                 op: "o".to_owned(),
+                run_id: "r".to_owned(),
+            },
+            RejectionReason::TaskTerminal {
+                op: "escalate".to_owned(),
+                node: "T07".to_owned(),
+                state: "failed".to_owned(),
+            },
+            RejectionReason::TaskNotInRun {
+                op: "escalate".to_owned(),
+                node: "T07".to_owned(),
                 run_id: "r".to_owned(),
             },
             RejectionReason::GoalClosed { op: "o".to_owned() },

@@ -29,9 +29,15 @@ pub struct SkillRecord {
     pub description: String,
     /// The markdown body injected into sessions that hold this skill.
     pub body: String,
-    /// Seeded built-ins are editable but not deletable.
+    /// Seeded built-ins are editable but not deletable. Wire records omit
+    /// it (the server forces it false on create, preserves it on update),
+    /// so it defaults rather than making callers send a field they cannot
+    /// influence — same shape rule `AgentRecord` already follows.
+    #[serde(default)]
     pub builtin: bool,
+    #[serde(default = "crate::record::now")]
     pub created_at: DateTime<Utc>,
+    #[serde(default = "crate::record::now")]
     pub updated_at: DateTime<Utc>,
 }
 

@@ -371,6 +371,43 @@ fn runs_are_newest_first_and_filters_work() {
         .is_empty());
 }
 
+/// A session that ends must stop reading as live. Without terminal arms an
+/// agent that ever reached `Running` stayed Running for the life of the
+/// journal, so the Command Center showed cancelled sessions as RUNNING.
+#[test]
+fn a_finished_cancelled_or_failed_session_leaves_running() {
+    let run = Uuid::now_v7();
+    let agent_event = |type_str: &str| {
+        Event::new(EventType::Other(type_str.to_owned()))
+            .with_run_id(run)
+            .with_agent_id("a1")
+    };
+    let after = |terminal: &str| {
+        let journal = journal_of(vec![
+            Event::new(EventType::RunCreated).with_run_id(run),
+            agent_event("session.spawn"),
+            agent_event("session.started"),
+            agent_event(terminal),
+        ]);
+        fold(&journal).agents(None)[0].status
+    };
+
+    assert_eq!(after("session.finished"), AgentStatus::Complete);
+    assert_eq!(after("session.cancelled"), AgentStatus::Idle);
+    assert_eq!(after("agent.session_failed"), AgentStatus::Failed);
+
+    // A chat session stays instructable after a finished turn: the next
+    // instruction must put the agent back on the running ladder.
+    let journal = journal_of(vec![
+        Event::new(EventType::RunCreated).with_run_id(run),
+        agent_event("session.spawn"),
+        agent_event("session.started"),
+        agent_event("session.finished"),
+        agent_event("session.instruction"),
+    ]);
+    assert_eq!(fold(&journal).agents(None)[0].status, AgentStatus::Running);
+}
+
 /// The agent status vocabulary transitions (§3.3): planning → running →
 /// waiting → reviewing → failed, and run terminal → complete; `agent.leased`
 /// and `task.running` both read as `running`.
@@ -607,4 +644,60 @@ fn depends_on_applies_retroactively_and_tolerates_count_nodes() {
     ]);
     let projection = fold(&journal);
     assert!(projection.tasks(None)[0].depends_on.is_empty());
+}
+
+/// An operator reopen puts the run back on the board. Without folding
+/// `run.reopened` the desktop would keep rendering a run that is executing
+/// again as `failed` with an `endedAt`, and its revived task as failed —
+/// the projection's last word on that task was `task.failed`.
+#[test]
+fn a_reopened_run_leaves_failed_and_its_revived_task_becomes_ready() {
+    let run = Uuid::now_v7();
+    let ok_task = Uuid::now_v7();
+    let bad_task = Uuid::now_v7();
+    let mut journal = vec![Event::new(EventType::RunCreated).with_run_id(run)];
+    for task in [ok_task, bad_task] {
+        journal.push(
+            Event::new(EventType::TaskCreated)
+                .with_run_id(run)
+                .with_task_id(task),
+        );
+    }
+    journal.push(
+        Event::new(EventType::TaskDone)
+            .with_run_id(run)
+            .with_task_id(ok_task),
+    );
+    journal.push(
+        Event::new(EventType::Other("task.failed".to_owned()))
+            .with_run_id(run)
+            .with_task_id(bad_task),
+    );
+    journal.push(Event::new(EventType::Other("run.failed".to_owned())).with_run_id(run));
+
+    let stranded = fold(&journal_of(journal.clone()));
+    assert_eq!(stranded.runs()[0].status, RunStatus::Failed);
+    assert!(stranded.runs()[0].ended_at.is_some());
+
+    // The reopen: one run-scoped event plus a `task.ready` per revived task.
+    journal.push(
+        Event::new(EventType::Other("run.reopened".to_owned()))
+            .with_run_id(run)
+            .with_payload(json!({"reopened": ["t07"], "unblocked": [], "status": "running"})),
+    );
+    journal.push(
+        Event::new(EventType::TaskReady)
+            .with_run_id(run)
+            .with_task_id(bad_task)
+            .with_payload(json!({"from": "failed", "reopened": true})),
+    );
+
+    let reopened = fold(&journal_of(journal));
+    let summary = &reopened.runs()[0];
+    assert_eq!(summary.status, RunStatus::Running, "the run is live again");
+    assert!(summary.ended_at.is_none(), "the terminal mark comes off");
+    assert_eq!(summary.task_counts.failed, 0);
+    assert_eq!(summary.task_counts.done, 1);
+    assert_eq!(summary.task_counts.active, 1, "the revived task is active");
+    assert_eq!(reopened.tasks(None)[1].state, TaskState::Ready);
 }

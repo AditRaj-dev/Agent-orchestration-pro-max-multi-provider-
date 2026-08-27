@@ -43,7 +43,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStderr, ChildStdout, Command};
 use tokio::sync::broadcast;
 
@@ -63,11 +63,24 @@ pub const AGY_SESSION_OVERHEAD_TOKENS: u64 = 37_000;
 /// maps to [`AdapterFailure::Transient`] (retryable), while letting the
 /// CLI die first would classify as an un-final-evented exit.
 pub const AGY_PRINT_TIMEOUT_SLACK_SECS: u64 = 30;
+/// Cap for compact tool summaries (F-00 §3: never full payloads).
+const AGY_TOOL_SUMMARY_MAX: usize = 160;
 /// Env var that opts the ignored e2e tests into live (free-only) agy probes.
 pub const AGY_E2E_ENV: &str = "AGENTOS_AGY_E2E";
 /// Env var overriding the agy binary location (same pattern as the probe
 /// scripts' `PROBE_*_BIN`).
 pub const AGY_BIN_ENV: &str = "AGENTOS_AGY_BIN";
+
+/// Tool names that mean "this turn must not run shell commands". agy cannot
+/// deny them individually, so their presence selects `--sandbox` instead.
+const SHELL_TOOLS: [&str; 6] = [
+    "Bash",
+    "BashOutput",
+    "KillShell",
+    "PowerShell",
+    "Tmux",
+    "REPL",
+];
 
 /// Coarse agy permission mode. There is no per-tool allow/deny surface on
 /// agy (observed gap vs Claude `--allowedTools`); `plan` is the verified
@@ -78,8 +91,11 @@ pub enum AgyMode {
     /// `--mode plan` — VERIFIED read-only (write prompt → plan artifact,
     /// no file written, SUCCESS status).
     Plan,
-    /// `--mode accept-edits` — file edits allowed (in `--add-dir` dirs);
-    /// shell commands denied headless (observable denial event).
+    /// `--mode accept-edits` — file edits allowed (in `--add-dir` dirs).
+    /// The old "shell denied headless" behaviour held only at
+    /// `permission_mode=request-review`, which also blocked every file write.
+    /// Under `always-proceed` the terminal runs: verified by a shell-only
+    /// command creating a file on disk. `--sandbox` is what blocks it now.
     AcceptEdits,
 }
 
@@ -144,6 +160,16 @@ impl AgyOutputFormat {
 /// has no fields for them, so callers chain the `with_*` builders.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgyInvocation {
+    /// Block terminal execution while still permitting file edits.
+    ///
+    /// agy has no per-tool allow/deny surface, so the daemon's shell denylist
+    /// for scoped authoring turns cannot be expressed directly. `--sandbox` is
+    /// the coarse equivalent: verified to stop a shell-only command from
+    /// creating a file while `write_to_file` still succeeds. Note the failure
+    /// is silent — the model reports the command as run — so enable this only
+    /// where shell genuinely must not fire.
+    pub sandbox: bool,
+
     /// The prompt. Rendered as the LAST argument in equals form
     /// `--print=<objective>` (variadic-flag canon, F-00 §4).
     pub objective: String,
@@ -204,6 +230,10 @@ impl AgyInvocation {
             } else {
                 AgyMode::AcceptEdits
             },
+            sandbox: spec
+                .tool_denylist
+                .iter()
+                .any(|tool| SHELL_TOOLS.contains(&tool.as_str())),
             output_format: AgyOutputFormat::StreamJson,
             model: spec.model.clone(),
             effort: None,
@@ -248,6 +278,18 @@ impl AgyInvocation {
             "--output-format".to_owned(),
             self.output_format.as_str().to_owned(),
         ];
+        if self.sandbox {
+            args.push("--sandbox".to_owned());
+        }
+        if self.mode == AgyMode::AcceptEdits {
+            // Without this the session runs at `permission_mode=request-review`
+            // and every tool call waits for an approval no one can give in
+            // print mode: the run still exits SUCCESS, with an empty response
+            // and no file written. A scoped authoring turn is silently a no-op.
+            // Autonomy is bounded by `--mode` and the `--add-dir` grants, the
+            // same way the codex adapter bounds it with `--sandbox`.
+            args.push("--dangerously-skip-permissions".to_owned());
+        }
         if let Some(model) = &self.model {
             args.push("--model".to_owned());
             args.push(model.clone());
@@ -282,8 +324,41 @@ impl AgyInvocation {
                 self.print_timeout_secs + AGY_PRINT_TIMEOUT_SLACK_SECS
             ));
         }
-        args.push(format!("--print={}", self.objective));
+        match self.output_format {
+            // The prompt is NDJSON on stdin. Delivering it in argv caps it at
+            // the OS command-line limit — a large phase envelope failed to
+            // spawn with "The filename or extension is too long" (os error
+            // 206) before it ever reached the model.
+            AgyOutputFormat::StreamJson => {
+                args.push("--input-format".to_owned());
+                args.push("stream-json".to_owned());
+            }
+            AgyOutputFormat::Json => args.push(format!("--print={}", self.objective)),
+        }
         args
+    }
+
+    /// The single NDJSON frame delivering the prompt, for runs that read stdin.
+    /// `None` means the prompt rides in argv instead (`--output-format json`).
+    ///
+    /// agy keys stream frames on `event`, not `type`, and `message` must be an
+    /// object — a bare string is rejected as `cannot unmarshal string into Go
+    /// struct field streamInputMessage.message`.
+    pub fn stdin_frame(&self) -> Option<String> {
+        match self.output_format {
+            AgyOutputFormat::Json => None,
+            AgyOutputFormat::StreamJson => Some(format!(
+                "{}
+",
+                serde_json::json!({
+                    "event": "user",
+                    "message": {
+                        "role": "user",
+                        "content": [{ "type": "text", "text": self.objective }],
+                    },
+                })
+            )),
+        }
     }
 }
 
@@ -361,6 +436,20 @@ impl AgyResult {
             .as_deref()
             .is_some_and(|status| status.eq_ignore_ascii_case("SUCCESS"))
     }
+
+    /// Whether the payload explicitly claims failure. Missing or unknown
+    /// status values are not failures by themselves: the provider schema is
+    /// drift-tolerant, and the process exit plus final result remain the
+    /// canonical success signals.
+    fn explicitly_failed(&self) -> bool {
+        self.status
+            .as_deref()
+            .is_some_and(|status| status.eq_ignore_ascii_case("ERROR"))
+            || self
+                .error
+                .as_deref()
+                .is_some_and(|error| !error.trim().is_empty())
+    }
 }
 
 /// `init` stream event (conversation_id + model; the 58-tool inventory and
@@ -374,10 +463,71 @@ pub struct AgyInit {
     pub model: Option<String>,
 }
 
+/// `step_update` payload (the object nested under the `step_update` key of
+/// the envelope — see [`AgyStreamReducer::push_line`]). Observed
+/// `step_type` values: `user_input`, `checkpoint`, `agent_response`,
+/// `tool`; `state` runs `ACTIVE` → `DONE` | `ERROR`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 struct AgyStepUpdate {
+    step_type: Option<String>,
+    /// `ACTIVE` | `DONE` | `ERROR` on the live CLI. Typed as a raw value
+    /// because older/synthetic transcripts carry an object here — a state
+    /// we cannot read must not cost us the whole step.
+    state: Option<Value>,
     text_delta: Option<String>,
     usage: Option<AgyUsage>,
+    /// Tool identity on `step_type: "tool"` steps.
+    tool_name: Option<String>,
+    /// Free-form tool detail; summarized, never forwarded whole (F-00 §3).
+    tool_info: Option<Value>,
+}
+
+impl AgyStepUpdate {
+    /// Whether this tool step is the opening edge of a call. Tool steps
+    /// run ACTIVE -> DONE|ERROR, so only the opening edge emits and one
+    /// call stays one `ToolUse`.
+    fn is_tool_call_start(&self) -> bool {
+        !matches!(
+            self.state.as_ref().and_then(Value::as_str),
+            Some("DONE") | Some("ERROR")
+        )
+    }
+
+    /// Compact `ToolUse` summary from `tool_info`: the first few scalar
+    /// fields, truncated. Never the whole payload.
+    fn tool_summary(&self) -> String {
+        let Some(Value::Object(info)) = &self.tool_info else {
+            return self
+                .tool_info
+                .as_ref()
+                .map(|value| truncate(&value.to_string(), AGY_TOOL_SUMMARY_MAX))
+                .unwrap_or_else(|| "(no arguments)".to_owned());
+        };
+        if info.is_empty() {
+            return "(no arguments)".to_owned();
+        }
+        let parts: Vec<String> = info
+            .iter()
+            .take(3)
+            .map(|(key, value)| {
+                let text = match value {
+                    Value::String(text) => text.clone(),
+                    other => other.to_string(),
+                };
+                format!("{key}={}", truncate(&text, 60))
+            })
+            .collect();
+        truncate(&parts.join(", "), AGY_TOOL_SUMMARY_MAX)
+    }
+}
+
+fn truncate(text: &str, max: usize) -> String {
+    if text.chars().count() <= max {
+        text.to_owned()
+    } else {
+        let cut: String = text.chars().take(max).collect();
+        format!("{cut}...")
+    }
 }
 
 /// Hook for future typed provider codes. agy v1.1.18 surfaced no typed
@@ -387,6 +537,33 @@ struct AgyStepUpdate {
 /// into Billing/BotGate/Auth/Transient automatically.
 fn provider_code_from_error(_error: &str) -> Option<i64> {
     None
+}
+
+/// Whether the structured `error` field reports account quota exhaustion.
+///
+/// Observed verbatim (2026-08-22, gemini-3.1-pro-high): `"Individual quota
+/// reached. Please upgrade your subscription to increase your limits.
+/// Resets in 146h41m26s."` — with `status: ERROR` and **exit code 0**.
+/// This is a time-boxed capacity limit, i.e. exactly `Transient`: retrying
+/// after the stated window is the correct behavior, and classifying it as
+/// a task failure would make the supervisor blame the task.
+///
+/// Machine-parsed payload content, never stderr (F-00 §4).
+fn quota_exhausted(error: Option<&str>) -> bool {
+    error.is_some_and(|text| {
+        let lowered = text.to_ascii_lowercase();
+        lowered.contains("quota reached") || lowered.contains("quota exceeded")
+    })
+}
+
+/// Whether agy says the provider stream ended prematurely and explicitly
+/// invites continuation. This is infrastructure loss, not a judgement on
+/// the task, so the supervisor may safely retry it.
+fn stream_interrupted(error: Option<&str>) -> bool {
+    error.is_some_and(|text| {
+        text.to_ascii_lowercase()
+            .contains("the stream was interrupted")
+    })
 }
 
 /// Whether the structured `error` field is the observed agy headless
@@ -400,16 +577,57 @@ fn denial_observed(error: Option<&str>) -> bool {
 /// Terminal event for a finished print run from the two machine-reliable
 /// signals (exit code + result payload) plus payload-content hooks.
 ///
-/// The payload's own `status` is authoritative for success: `ERROR` is
-/// never a success regardless of exit code, and `SUCCESS` + exit 0 +
-/// result present is the F-00 §4 success conjunction.
+/// The payload's own explicit failure signals are authoritative: `ERROR` or
+/// a non-empty structured error is never success regardless of exit code.
+/// Otherwise the F-00 §4 conjunction decides (exit 0 + final result). This
+/// matters because live agy results sometimes omit or drift the optional
+/// `status` field while still returning a complete response and exit 0.
 fn terminal_event(exit_code: i32, result: Option<&AgyResult>) -> AdapterEvent {
     match result {
-        Some(result) if exit_code == 0 && result.status_is_success() => AdapterEvent::Finished {
-            exit_code,
-            final_result: result.response.clone(),
-            structured: result.structured_output.clone(),
-        },
+        // A quota window outranks the generic ladder: retryable, with the
+        // provider's own reset window preserved for the backoff policy.
+        Some(result) if quota_exhausted(result.error.as_deref()) => {
+            AdapterEvent::Failed(AdapterFailure::Transient {
+                detail: format!(
+                    "agy account quota exhausted: {}",
+                    result.error.as_deref().unwrap_or("quota reached")
+                ),
+            })
+        }
+        Some(result) if stream_interrupted(result.error.as_deref()) => {
+            AdapterEvent::Failed(AdapterFailure::Transient {
+                detail: format!(
+                    "agy provider stream interrupted: {}",
+                    result
+                        .error
+                        .as_deref()
+                        .unwrap_or("the stream was interrupted")
+                ),
+            })
+        }
+        Some(result) if Classifier::is_success(exit_code, true) && !result.explicitly_failed() => {
+            AdapterEvent::Finished {
+                exit_code,
+                final_result: result.response.clone(),
+                structured: result.structured_output.clone(),
+            }
+        }
+        // Do not feed explicit provider failure evidence into Classifier's
+        // defensive "these inputs succeeded" branch. That branch is correct
+        // for the generic two-signal contract; agy's extra payload signal is
+        // adapter-specific.
+        Some(result) if exit_code == 0 && result.explicitly_failed() => {
+            AdapterEvent::Failed(AdapterFailure::TaskFailure {
+                detail: format!(
+                    "agy result explicitly reported failure despite exit code 0: {}",
+                    result
+                        .error
+                        .as_deref()
+                        .filter(|error| !error.trim().is_empty())
+                        .unwrap_or("status ERROR")
+                ),
+            })
+        }
         _ => AdapterEvent::Failed(Classifier::classify(
             exit_code,
             result.is_some(),
@@ -450,8 +668,30 @@ impl AgyStreamReducer {
             .get("type")
             .and_then(Value::as_str)
             .or_else(|| value.get("event").and_then(Value::as_str));
+        // The live CLI NESTS each payload under a key equal to its kind
+        // (`{"event":"step_update","step_update":{...}}`), with
+        // `conversation_id` hoisted to the envelope on `init`. Flat
+        // envelopes are still accepted so older/synthetic shapes keep
+        // parsing — hence `payload()`, which prefers the nested object.
+        let payload = |kind: &str| -> Value {
+            match value.get(kind) {
+                Some(Value::Object(inner)) => {
+                    let mut merged = inner.clone();
+                    // Envelope-level fields the payload does not repeat.
+                    for hoisted in ["conversation_id", "model"] {
+                        if !merged.contains_key(hoisted) {
+                            if let Some(field) = value.get(hoisted) {
+                                merged.insert(hoisted.to_owned(), field.clone());
+                            }
+                        }
+                    }
+                    Value::Object(merged)
+                }
+                _ => value.clone(),
+            }
+        };
         match kind {
-            Some("init") => match parse_as::<AgyInit>(&value) {
+            Some("init") => match parse_as::<AgyInit>(&payload("init")) {
                 Some(init) => {
                     let event = AdapterEvent::Started {
                         session_id: init
@@ -467,12 +707,23 @@ impl AgyStreamReducer {
                 }
                 None => Vec::new(),
             },
-            Some("step_update") => match parse_as::<AgyStepUpdate>(&value) {
+            Some("step_update") => match parse_as::<AgyStepUpdate>(&payload("step_update")) {
                 Some(step) => {
                     let mut events = Vec::new();
-                    if let Some(delta) = step.text_delta {
+                    // Tool steps run ACTIVE -> DONE|ERROR; only the ACTIVE
+                    // edge emits, so one call is one ToolUse.
+                    if step.step_type.as_deref() == Some("tool") && step.is_tool_call_start() {
+                        events.push(AdapterEvent::ToolUse {
+                            tool: step
+                                .tool_name
+                                .clone()
+                                .unwrap_or_else(|| "unknown".to_owned()),
+                            args_summary: step.tool_summary(),
+                        });
+                    }
+                    if let Some(delta) = &step.text_delta {
                         if !delta.is_empty() {
-                            events.push(AdapterEvent::TextDelta(delta));
+                            events.push(AdapterEvent::TextDelta(delta.clone()));
                         }
                     }
                     if let Some(usage) = step.usage {
@@ -482,11 +733,17 @@ impl AgyStreamReducer {
                 }
                 None => Vec::new(),
             },
-            Some("result") => match parse_as::<AgyResult>(&value) {
+            Some("result") => match parse_as::<AgyResult>(&payload("result")) {
                 Some(result) => {
                     let mut events = Vec::new();
                     if let Some(usage) = &result.usage {
                         events.push(AdapterEvent::UsageUpdate(usage.to_snapshot()));
+                    }
+                    // agy has no asking tool: a plan-mode question arrives
+                    // as a fenced block in the answer text (F-02 Decision,
+                    // taught by the `decision-protocol` skill).
+                    if let Some(response) = result.response.as_deref() {
+                        events.extend(crate::decision::from_text(response));
                     }
                     self.result = Some(result);
                     events
@@ -537,6 +794,10 @@ impl AgyStreamReducer {
 fn parse_json_result(text: &str) -> Option<AgyResult> {
     let trimmed = text.trim();
     if let Ok(value) = serde_json::from_str::<Value>(trimmed) {
+        // Nested envelope first (live shape), then flat.
+        if let Some(inner) = value.get("result").filter(|inner| looks_like_result(inner)) {
+            return serde_json::from_value(inner.clone()).ok();
+        }
         if looks_like_result(&value) {
             return serde_json::from_value(value).ok();
         }
@@ -589,6 +850,10 @@ fn json_run_events(result: Option<&AgyResult>, exit_code: i32) -> Vec<AdapterEve
     }];
     if let Some(usage) = &result.usage {
         events.push(AdapterEvent::UsageUpdate(usage.to_snapshot()));
+    }
+    // Same text protocol as the streaming path (agy has no asking tool).
+    if let Some(response) = result.response.as_deref() {
+        events.extend(crate::decision::from_text(response));
     }
     events.push(terminal_event(exit_code, Some(result)));
     events
@@ -656,11 +921,9 @@ impl SessionBackend for AgySessionBackend {
             return Err(AdapterError::SessionNotActive(state.handle_id.clone()));
         }
         if state.run_active.swap(true, Ordering::Relaxed) {
-            return Err(AdapterError::Internal(
-                "an agy print run is active; deliver instructions between runs \
-                 (after the current turn's terminal event)"
-                    .to_owned(),
-            ));
+            // The session is alive, just mid-turn: the caller must wait for
+            // the terminal event, never open a second session.
+            return Err(AdapterError::Busy(state.handle_id.clone()));
         }
         let conversation = state
             .conversation_id
@@ -678,7 +941,7 @@ impl SessionBackend for AgySessionBackend {
         let mut invocation = state.base_invocation.clone();
         invocation.objective = text;
         invocation.conversation = Some(conversation);
-        match agy_command(&state.binary, &invocation).spawn() {
+        match spawn_agy_run(&state.binary, &invocation).await {
             Ok(child) => {
                 let state = state.clone();
                 let events = self.events.clone();
@@ -747,6 +1010,55 @@ impl AgyAdapter {
             sessions: Mutex::new(Vec::new()),
             models_cache: Mutex::new(None),
         }
+    }
+    /// Spawn one session from a ready invocation. Shared by
+    /// `start_session` (fresh) and `resume_session` (`--conversation <id>`).
+    async fn launch(&self, invocation: AgyInvocation) -> Result<SessionHandle, AdapterError> {
+        let binary = resolve_binary().ok_or_else(|| {
+            AdapterError::Internal(format!(
+                "agy binary not found (checked ${}, %LOCALAPPDATA%\\agy\\bin\\agy.exe, PATH)",
+                AGY_BIN_ENV
+            ))
+        })?;
+        // Spawn synchronously so machinery failures (bad cwd, missing
+        // binary) are `Result` errors, per the F-02 contract.
+        let child = spawn_agy_run(&binary, &invocation).await.map_err(|error| {
+            AdapterError::Internal(format!(
+                "failed to spawn agy in {}: {error}",
+                invocation.workspace.display()
+            ))
+        })?;
+
+        let session_no = self.next_session.fetch_add(1, Ordering::Relaxed) + 1;
+        let handle_id = format!("agy-{session_no}");
+        let (events, _) = broadcast::channel(1024);
+        let state = std::sync::Arc::new(AgySessionState {
+            handle_id: handle_id.clone(),
+            binary,
+            base_invocation: invocation.clone(),
+            conversation_id: Mutex::new(None),
+            child: tokio::sync::Mutex::new(None),
+            cancelled: AtomicBool::new(false),
+            dead: AtomicBool::new(false),
+            run_active: AtomicBool::new(true),
+        });
+        let backend = std::sync::Arc::new(AgySessionBackend {
+            state: state.clone(),
+            events: events.clone(),
+        });
+        let handle = SessionHandle::new(handle_id, events.clone(), backend);
+        self.sessions
+            .lock()
+            .expect("agy session registry poisoned")
+            .push(handle.clone());
+
+        let driver_state = state;
+        let driver_invocation = invocation;
+        let driver_events = events;
+        tokio::spawn(async move {
+            drive_print_run(driver_state, driver_invocation, driver_events, child).await;
+        });
+        Ok(handle)
     }
 
     /// The free `agy models` catalog — the authoritative model list *and*
@@ -854,52 +1166,18 @@ impl RuntimeAdapter for AgyAdapter {
     }
 
     async fn start_session(&self, spec: SpawnSpec) -> Result<SessionHandle, AdapterError> {
-        let invocation = AgyInvocation::from_spec(&spec);
-        let binary = resolve_binary().ok_or_else(|| {
-            AdapterError::Internal(format!(
-                "agy binary not found (checked ${}, %LOCALAPPDATA%\\agy\\bin\\agy.exe, PATH)",
-                AGY_BIN_ENV
-            ))
-        })?;
-        // Spawn synchronously so machinery failures (bad cwd, missing
-        // binary) are `Result` errors, per the F-02 contract.
-        let child = agy_command(&binary, &invocation).spawn().map_err(|error| {
-            AdapterError::Internal(format!(
-                "failed to spawn agy in {}: {error}",
-                invocation.workspace.display()
-            ))
-        })?;
+        self.launch(AgyInvocation::from_spec(&spec)).await
+    }
 
-        let session_no = self.next_session.fetch_add(1, Ordering::Relaxed) + 1;
-        let handle_id = format!("agy-{session_no}");
-        let (events, _) = broadcast::channel(1024);
-        let state = std::sync::Arc::new(AgySessionState {
-            handle_id: handle_id.clone(),
-            binary,
-            base_invocation: invocation.clone(),
-            conversation_id: Mutex::new(None),
-            child: tokio::sync::Mutex::new(None),
-            cancelled: AtomicBool::new(false),
-            dead: AtomicBool::new(false),
-            run_active: AtomicBool::new(true),
-        });
-        let backend = std::sync::Arc::new(AgySessionBackend {
-            state: state.clone(),
-            events: events.clone(),
-        });
-        let handle = SessionHandle::new(handle_id, events.clone(), backend);
-        self.sessions
-            .lock()
-            .expect("agy session registry poisoned")
-            .push(handle.clone());
-
-        let driver_state = state;
-        let driver_invocation = invocation;
-        let driver_events = events;
-        tokio::spawn(async move {
-            drive_print_run(driver_state, driver_invocation, driver_events, child).await;
-        });
-        Ok(handle)
+    /// Continue an earlier provider conversation: same invocation,
+    /// plus `--conversation <id>`.
+    async fn resume_session(
+        &self,
+        spec: SpawnSpec,
+        provider_session_id: String,
+    ) -> Result<SessionHandle, AdapterError> {
+        self.launch(AgyInvocation::from_spec(&spec).with_conversation(provider_session_id))
+            .await
     }
 
     async fn shutdown(&self) -> Result<(), AdapterError> {
@@ -1002,14 +1280,35 @@ async fn probe_version(binary: &Path) -> Option<String> {
     }
 }
 
+/// Spawn one print run and deliver the prompt frame on stdin when the run
+/// reads stdin. The handle is dropped after the write so the child sees EOF
+/// and begins its turn instead of blocking on more input.
+async fn spawn_agy_run(binary: &Path, invocation: &AgyInvocation) -> std::io::Result<Child> {
+    let mut child = agy_command(binary, invocation).spawn()?;
+    if let Some(frame) = invocation.stdin_frame() {
+        let mut handle = child
+            .stdin
+            .take()
+            .ok_or_else(|| std::io::Error::other("agy stdin pipe was not created"))?;
+        handle.write_all(frame.as_bytes()).await?;
+        handle.shutdown().await?;
+    }
+    Ok(child)
+}
+
 /// Assemble the child command for one print run. Argv-vector only — no
 /// shell, no string quoting (F-05 hard rule).
 fn agy_command(binary: &Path, invocation: &AgyInvocation) -> Command {
     let mut command = Command::new(binary);
+    let stdin = if invocation.stdin_frame().is_some() {
+        Stdio::piped()
+    } else {
+        Stdio::null()
+    };
     command
         .args(invocation.args())
         .current_dir(&invocation.workspace)
-        .stdin(Stdio::null())
+        .stdin(stdin)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
@@ -1308,29 +1607,116 @@ mod tests {
 
     // -- arg builder ---------------------------------------------------------
 
+    /// A stream-json run delivers the prompt on stdin. Putting it in argv
+    /// capped it at the OS command-line limit: a large phase envelope failed
+    /// to spawn with os error 206 before reaching the model.
     #[test]
-    fn arg_builder_uses_equals_form_print_and_prefers_stream_json() {
-        let invocation = AgyInvocation::from_spec(&spec(
-            "fix the flaky test -- and run it \"twice\"",
-            vec![],
-            600,
-        ));
+    fn stream_json_runs_deliver_the_prompt_on_stdin_not_argv() {
+        let objective = "fix the flaky test -- and run it \"twice\"";
+        let invocation = AgyInvocation::from_spec(&spec(objective, vec![], 600));
+        assert_eq!(invocation.output_format, AgyOutputFormat::StreamJson);
         let args = invocation.args();
 
-        assert_eq!(
-            args.last(),
-            Some(&"--print=fix the flaky test -- and run it \"twice\"".to_owned()),
-            "prompt must be one argv element in equals form (variadic canon)"
+        assert!(
+            !args.iter().any(|arg| arg.starts_with("--print=")),
+            "prompt must not ride in argv: {args:?}"
         );
-        // Tail order: --add-dir <ws> --print-timeout <duration> --print=<objective>.
-        assert_eq!(args[args.len() - 2], "630s");
-        assert_eq!(args[args.len() - 3], "--print-timeout");
-        assert_eq!(args[args.len() - 4], "worktrees/task-agy");
-        assert_eq!(args[args.len() - 5], "--add-dir");
+        assert!(!args.iter().any(|arg| arg.contains(objective)));
+        assert_eq!(args[args.len() - 2], "--input-format");
+        assert_eq!(args[args.len() - 1], "stream-json");
         assert!(args.contains(&"--output-format".to_owned()));
-        assert!(args.contains(&"stream-json".to_owned()));
-        // No bare "--print" separate-value form anywhere.
+
+        // agy keys frames on `event`, and `message` must be an object.
+        let frame = invocation
+            .stdin_frame()
+            .expect("stream-json run reads stdin");
+        assert!(frame.ends_with('\n'), "frame must be one NDJSON line");
+        let parsed: Value = serde_json::from_str(frame.trim()).expect("valid NDJSON");
+        assert_eq!(parsed["event"], "user");
+        assert_eq!(parsed["message"]["role"], "user");
+        assert_eq!(parsed["message"]["content"][0]["type"], "text");
+        assert_eq!(parsed["message"]["content"][0]["text"], objective);
+
+        // An envelope far past the OS cap changes argv not at all.
+        let mut huge = invocation.clone();
+        huge.objective = "x".repeat(200 * 1024);
+        let huge_args = huge.args();
+        assert_eq!(huge_args, args, "argv must not grow with the prompt");
+        let budget: usize = huge_args.iter().map(|arg| arg.len() + 1).sum();
+        assert!(budget < 32_767, "argv must stay under the OS cap: {budget}");
+    }
+
+    /// A write turn must auto-approve tool permissions. Without it agy runs at
+    /// `permission_mode=request-review`, no tool executes, and the run reports
+    /// SUCCESS with an empty response and no deliverable — the exact signature
+    /// that stalled Phase 6.
+    #[test]
+    fn write_mode_bypasses_permission_prompts_and_plan_mode_does_not() {
+        let write = AgyInvocation::from_spec(&spec(
+            "author the design doc",
+            vec!["worktrees/task-agy/docs/DESIGN.md".to_owned()],
+            600,
+        ));
+        assert_eq!(write.mode, AgyMode::AcceptEdits);
+        assert!(
+            write
+                .args()
+                .contains(&"--dangerously-skip-permissions".to_owned()),
+            "a scoped write turn would silently no-op: {:?}",
+            write.args()
+        );
+
+        let mut plan = write.clone();
+        plan.mode = AgyMode::Plan;
+        assert!(
+            !plan
+                .args()
+                .contains(&"--dangerously-skip-permissions".to_owned()),
+            "read-only planning must not auto-approve tools"
+        );
+    }
+
+    /// `--dangerously-skip-permissions` lifts the terminal restriction as well
+    /// as the write one — verified by a shell-only command creating a file on
+    /// disk. agy cannot deny tools individually, so a turn whose caller denies
+    /// shell must carry `--sandbox`, which was verified to stop that same
+    /// command while leaving file writes working.
+    #[test]
+    fn a_turn_that_denies_shell_is_sandboxed() {
+        let mut authoring = spec(
+            "author the design doc",
+            vec!["worktrees/task-agy/docs/DESIGN.md".to_owned()],
+            600,
+        );
+        authoring.tool_denylist = vec!["Bash".to_owned(), "PowerShell".to_owned()];
+        let guarded = AgyInvocation::from_spec(&authoring);
+        assert!(guarded.sandbox);
+        let args = guarded.args();
+        assert!(args.contains(&"--sandbox".to_owned()));
+        assert!(args.contains(&"--dangerously-skip-permissions".to_owned()));
+
+        // A turn that never denied shell keeps it: build tasks legitimately
+        // run commands, and --sandbox fails them silently.
+        let open = AgyInvocation::from_spec(&spec(
+            "run the build",
+            vec!["worktrees/task-agy/src".to_owned()],
+            600,
+        ));
+        assert!(!open.sandbox);
+        assert!(!open.args().contains(&"--sandbox".to_owned()));
+    }
+
+    /// `--output-format json` has no stdin channel, so it keeps the verified
+    /// variadic-safe equals form.
+    #[test]
+    fn json_runs_keep_the_equals_form_print_argument() {
+        let mut invocation = AgyInvocation::from_spec(&spec("summarize the repo", vec![], 600));
+        invocation.output_format = AgyOutputFormat::Json;
+        let args = invocation.args();
+
+        assert_eq!(args.last(), Some(&"--print=summarize the repo".to_owned()));
         assert!(!args.iter().any(|arg| arg == "--print"));
+        assert!(invocation.stdin_frame().is_none());
     }
 
     #[test]
@@ -1456,6 +1842,7 @@ mod tests {
             workspace: PathBuf::from("wt"),
             extra_dirs: vec![PathBuf::from("extra")],
             mode: AgyMode::AcceptEdits,
+            sandbox: false,
             output_format: AgyOutputFormat::Json,
             model: Some("gemini-3.1-pro".to_owned()),
             effort: Some(AgyEffort::High),
@@ -1470,6 +1857,7 @@ mod tests {
                 "accept-edits",
                 "--output-format",
                 "json",
+                "--dangerously-skip-permissions",
                 "--model",
                 "gemini-3.1-pro",
                 "--effort",
@@ -1566,6 +1954,250 @@ mod tests {
     }
 
     // -- stream-json parser --------------------------------------------------
+
+    /// agy exposes no asking tool, so a plan-mode question rides in the
+    /// answer text as a fenced block (the `decision-protocol` skill teaches
+    /// the shape). The reducer lifts it into a `Decision` at result time,
+    /// before the terminal event, so the desktop gets its buttons.
+    #[test]
+    fn result_text_carrying_a_fenced_ask_becomes_a_decision() {
+        let mut reducer = AgyStreamReducer::default();
+        let response = "I need one call first.\n\n```json\n            {\"ask\": {\"question\": \"Which database?\",             \"options\": [\"Postgres\", \"SQLite\"]}}\n```";
+        let line = json!({
+            "type": "result",
+            "conversation_id": "conv-ask-1",
+            "status": "SUCCESS",
+            "response": response,
+            "error": null,
+            "structured_output": null,
+        })
+        .to_string();
+
+        let events = reducer.push_line(&line);
+        let kinds: Vec<&str> = events.iter().map(AdapterEvent::kind).collect();
+        assert_eq!(kinds, vec!["decision"], "usage is absent in this line");
+        match &events[0] {
+            AdapterEvent::Decision {
+                tool,
+                prompt,
+                options,
+                multi_select,
+            } => {
+                assert_eq!(tool, "ask");
+                assert_eq!(prompt, "Which database?");
+                assert_eq!(options, &["Postgres".to_owned(), "SQLite".to_owned()]);
+                assert!(!multi_select);
+            }
+            other => panic!("expected Decision, got {other:?}"),
+        }
+        assert!(
+            reducer
+                .push_line(
+                    &json!({"type": "result", "status": "SUCCESS",
+                "response": "Plain answer, no block."})
+                    .to_string()
+                )
+                .is_empty(),
+            "ordinary answers are not decisions"
+        );
+    }
+
+    // -- frozen LIVE transcripts (cli-agy-output/<stamp>/fixtures) --------
+    //
+    // F-05 shipped against synthetic FLAT fixtures; the real CLI nests each
+    // payload under a key equal to its kind. These tests exist so that can
+    // never regress unnoticed again.
+
+    fn live_fixture(name: &str) -> Option<String> {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../cli-agy-output");
+        let mut runs: Vec<_> = std::fs::read_dir(root)
+            .ok()?
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .collect();
+        runs.sort();
+        std::fs::read_to_string(runs.last()?.join("fixtures").join(name)).ok()
+    }
+
+    /// The live envelope, end to end: nested payloads, the conversation id
+    /// hoisted onto `init`, streamed text fragments, one ToolUse per tool
+    /// call, usage, and a parsed result. Before the fix this transcript
+    /// produced exactly one event (`Started`) — no text, no result, no
+    /// resume handle.
+    #[test]
+    fn the_live_envelope_maps_to_events() {
+        let Some(transcript) = live_fixture("agy.A1-tool-retries.stdout.jsonl") else {
+            eprintln!("agy live fixture corpus unavailable; skipping");
+            return;
+        };
+        let mut reducer = AgyStreamReducer::default();
+        let events: Vec<AdapterEvent> = transcript
+            .lines()
+            .flat_map(|line| reducer.push_line(line))
+            .collect();
+
+        match events.first().expect("init maps first") {
+            AdapterEvent::Started { session_id, model } => {
+                assert!(
+                    !session_id.is_empty() && session_id != "unknown",
+                    "conversation_id is hoisted onto the envelope: {session_id}"
+                );
+                assert_eq!(
+                    model.as_deref(),
+                    Some("claude-sonnet-4-6"),
+                    "model is nested inside `init`"
+                );
+            }
+            other => panic!("expected Started, got {other:?}"),
+        }
+        assert!(
+            events.iter().any(
+                |event| matches!(event, AdapterEvent::TextDelta(text) if !text.trim().is_empty())
+            ),
+            "text_delta fragments must reach the stream"
+        );
+        let tool_uses: Vec<&str> = events
+            .iter()
+            .filter_map(|event| match event {
+                AdapterEvent::ToolUse { tool, .. } => Some(tool.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            tool_uses,
+            vec!["find_by_name", "find_by_name", "find_by_name"],
+            "one ToolUse per ACTIVE edge; DONE/ERROR edges must not double-count"
+        );
+        assert!(
+            events.iter().any(
+                |event| matches!(event, AdapterEvent::UsageUpdate(usage) if usage.input_tokens > 0)
+            ),
+            "usage rides DONE steps and the result"
+        );
+
+        let result = reducer.result().expect("the result payload parses");
+        assert!(reducer.conversation_id().is_some(), "resume handle learned");
+        assert!(
+            result
+                .response
+                .as_deref()
+                .is_some_and(|text| !text.trim().is_empty()),
+            "the response text is what the daemon reports as finalResult"
+        );
+    }
+
+    /// Observed on both captured ERROR runs: agy reports `status: ERROR`
+    /// while exiting **0**, contradicting the synthetic canon's
+    /// "ERROR → exit 2". The payload's status is authoritative (F-00 §4),
+    /// so the terminal event must be a failure even on a clean exit.
+    #[test]
+    fn an_error_status_with_exit_zero_is_still_a_failure() {
+        let Some(transcript) = live_fixture("agy.A1-tool-retries.stdout.jsonl") else {
+            eprintln!("agy live fixture corpus unavailable; skipping");
+            return;
+        };
+        let mut reducer = AgyStreamReducer::default();
+        for line in transcript.lines() {
+            reducer.push_line(line);
+        }
+        let result = reducer.result().expect("result parses");
+        assert_eq!(result.status.as_deref(), Some("ERROR"));
+        assert!(
+            !matches!(reducer.finish(0), AdapterEvent::Finished { .. }),
+            "an ERROR payload never finishes successfully, whatever the exit code"
+        );
+    }
+
+    /// A quota window is retryable, not a task failure — and the
+    /// provider's own reset time survives into the detail so the backoff
+    /// policy can use it. Text observed verbatim on 2026-08-22.
+    #[test]
+    fn a_quota_window_is_transient_with_its_reset_time() {
+        let result = AgyResult {
+            conversation_id: Some("conv-quota".to_owned()),
+            status: Some("ERROR".to_owned()),
+            response: Some(String::new()),
+            error: Some(
+                "Individual quota reached. Please upgrade your subscription to \
+                 increase your limits. Resets in 146h41m26s."
+                    .to_owned(),
+            ),
+            usage: None,
+            structured_output: None,
+        };
+        // Exit 0 — the observed combination, which the generic ladder
+        // would otherwise read as "succeeded".
+        match terminal_event(0, Some(&result)) {
+            AdapterEvent::Failed(failure) => {
+                assert!(failure.is_retryable(), "quota windows retry: {failure:?}");
+                assert!(
+                    format!("{failure:?}").contains("146h41m26s"),
+                    "the reset window is preserved: {failure:?}"
+                );
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
+    }
+
+    /// The quota path against a REAL transcript (gpt-oss-120b-medium,
+    /// exit 1): the reducer must reach the quota classification, not the
+    /// generic ladder. Exit code varies (0 and 1 both observed), so the
+    /// payload error is what decides.
+    #[test]
+    fn a_real_quota_transcript_classifies_as_transient() {
+        let Some(transcript) = live_fixture("agy.A4-quota-exhausted.stdout.jsonl") else {
+            eprintln!("agy live fixture corpus unavailable; skipping");
+            return;
+        };
+        let mut reducer = AgyStreamReducer::default();
+        for line in transcript.lines() {
+            reducer.push_line(line);
+        }
+        let result = reducer.result().expect("result payload parses");
+        assert!(result.error.as_deref().is_some_and(|e| e.contains("quota")));
+        match reducer.finish(1) {
+            AdapterEvent::Failed(failure) => assert!(
+                failure.is_retryable(),
+                "a quota window is retryable whatever the exit code: {failure:?}"
+            ),
+            other => panic!("expected Failed, got {other:?}"),
+        }
+    }
+
+    /// agy's `ask_question` / `ask_permission` tools exist in the init
+    /// inventory but are auto-skipped headless — no tool step ever reaches
+    /// the stream. That is why decisions on agy ride the text protocol
+    /// (`decision::from_text`) instead of a tool surface.
+    #[test]
+    fn headless_ask_tools_never_reach_the_stream() {
+        let Some(transcript) = live_fixture("agy.A3-ask-question-skipped.stdout.jsonl") else {
+            eprintln!("agy live fixture corpus unavailable; skipping");
+            return;
+        };
+        let mut reducer = AgyStreamReducer::default();
+        let events: Vec<AdapterEvent> = transcript
+            .lines()
+            .flat_map(|line| reducer.push_line(line))
+            .collect();
+        assert!(
+            !events.iter().any(|event| matches!(
+                event,
+                AdapterEvent::ToolUse { tool, .. } if tool.starts_with("ask_")
+            )),
+            "no ask_* tool step is observable headless"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, AdapterEvent::Decision { .. })),
+            "and the model's prose is not a decision either"
+        );
+        let inventory = transcript.lines().next().expect("init line");
+        assert!(
+            inventory.contains("ask_question"),
+            "the tool IS in the inventory; it is the headless path that skips it"
+        );
+    }
 
     #[test]
     fn stream_reducer_maps_init_step_and_result_events() {
@@ -1691,6 +2323,58 @@ mod tests {
         let cases: Vec<Case> = vec![
             // SUCCESS + exit 0 + result present: the F-00 §4 conjunction.
             ((0, Some(synth_result("SUCCESS", None))), None),
+            // Live regression: agy can omit or drift the optional status even
+            // though it exits 0 with a complete final result. The generic
+            // success conjunction must still win when no explicit failure is
+            // present.
+            (
+                (
+                    0,
+                    Some(AgyResult {
+                        conversation_id: Some("conv-missing-status".to_owned()),
+                        status: None,
+                        response: Some("VERDICT: FAIL\nreal review text".to_owned()),
+                        error: None,
+                        usage: None,
+                        structured_output: None,
+                    }),
+                ),
+                None,
+            ),
+            // Observed live while replaying Phase 9: the provider asks the
+            // caller to continue after an interrupted stream. That is
+            // retryable infrastructure loss, not a permanent task failure.
+            (
+                (
+                    0,
+                    Some(AgyResult {
+                        conversation_id: Some("conv-interrupted".to_owned()),
+                        status: None,
+                        response: None,
+                        error: Some(
+                            "The stream was interrupted. Please continue the task you were working on."
+                                .to_owned(),
+                        ),
+                        usage: None,
+                        structured_output: None,
+                    }),
+                ),
+                Some("transient"),
+            ),
+            (
+                (
+                    0,
+                    Some(AgyResult {
+                        conversation_id: Some("conv-drifted-status".to_owned()),
+                        status: Some("COMPLETED".to_owned()),
+                        response: Some("done".to_owned()),
+                        error: None,
+                        usage: None,
+                        structured_output: None,
+                    }),
+                ),
+                None,
+            ),
             // agy ERROR shape: exit 2 with the result event present → the
             // model round-tripped and failed on its own merits.
             (

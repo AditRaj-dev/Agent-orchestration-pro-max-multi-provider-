@@ -1,5 +1,31 @@
 /target
+target-routing-test/
 *.log
+.run-workspace/
+*.tsbuildinfo
+
+# Local daemon/runtime state
+.agentos/
+state/
+*.db
+*.db-shm
+*.db-wal
+
+# Local credentials and environment overrides
+.env
+.env.*
+!.env.example
+
+# Session-local investigation and handoff artifacts
+/CODEX_HANDOFF.md
+/DEFECT_FIXES_HANDOFF.md
+/handoff.md
+/subagent.md
+/q.mjs
+/est-*.mjs
+/est-*.txt
+/docs/HANDOFF-SESSION-*.md
+/docs/New Text Document.txt
 
 # F-11 desktop app (apps/desktop)
 node_modules/
@@ -7,3 +33,7 @@ apps/desktop/node_modules/
 apps/desktop/dist/
 apps/desktop/src-tauri/target/
 apps/desktop/src-tauri/gen/
+
+# Code-graph / analysis tool output; never a project deliverable
+graphify-out/
+**/graphify-out/

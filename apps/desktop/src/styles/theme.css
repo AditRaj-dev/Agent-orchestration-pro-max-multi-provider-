@@ -1,0 +1,369 @@
+/* MiniMax Design System Tokens (docs/DESIGN.md) */
+
+:root {
+  /* Surface & Canvas */
+  --colors-canvas: #ffffff;
+  --colors-surface: #f6f7f9;
+  --colors-surface-soft: #fafbfc;
+  --colors-surface-subtle: #f1f3f5;
+  --colors-hairline: #e5e7eb;
+  --colors-hairline-soft: #f0f1f3;
+
+  /* Typography / Inks */
+  --colors-ink: #111827;
+  --colors-ink-strong: #0a0a0c;
+  --colors-charcoal: #374151;
+  --colors-slate: #55606f;
+  --colors-steel: #5b6673;
+  --colors-stone: #6b7280;
+  --colors-muted: #6b7280;
+  --colors-on-dark: #ffffff;
+  --colors-on-primary: #ffffff;
+
+  /* Saturated Brand Accents (Identity Moments) */
+  --colors-brand-coral: #ff4d36;
+  --colors-brand-coral-hover: #e8402a;
+  --colors-brand-coral-soft: rgba(255, 77, 54, 0.08);
+  --colors-brand-magenta: #d92672;
+  --colors-brand-magenta-soft: rgba(217, 38, 114, 0.08);
+  --colors-brand-blue: #2563eb;
+  --colors-brand-blue-deep: #1d4ed8;
+  --colors-brand-blue-700: #1e40af;
+  --colors-brand-blue-200: #dbeafe;
+  --colors-brand-cyan: #06b6d4;
+  --colors-brand-purple: #7c3aed;
+  --colors-brand-purple-deep: #6d28d9;
+  --colors-brand-purple-soft: rgba(124, 58, 237, 0.08);
+
+  /* Primary action anchor — the black pill (DESIGN.md `button-primary`) */
+  --colors-primary: #0a0a0c;
+  --colors-primary-pressed: #374151;
+  --colors-footer-bg: #0a0a0c;
+
+  /* Semantic Status */
+  --colors-success-bg: #ecfdf5;
+  --colors-success-text: #047857;
+  --colors-success-border: #a7f3d0;
+
+  --colors-warning-bg: #fffbeb;
+  --colors-warning-text: #b45309;
+  --colors-warning-border: #fde68a;
+
+  --colors-error-bg: #fef2f2;
+  --colors-error-text: #b91c1c;
+  --colors-error-border: #d45656;
+
+  /* Elevation & Depth */
+  --shadow-0: none;
+  --shadow-1: 0 1px 2px 0 rgba(0, 0, 0, 0.04);
+  --shadow-2: 0 4px 6px -1px rgba(0, 0, 0, 0.07), 0 2px 4px -2px rgba(0, 0, 0, 0.04);
+  --shadow-3: 0 0 22px 0 rgba(0, 0, 0, 0.08);
+  --shadow-4: 0 12px 24px -4px rgba(17, 24, 39, 0.12), 0 4px 8px -2px rgba(17, 24, 39, 0.06);
+  --shadow-card-elevated: 0 10px 30px -5px rgba(0, 0, 0, 0.08);
+  --shadow-glow-purple: 0 0 20px rgba(124, 58, 237, 0.25);
+  --shadow-glow-coral: 0 0 20px rgba(255, 77, 54, 0.25);
+
+  /* Border Radius Scale */
+  --rounded-xs: 4px;
+  --rounded-sm: 6px;
+  --rounded-md: 8px;
+  --rounded-lg: 12px;
+  --rounded-xl: 16px;
+  --rounded-xxl: 20px;
+  --rounded-xxxl: 24px;
+  --rounded-hero: 32px;
+  --rounded-full: 9999px;
+
+  /* Legacy Radius Aliases */
+  --radius-xs: var(--rounded-xs);
+  --radius-sm: var(--rounded-sm);
+  --radius-md: var(--rounded-md);
+  --radius-lg: var(--rounded-lg);
+  --radius-xl: var(--rounded-xl);
+  --radius-hero: var(--rounded-hero);
+  --radius-full: var(--rounded-full);
+
+  /* Spacing Scale */
+  --spacing-xxs: 4px;
+  --spacing-xs: 8px;
+  --spacing-sm: 12px;
+  --spacing-md: 16px;
+  --spacing-lg: 20px;
+  --spacing-xl: 24px;
+  --spacing-xxl: 32px;
+  --spacing-xxxl: 40px;
+  --spacing-section-sm: 48px;
+  --spacing-section: 64px;
+  --spacing-section-lg: 80px;
+  --spacing-hero: 96px;
+
+  /* Typography */
+  --font-sans: "DM Sans", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, system-ui, sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+
+  /* Type scale (DESIGN.md §Typography). A dense desktop tool runs one step
+     below the marketing surfaces, so `body-sm` is the app's base — but the
+     ratios, weights and leading are the published ones. */
+  --text-micro: 12px;
+  --text-caption: 13px;
+  --text-body-sm: 14px;
+  --text-body-md: 16px;
+  --text-subtitle: 18px;
+  --text-card-title: 20px;
+  --text-heading-sm: 24px;
+  --text-heading-md: 32px;
+  --text-heading-lg: 40px;
+
+  --leading-tight: 1.25;
+  --leading-body: 1.5;
+  --leading-prose: 1.6;
+  --leading-caption: 1.7;
+
+  --weight-regular: 400;
+  --weight-medium: 500;
+  --weight-semibold: 600;
+  --weight-bold: 700;
+
+  --tracking-eyebrow: 0.14em;
+  --tracking-tight: -0.01em;
+  --tracking-display: -0.025em;
+
+  /* Accent washes and hairlines.
+     Three steps per accent — wash (fill), line (border), solid (ink) — so a
+     component states its intent instead of inlining an alpha that only ever
+     read correctly against one theme's canvas. */
+  --accent-purple-wash: rgba(124, 58, 237, 0.07);
+  --accent-purple-line: rgba(124, 58, 237, 0.28);
+  --accent-purple-ink: var(--colors-brand-purple-deep);
+
+  --accent-blue-wash: rgba(37, 99, 235, 0.07);
+  --accent-blue-line: rgba(37, 99, 235, 0.28);
+  --accent-blue-ink: var(--colors-brand-blue-deep);
+
+  --accent-green-wash: rgba(5, 150, 105, 0.08);
+  --accent-green-line: rgba(5, 150, 105, 0.32);
+  --accent-green-ink: #047857;
+
+  --accent-cyan-wash: rgba(6, 182, 212, 0.10);
+  --accent-cyan-ink: #0e7490;
+
+  --accent-amber-wash: rgba(217, 119, 6, 0.10);
+  --accent-amber-ink: #b45309;
+
+  --accent-red-wash: rgba(185, 28, 28, 0.08);
+  --accent-red-ink: #b91c1c;
+
+  /* Layout dimensions */
+  --sidebar-width: 240px;
+  --header-height: 60px;
+
+  /* Compatibility & Legacy Aliases (mapped to MiniMax palette) */
+  --bg-app: #f9fafb;
+  --bg-panel: var(--colors-canvas);
+  --bg-card: var(--colors-canvas);
+  --bg-card-hover: var(--colors-surface);
+  --bg-input: var(--colors-canvas);
+  --bg-overlay: rgba(17, 24, 39, 0.4);
+
+  --border-subtle: var(--colors-hairline-soft);
+  --border-default: var(--colors-hairline);
+  --border-focus: var(--colors-brand-blue-deep);
+  --border-accent: var(--colors-brand-purple);
+
+  --text-primary: var(--colors-ink);
+  --text-secondary: var(--colors-charcoal);
+  --text-muted: var(--colors-slate);
+  --text-code: var(--colors-brand-purple-deep);
+
+  --accent-purple: var(--colors-brand-purple);
+  --accent-blue: var(--colors-brand-blue);
+  --accent-cyan: var(--colors-brand-cyan);
+  --accent-amber: var(--accent-amber-ink);
+  --accent-green: var(--accent-green-ink);
+  --accent-red: var(--colors-error-text);
+  --accent-gray: var(--colors-slate);
+
+  --status-running: var(--colors-brand-blue);
+  --status-complete: var(--accent-green-ink);
+  --status-done: var(--accent-green-ink);
+  --status-failed: var(--colors-error-text);
+  --status-waiting: var(--accent-amber-ink);
+  --status-pending: var(--accent-amber-ink);
+  --status-human-required: var(--accent-amber-ink);
+  --status-reviewing: var(--colors-brand-purple);
+  --status-planning: var(--accent-cyan-ink);
+  --status-idle: var(--colors-slate);
+  --status-blocked: var(--colors-error-text);
+}
+
+/* ==========================================================================
+   Dark Mode Tokens (MiniMax Obsidian Dark Theme)
+   ========================================================================== */
+/* Declared on the root only. Tokens split across :root and body meant a
+   theme swap had to invalidate custom properties inherited *through* body,
+   which Chromium does not do reliably for already-painted elements. */
+:root[data-theme="dark"] {
+  /* Surface & Canvas */
+  --colors-canvas: #0d1117;
+  --colors-surface: #161b22;
+  --colors-surface-soft: #1c2128;
+  --colors-surface-subtle: #21262d;
+  --colors-hairline: #30363d;
+  --colors-hairline-soft: #21262d;
+
+  /* Typography / Inks */
+  --colors-ink: #f0f6fc;
+  --colors-ink-strong: #ffffff;
+  --colors-charcoal: #c9d1d9;
+  --colors-slate: #9aa4ae;
+  --colors-steel: #8b949e;
+  --colors-stone: #7d8590;
+  --colors-muted: #8b949e;
+  --colors-on-dark: #ffffff;
+  --colors-on-primary: #0d1117;
+
+  /* Saturated Brand Accents */
+  --colors-brand-coral: #ff5c47;
+  --colors-brand-coral-hover: #ff705c;
+  --colors-brand-coral-soft: rgba(255, 92, 71, 0.16);
+  --colors-brand-magenta: #e83a84;
+  --colors-brand-magenta-soft: rgba(232, 58, 132, 0.16);
+  --colors-brand-blue: #3b82f6;
+  --colors-brand-blue-deep: #60a5fa;
+  --colors-brand-blue-700: #93c5fd;
+  --colors-brand-blue-200: rgba(59, 130, 246, 0.2);
+  --colors-brand-cyan: #22d3ee;
+  --colors-brand-purple: #8b5cf6;
+  --colors-brand-purple-deep: #a78bfa;
+  --colors-brand-purple-soft: rgba(139, 92, 246, 0.16);
+
+  /* The black pill inverts against the obsidian canvas so the primary CTA
+     stays the highest-contrast control in the view. */
+  --colors-primary: #f0f6fc;
+  --colors-primary-pressed: #c9d1d9;
+  --colors-footer-bg: #010409;
+
+  /* Accents need more alpha to register against the obsidian canvas. */
+  --accent-purple-wash: rgba(139, 92, 246, 0.10);
+  --accent-purple-line: rgba(139, 92, 246, 0.34);
+  --accent-purple-ink: #b6aaff;
+
+  --accent-blue-wash: rgba(59, 130, 246, 0.10);
+  --accent-blue-line: rgba(59, 130, 246, 0.34);
+  --accent-blue-ink: #a8c8ff;
+
+  --accent-green-wash: rgba(63, 182, 139, 0.10);
+  --accent-green-line: rgba(63, 182, 139, 0.40);
+  --accent-green-ink: #7ddbab;
+
+  --accent-cyan-wash: rgba(34, 211, 238, 0.12);
+  --accent-cyan-ink: #67e8f9;
+
+  --accent-amber-wash: rgba(245, 158, 11, 0.12);
+  --accent-amber-ink: #fbbf24;
+
+  --accent-red-wash: rgba(248, 113, 113, 0.12);
+  --accent-red-ink: #f87171;
+
+  /* Semantic Status */
+  --colors-success-bg: rgba(16, 185, 129, 0.15);
+  --colors-success-text: #34d399;
+  --colors-success-border: rgba(16, 185, 129, 0.35);
+
+  --colors-warning-bg: rgba(245, 158, 11, 0.15);
+  --colors-warning-text: #fbbf24;
+  --colors-warning-border: rgba(245, 158, 11, 0.35);
+
+  --colors-error-bg: rgba(239, 68, 68, 0.15);
+  --colors-error-text: #f87171;
+  --colors-error-border: rgba(239, 68, 68, 0.35);
+
+  /* Elevation & Shadows */
+  --shadow-1: 0 1px 3px 0 rgba(0, 0, 0, 0.4);
+  --shadow-2: 0 4px 12px 0 rgba(0, 0, 0, 0.5);
+  --shadow-3: 0 0 24px 0 rgba(0, 0, 0, 0.6);
+  --shadow-4: 0 16px 32px -4px rgba(0, 0, 0, 0.7);
+
+  /* Compatibility & Legacy Aliases */
+  --bg-app: #080c10;
+  --bg-panel: var(--colors-surface);
+  --bg-card: var(--colors-surface);
+  --bg-card-hover: var(--colors-surface-soft);
+  --bg-input: #080c10;
+  --bg-overlay: rgba(0, 0, 0, 0.7);
+
+  --border-subtle: var(--colors-hairline-soft);
+  --border-default: var(--colors-hairline);
+  --border-focus: var(--colors-brand-blue);
+  --border-accent: var(--colors-brand-purple);
+
+  --text-primary: var(--colors-ink);
+  --text-secondary: var(--colors-charcoal);
+  --text-muted: var(--colors-slate);
+  --text-code: var(--colors-brand-purple-deep);
+
+  --accent-amber: var(--accent-amber-ink);
+  --accent-green: var(--accent-green-ink);
+  --accent-red: var(--accent-red-ink);
+  --accent-cyan: var(--colors-brand-cyan);
+  --accent-blue: var(--colors-brand-blue-deep);
+  --accent-purple: var(--colors-brand-purple-deep);
+
+  --status-running: var(--colors-brand-blue-deep);
+  --status-complete: var(--accent-green-ink);
+  --status-done: var(--accent-green-ink);
+  --status-failed: var(--colors-error-text);
+  --status-waiting: var(--accent-amber-ink);
+  --status-pending: var(--accent-amber-ink);
+  --status-human-required: var(--accent-amber-ink);
+  --status-reviewing: var(--colors-brand-purple-deep);
+  --status-planning: var(--accent-cyan-ink);
+  --status-idle: var(--colors-slate);
+  --status-blocked: var(--colors-error-text);
+}
+
+
+/* Held for the single frame in which the theme swaps. Without it a running
+   colour transition keeps interpolating toward the value the old palette
+   resolved, and the element never reaches the new one. */
+:root.theme-swapping,
+:root.theme-swapping *,
+:root.theme-swapping *::before,
+:root.theme-swapping *::after {
+  transition: none !important;
+}
+
+* {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+html, body, #root {
+  height: 100%;
+  width: 100%;
+  overflow: hidden;
+  background-color: var(--bg-app);
+  color: var(--colors-ink);
+  font-family: var(--font-sans);
+  font-size: var(--text-body-sm);
+  line-height: var(--leading-body);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+/* Custom Sleek Scrollbars */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: var(--colors-hairline);
+  border-radius: var(--rounded-full);
+}
+::-webkit-scrollbar-thumb:hover {
+  background: var(--colors-steel);
+}

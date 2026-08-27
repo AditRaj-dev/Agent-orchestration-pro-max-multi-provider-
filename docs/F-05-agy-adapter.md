@@ -67,6 +67,45 @@ Envelope: the kind is read from `type` with `event` as fallback — the observed
   - `denial` — the structured `error` field containing the observed `"user denied permission"` string (accept-edits denying shell headless) → `PolicyDenial`. This is machine-parsed payload content, not stderr scraping.
 - The payload's `status` outranks the exit code: `ERROR` is never a success even at exit 0; `SUCCESS` at non-zero exit is still a failed run.
 
+## 3a. LIVE envelope correction (2026-08-22)
+
+F-05 shipped against **synthetic flat fixtures**; the real CLI **nests every payload under a key equal to its kind**, so the reducer parsed nothing on a real run — no text, no result, no conversation id, every agy session terminal-failing. Found by the first live agent-builder e2e; fixed and pinned against frozen real transcripts (`cli-agy-output/2026-08-22T17-44-06-000Z/fixtures`).
+
+Real shapes:
+
+- `{"event":"init","conversation_id":"<id>","init":{"model":...,"cwd":...,"tools":[...],"permission_mode":...}}` — id hoisted to the envelope, model nested.
+- `{"event":"step_update","step_update":{conversation_id, step_index, state, step_type, text_delta?, usage?, tool_name?, tool_info?}}` — `step_type` is `user_input` | `checkpoint` | `agent_response` | `tool`; `state` runs `ACTIVE` → `DONE` | `ERROR`. Tool steps now map to one `ToolUse` per ACTIVE edge (previously agy emitted **no** tool events at all).
+- `{"event":"result","result":{conversation_id,status,response,error,duration_seconds,num_turns,usage}}`.
+
+The parser accepts the flat shape as a fallback, so older transcripts still reduce.
+
+Two further corrections to the synthetic canon, both observed three times:
+
+1. **`status: ERROR` does NOT imply exit 2** — every captured ERROR run exited **0**. The payload status is authoritative (F-00 §4); the terminal event must fail on it regardless of exit code.
+2. **Quota exhaustion is its own class.** Observed verbatim: `Individual quota reached. Please upgrade your subscription to increase your limits. Resets in 146h41m26s.` (gemini-3.1-pro-high, ERROR + exit 0). It now classifies as **Transient (retryable)** with the reset window preserved in the detail, instead of an opaque task failure.
+
+## 3b. Plan-mode decisions (no asking tool)
+
+agy's init inventory *does* list `ask_question`, `ask_permission` and
+`ask_custom_permission` — but headless they are **auto-skipped**: no tool
+step reaches the stream and the model simply reports that the question was
+skipped (fixture `agy.A3-ask-question-skipped`). There is no asking surface
+to lift a question out of. Plan-mode options therefore ride
+in the answer text as a fenced JSON block, which the reducer turns into
+`AdapterEvent::Decision` at `result` time (both the stream-json and plain
+`--json` paths), before the terminal event:
+
+```json
+{"ask": {"question": "Which database?", "options": ["Postgres", "SQLite"], "multiSelect": false}}
+```
+
+Parsing lives in `agentos-adapters/src/decision.rs` (shared with F-03 claude
+and, later, F-04 codex). It is tolerant by construction: a block that does
+not parse, carries no options, or is still half-streamed is simply not a
+decision — a malformed ask never fails a session. The emitting side is the
+`decision-protocol` skill (F-13), held by every agy-backed built-in agent;
+without that skill the model never emits the block and the feature is inert.
+
 ## 4. Virtualized filesystem and the `--add-dir` rule
 
 CRITICAL observed semantic that differs from Claude/Codex: **in print mode, agy writes are virtualized** to `~/.gemini/antigravity-cli/brain/<conversation_id>/` (+ `.metadata.json` sidecar) and `~/.gemini/antigravity-cli/scratch/`. The cwd is NOT writable by default — a naive run "succeeds" while editing a shadow copy of the workspace.

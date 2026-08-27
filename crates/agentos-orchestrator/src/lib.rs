@@ -123,7 +123,7 @@ pub use operation::{
     AddDependency, AssignPool, CloseGoal, CreateTask, Escalate, Escalation, EscalationTarget,
     PlanOperation, RequestReview, KNOWN_OPERATIONS,
 };
-pub use orchestrator::{Orchestrator, PlanCycleReport};
+pub use orchestrator::{Orchestrator, OrchestratorCheckpoint, PlanCycleReport};
 pub use parse::{operation_from_value, parse_operations, ParsedOperations};
 pub use plan::{Plan, PlanPolicy, PlannedNode, DEFAULT_POOLS, DEFAULT_REVIEWER_POOL};
 pub use sink::{PlanSink, RunView, TaskView, WorkflowSink};

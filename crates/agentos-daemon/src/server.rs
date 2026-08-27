@@ -37,11 +37,12 @@
 
 use std::collections::HashMap;
 use std::net::{SocketAddr, TcpListener as StdTcpListener, ToSocketAddrs};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Output};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
-use agentos_agents::AgentRecord;
+use agentos_agents::{AgentRecord, SkillRecord};
 use agentos_core::{CoreError, Event, EventType};
 use chrono::{DateTime, SecondsFormat, Utc};
 use futures_util::stream::SplitSink;
@@ -67,6 +68,9 @@ use crate::projection;
 const EVT_AGENT_CREATED: &str = "agent.created";
 const EVT_AGENT_UPDATED: &str = "agent.updated";
 const EVT_AGENT_DELETED: &str = "agent.deleted";
+const EVT_SKILL_CREATED: &str = "skill.created";
+const EVT_SKILL_UPDATED: &str = "skill.updated";
+const EVT_SKILL_DELETED: &str = "skill.deleted";
 
 /// Default bind address (loopback only — F-11 §2).
 pub const DEFAULT_WS_ADDR: &str = "127.0.0.1:8741";
@@ -185,6 +189,10 @@ pub struct WsServer {
     journal_path: PathBuf,
     registry: Arc<agentos_agents::AgentRegistry>,
     sessions: Arc<AgentSessions>,
+    /// F-12: the mastermind service, when the daemon was built with one.
+    /// `None` in fixtures and UI-only daemons — the `mastermind.*` methods
+    /// then answer `not_supported` instead of pretending to plan.
+    mastermind: Option<Arc<crate::mastermind::Mastermind>>,
     started_at: DateTime<Utc>,
     next_subscription: std::sync::atomic::AtomicU64,
 }
@@ -206,9 +214,25 @@ impl WsServer {
             journal_path: journal_path.into(),
             registry,
             sessions,
+            mastermind: None,
             started_at: Utc::now(),
             next_subscription: std::sync::atomic::AtomicU64::new(1),
         }
+    }
+
+    /// Attach the F-12 mastermind service (`main` does; fixtures do not).
+    pub fn with_mastermind(mut self, mastermind: Arc<crate::mastermind::Mastermind>) -> Self {
+        self.mastermind = Some(mastermind);
+        self
+    }
+
+    /// The mastermind service or a plain `not_supported`.
+    fn mastermind(&self) -> Result<&Arc<crate::mastermind::Mastermind>, ApiError> {
+        self.mastermind.as_ref().ok_or_else(|| {
+            ApiError::not_supported(
+                "this daemon was built without the mastermind service (no repo/state dir configured)",
+            )
+        })
     }
 
     /// Validate `addr` as loopback and bind it, returning the bound server
@@ -278,6 +302,9 @@ impl WsServer {
                 let tasks = projection.tasks(run_id.as_deref());
                 Ok(json!({ "tasks": tasks }))
             }
+            // Provider rate-limit meters for the top bar. A cheap file
+            // read, so the desktop polls it rather than subscribing.
+            "usage.limits" => Ok(json!({ "meters": crate::usage_meters::meters() })),
             "agents.list" => {
                 let run_id = optional_run_id(params)?;
                 let projection = self.fold_all()?;
@@ -297,6 +324,11 @@ impl WsServer {
                 let skills = self.registry.list_skills().map_err(registry_error)?;
                 Ok(json!({ "skills": skills }))
             }
+            "registry.skills.available" => self.registry_available_skills(),
+            "registry.skills.import" => self.registry_import_skills(params),
+            "registry.skills.create" => self.registry_create_skill(params),
+            "registry.skills.update" => self.registry_update_skill(params),
+            "registry.skills.delete" => self.registry_delete_skill(params),
             "registry.catalog" => {
                 let providers = self.sessions.provider_catalog().await;
                 Ok(json!({ "providers": providers }))
@@ -310,6 +342,39 @@ impl WsServer {
                     .await
                     .map_err(session_error)?;
                 Ok(json!({ "sessionId": session_id }))
+            }
+            // F-13b chat history: past conversations folded out of the
+            // journal, and reopening one on the provider session it left
+            // behind.
+            "chat.sessions" => {
+                let agent_id = optional_string(params, "agentId")?;
+                let sessions = self
+                    .sessions
+                    .chat_sessions(agent_id)
+                    .map_err(session_error)?;
+                Ok(json!({ "sessions": sessions }))
+            }
+            "chat.transcript" => {
+                let session_id = required_string(params, "sessionId")?;
+                let messages = self
+                    .sessions
+                    .chat_transcript(session_id)
+                    .map_err(session_error)?;
+                let summary = self
+                    .sessions
+                    .chat_session(session_id)
+                    .map_err(session_error)?;
+                Ok(json!({ "messages": messages, "session": summary }))
+            }
+            "agent.session.reopen" => {
+                let session_id = required_string(params, "sessionId")?;
+                let message = required_string(params, "message")?;
+                let new_session = self
+                    .sessions
+                    .reopen(session_id, message)
+                    .await
+                    .map_err(session_error)?;
+                Ok(json!({ "sessionId": new_session, "resumedFrom": session_id }))
             }
             "agent.session.send" => {
                 let session_id = required_string(params, "sessionId")?;
@@ -328,6 +393,159 @@ impl WsServer {
                     .map_err(session_error)?;
                 Ok(json!({ "cancelled": true }))
             }
+            // ----- F-12: the mastermind flow -----------------------------
+            "mastermind.start" => {
+                let goal = required_string(params, "goal")?;
+                let repo = required_string(params, "repo")?;
+                let planner_adapter = params
+                    .get("plannerAdapter")
+                    .and_then(Value::as_str)
+                    .filter(|value| !value.is_empty());
+                let planner_model = params
+                    .get("plannerModel")
+                    .and_then(Value::as_str)
+                    .filter(|value| !value.is_empty());
+                self.mastermind()?
+                    .start(
+                        goal,
+                        std::path::Path::new(repo),
+                        planner_adapter,
+                        planner_model,
+                    )
+                    .await
+                    .map_err(mastermind_error)
+            }
+            "mastermind.plan" | "mastermind.respond" => {
+                let session_id = required_string(params, "sessionId")?;
+                let instruction = params
+                    .get("instruction")
+                    .and_then(Value::as_str)
+                    .filter(|value| !value.trim().is_empty());
+                self.mastermind()?
+                    .plan(session_id, instruction)
+                    .await
+                    .map_err(mastermind_error)
+            }
+            "mastermind.commit" => {
+                let session_id = required_string(params, "sessionId")?;
+                self.mastermind()?
+                    .commit(session_id)
+                    .await
+                    .map_err(mastermind_error)
+            }
+            "mastermind.approveDiscovery" => {
+                let session_id = required_string(params, "sessionId")?;
+                self.mastermind()?
+                    .approve_discovery(session_id)
+                    .await
+                    .map_err(mastermind_error)
+            }
+            "mastermind.approvePhase" => {
+                let session_id = required_string(params, "sessionId")?;
+                self.mastermind()?
+                    .approve_phase(session_id)
+                    .await
+                    .map_err(mastermind_error)
+            }
+            "mastermind.acceptPhaseAsIs" => {
+                let session_id = required_string(params, "sessionId")?;
+                self.mastermind()?
+                    .accept_phase_as_is(session_id)
+                    .await
+                    .map_err(mastermind_error)
+            }
+            "mastermind.authorizePhaseWrite" => {
+                let session_id = required_string(params, "sessionId")?;
+                self.mastermind()?
+                    .authorize_phase_write(session_id)
+                    .await
+                    .map_err(mastermind_error)
+            }
+            "mastermind.repreparePhaseRevision" => {
+                let session_id = required_string(params, "sessionId")?;
+                let guidance = params
+                    .get("guidance")
+                    .and_then(Value::as_str)
+                    .filter(|value| !value.trim().is_empty());
+                self.mastermind()?
+                    .reprepare_phase_revision(session_id, guidance)
+                    .await
+                    .map_err(mastermind_error)
+            }
+            "mastermind.recoverPhaseArtifact" => {
+                let session_id = required_string(params, "sessionId")?;
+                self.mastermind()?
+                    .recover_phase_artifact(session_id)
+                    .await
+                    .map_err(mastermind_error)
+            }
+            "mastermind.setPlanner" => {
+                let session_id = required_string(params, "sessionId")?;
+                let planner_adapter = required_string(params, "plannerAdapter")?;
+                let planner_model = required_string(params, "plannerModel")?;
+                self.mastermind()?
+                    .set_planner(session_id, planner_adapter, planner_model)
+                    .await
+                    .map_err(mastermind_error)
+            }
+            "mastermind.retryPhaseAuthoring" => {
+                let session_id = required_string(params, "sessionId")?;
+                self.mastermind()?
+                    .retry_phase_authoring(session_id)
+                    .await
+                    .map_err(mastermind_error)
+            }
+            "mastermind.revisePhase" => {
+                let session_id = required_string(params, "sessionId")?;
+                let guidance = required_string(params, "guidance")?;
+                self.mastermind()?
+                    .revise_phase(session_id, guidance)
+                    .await
+                    .map_err(mastermind_error)
+            }
+            "mastermind.drive" => {
+                let session_id = required_string(params, "sessionId")?;
+                let max_ticks = params
+                    .get("maxTicks")
+                    .and_then(Value::as_u64)
+                    .map(|ticks| ticks.min(u64::from(u32::MAX)) as u32);
+                self.mastermind()?
+                    .drive(session_id, max_ticks)
+                    .await
+                    .map_err(mastermind_error)
+            }
+            // Operator recovery after a cleared transient outage. Separate
+            // from `drive` on purpose: resuming a failed run is a decision
+            // a person makes, never something a tick infers.
+            "mastermind.reopenRun" => {
+                let session_id = required_string(params, "sessionId")?;
+                self.mastermind()?
+                    .reopen_run(session_id)
+                    .await
+                    .map_err(mastermind_error)
+            }
+            "mastermind.status" => {
+                let session_id = required_string(params, "sessionId")?;
+                self.mastermind()?
+                    .status(session_id)
+                    .await
+                    .map_err(mastermind_error)
+            }
+            "mastermind.artifact" => {
+                let session_id = required_string(params, "sessionId")?;
+                let path = required_string(params, "path")?;
+                self.mastermind()?
+                    .artifact(session_id, path)
+                    .await
+                    .map_err(mastermind_error)
+            }
+            "mastermind.list" => {
+                let sessions = self.mastermind()?.list().map_err(mastermind_error)?;
+                Ok(json!({ "sessions": sessions }))
+            }
+            // ----- Git push identity / remote selection -----------------
+            "git.push-targets" => git_push_targets(params),
+            "git.push-target.set" => git_push_target_set(params),
             "git.diff" => Err(ApiError::not_supported(
                 "git.diff is a v1 seam (F-11 §6.1): the daemon does not embed agentos-git yet; \
                  UX-05 renders event-carried attribution",
@@ -343,9 +561,180 @@ impl WsServer {
     fn registry_create_agent(&self, params: &Value) -> Result<Value, ApiError> {
         let mut record: AgentRecord = agent_param(params)?;
         record.builtin = false; // wire records are never builtin (API-edge policy)
+        report_unresolved(self.resolve_skills(&record.skills))?;
         let record = self.registry.create_agent(record).map_err(registry_error)?;
         self.journal_agent_mutation(EVT_AGENT_CREATED, &record, None);
         Ok(json!({ "agent": record }))
+    }
+
+    /// Make sure every named skill exists, pulling it out of the local skill
+    /// library when the registry has not seen it yet.
+    ///
+    /// The library (`~/.claude/skills`) holds well-written method documents
+    /// this daemon used to be blind to, so an agent naming `react-patterns`
+    /// was rejected while the file sat on disk. Naming a skill is now enough
+    /// to install it. Returns the ids that could not be resolved at all,
+    /// each with its reason.
+    pub(crate) fn resolve_skills(&self, skills: &[String]) -> Vec<(String, String)> {
+        let mut unresolved = Vec::new();
+        let dir = crate::skill_import::source_dir();
+
+        for id in skills {
+            match self.registry.get_skill(id) {
+                Ok(Some(_)) => continue,
+                Ok(None) => {}
+                Err(err) => {
+                    unresolved.push((id.clone(), err.to_string()));
+                    continue;
+                }
+            }
+            match crate::skill_import::load(&dir, id) {
+                Ok(record) => match self.registry.create_skill(record) {
+                    Ok(record) => {
+                        tracing::info!(skill = %record.id, "imported skill from the local library");
+                        self.journal_skill_mutation(EVT_SKILL_CREATED, &record);
+                    }
+                    Err(err) => unresolved.push((id.clone(), err.to_string())),
+                },
+                Err(reason) => unresolved.push((id.clone(), reason)),
+            }
+        }
+        unresolved
+    }
+
+    /// `registry.skills.available`: what is importable from disk. Cheap by
+    /// design — frontmatter only, no bodies — so a directory of a thousand
+    /// skills lists without reading a thousand files end to end.
+    fn registry_available_skills(&self) -> Result<Value, ApiError> {
+        let dir = crate::skill_import::source_dir();
+        let installed: Vec<String> = self
+            .registry
+            .list_skills()
+            .map_err(registry_error)?
+            .into_iter()
+            .map(|skill| skill.id)
+            .collect();
+        let skills = crate::skill_import::discover(&dir, &installed);
+        Ok(json!({
+            "sourceDir": dir.display().to_string(),
+            "skills": skills,
+        }))
+    }
+
+    /// `registry.skills.import`: install the named skills from disk.
+    ///
+    /// Partial success is the contract: one unreadable or oversized file
+    /// must not lose the other forty-nine imports, so every id reports its
+    /// own outcome and the call itself succeeds.
+    fn registry_import_skills(&self, params: &Value) -> Result<Value, ApiError> {
+        let ids = params
+            .get("ids")
+            .and_then(Value::as_array)
+            .ok_or_else(|| ApiError::invalid_params("ids must be an array of skill ids"))?;
+        if ids.is_empty() {
+            return Err(ApiError::invalid_params("ids must name at least one skill"));
+        }
+
+        let dir = crate::skill_import::source_dir();
+        let mut imported = Vec::new();
+        let mut skipped = Vec::new();
+
+        for id in ids {
+            let Some(id) = id.as_str() else {
+                skipped.push(json!({ "id": id, "reason": "not a string" }));
+                continue;
+            };
+            match crate::skill_import::load(&dir, id) {
+                Ok(record) => match self.registry.create_skill(record) {
+                    Ok(record) => {
+                        self.journal_skill_mutation(EVT_SKILL_CREATED, &record);
+                        imported.push(record.id);
+                    }
+                    Err(err) => skipped.push(json!({ "id": id, "reason": err.to_string() })),
+                },
+                Err(reason) => skipped.push(json!({ "id": id, "reason": reason })),
+            }
+        }
+
+        Ok(json!({ "imported": imported, "skipped": skipped }))
+    }
+
+    /// `registry.skills.create`: install a new skill. Wire records are never
+    /// builtin — a seeded skill is the daemon's own, not something an API
+    /// caller can mint.
+    fn registry_create_skill(&self, params: &Value) -> Result<Value, ApiError> {
+        let mut record: SkillRecord = skill_param(params)?;
+        record.builtin = false;
+        let record = self.registry.create_skill(record).map_err(registry_error)?;
+        self.write_through(&record);
+        self.journal_skill_mutation(EVT_SKILL_CREATED, &record);
+        Ok(json!({ "skill": record }))
+    }
+
+    /// `registry.skills.update`: edit an existing skill's body or metadata.
+    fn registry_update_skill(&self, params: &Value) -> Result<Value, ApiError> {
+        let mut record: SkillRecord = skill_param(params)?;
+        let previous = self
+            .registry
+            .get_skill(&record.id)
+            .map_err(registry_error)?
+            .ok_or_else(|| {
+                ApiError::invalid_params(format!("skill {:?} does not exist", record.id))
+            })?;
+        record.builtin = previous.builtin; // preserved by the registry
+        let record = self.registry.update_skill(record).map_err(registry_error)?;
+        self.write_through(&record);
+        self.journal_skill_mutation(EVT_SKILL_UPDATED, &record);
+        Ok(json!({ "skill": record }))
+    }
+
+    /// `registry.skills.delete`: the registry refuses while an agent still
+    /// holds the skill, so a delete cannot strand a roster entry.
+    fn registry_delete_skill(&self, params: &Value) -> Result<Value, ApiError> {
+        let id = required_string(params, "id")?;
+        let record = self
+            .registry
+            .get_skill(id)
+            .map_err(registry_error)?
+            .ok_or_else(|| ApiError::invalid_params(format!("skill {id:?} does not exist")))?;
+        self.registry.delete_skill(id).map_err(registry_error)?;
+        self.remove_write_through(id);
+        self.journal_skill_mutation(EVT_SKILL_DELETED, &record);
+        Ok(json!({ "deleted": id }))
+    }
+
+    /// Mirror a skill into the library so the two never diverge.
+    ///
+    /// A write that fails is logged, not fatal: the registry row is already
+    /// committed, and a read-only library should not fail the call.
+    fn write_through(&self, record: &SkillRecord) {
+        let dir = crate::skill_import::source_dir();
+        if let Err(err) = crate::skill_import::write_one(&dir, record) {
+            tracing::warn!(skill = %record.id, %err, "could not mirror skill into the library");
+        }
+    }
+
+    /// Drop a deleted skill's mirror so the library does not keep listing
+    /// it. Same failure posture as `write_through`: the registry row is
+    /// already gone, and a read-only library must not fail the call.
+    fn remove_write_through(&self, id: &str) {
+        let dir = crate::skill_import::source_dir();
+        if let Err(err) = crate::skill_import::remove_one(&dir, id) {
+            tracing::warn!(skill = %id, %err, "could not remove the skill from the library");
+        }
+    }
+
+    /// Journal one skill mutation. Skills are not agent-scoped, so the
+    /// event carries no `agent_id`; the payload is the whole record.
+    fn journal_skill_mutation(&self, event_type: &str, record: &SkillRecord) {
+        let event = Event::new(EventType::Other(event_type.to_owned()))
+            .with_payload(json!({ "skill": record }));
+        match crate::db::open_db(&self.journal_path)
+            .and_then(|conn| events::append_event(&conn, &event))
+        {
+            Ok(_seq) => {}
+            Err(err) => tracing::error!(%err, "skill mutation journal append failed"),
+        }
     }
 
     /// `registry.agents.update`: same shape, `agent.updated` journal event.
@@ -359,6 +748,7 @@ impl WsServer {
                 ApiError::invalid_params(format!("agent {:?} does not exist", record.id))
             })?;
         record.builtin = previous.builtin; // preserved by the registry; keep the wire honest
+        report_unresolved(self.resolve_skills(&record.skills))?;
         let record = self.registry.update_agent(record).map_err(registry_error)?;
         self.journal_agent_mutation(EVT_AGENT_UPDATED, &record, None);
         Ok(json!({ "agent": record }))
@@ -570,11 +960,31 @@ impl WsServer {
                 _ = shutdown.changed() => break,
                 maybe = stream.next() => match maybe {
                     Some(Ok(Message::Text(text))) => {
-                        let response =
-                            self.handle_text_frame(&out_tx, &subs, &shutdown, text.as_str()).await;
-                        if out_tx.send(response).await.is_err() {
-                            break; // writer gone; connection is dead
-                        }
+                        // Requests on one socket are independent and carry
+                        // correlation ids, so dispatch them independently.
+                        // A provider-backed call (notably mastermind.plan)
+                        // can take minutes. Awaiting it in this reader loop
+                        // prevented the same socket from answering the UI's
+                        // application-level heartbeat, which then closed a
+                        // healthy connection after ten seconds.
+                        let server = Arc::clone(&self);
+                        let out = out_tx.clone();
+                        let request_subs = Arc::clone(&subs);
+                        let request_shutdown = shutdown.clone();
+                        tokio::spawn(async move {
+                            let response = server
+                                .handle_text_frame(
+                                    &out,
+                                    &request_subs,
+                                    &request_shutdown,
+                                    text.as_str(),
+                                )
+                                .await;
+                            // A failed send only means this connection ended;
+                            // the reader owns teardown and no task may close
+                            // a replacement connection.
+                            let _ = out.send(response).await;
+                        });
                     }
                     Some(Ok(Message::Binary(_))) => {
                         // §2: one JSON object per TEXT frame, no binary.
@@ -933,12 +1343,129 @@ fn optional_non_negative_i64(params: &Value, key: &str) -> Result<Option<i64>, A
 }
 
 /// Required non-empty string parameter.
+/// An optional non-empty string parameter: absent and empty both read as
+/// "no filter".
+fn optional_string<'a>(params: &'a Value, key: &str) -> Result<Option<&'a str>, ApiError> {
+    match params.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(text)) if !text.is_empty() => Ok(Some(text.as_str())),
+        Some(Value::String(_)) => Ok(None),
+        Some(_) => Err(ApiError::invalid_params(format!("{key} must be a string"))),
+    }
+}
+
 fn required_string<'a>(params: &'a Value, key: &str) -> Result<&'a str, ApiError> {
     params
         .get(key)
         .and_then(Value::as_str)
         .filter(|value| !value.is_empty())
         .ok_or_else(|| ApiError::invalid_params(format!("{key} must be a non-empty string")))
+}
+
+/// Read the named Git remote that plain `git push` will use. Git
+/// authentication itself stays with the OS credential manager or SSH agent;
+/// this API neither reads nor stores credentials.
+fn git_push_targets(params: &Value) -> Result<Value, ApiError> {
+    let repo = PathBuf::from(required_string(params, "repo")?);
+    git_push_profile(&repo)
+}
+
+/// Set Git's repository-local `remote.pushDefault`. The remote name must
+/// already exist in the selected repository, so an RPC caller cannot inject
+/// an arbitrary destination.
+fn git_push_target_set(params: &Value) -> Result<Value, ApiError> {
+    let repo = PathBuf::from(required_string(params, "repo")?);
+    let remote = required_string(params, "remote")?;
+    let profile = git_push_profile(&repo)?;
+    let known = profile["remotes"]
+        .as_array()
+        .is_some_and(|remotes| remotes.iter().any(|entry| entry["name"] == remote));
+    if !known {
+        return Err(ApiError::invalid_params(format!(
+            "remote {remote:?} is not configured for {}",
+            repo.display()
+        )));
+    }
+    let output = git_output(&repo, &["config", "--local", "remote.pushDefault", remote])?;
+    if !output.status.success() {
+        return Err(git_command_error(&repo, "set push default", &output));
+    }
+    git_push_profile(&repo)
+}
+
+/// Build the credential-safe Git push profile surfaced in Settings. A remote
+/// URL identifies the authentication context (for example `github-work` in
+/// an SSH URL); the credential manager/SSH agent remains the sole secret
+/// holder.
+fn git_push_profile(repo: &Path) -> Result<Value, ApiError> {
+    if !repo.is_dir() {
+        return Err(ApiError::invalid_params(format!(
+            "repo {} does not exist",
+            repo.display()
+        )));
+    }
+    let remote_output = git_output(repo, &["remote"])?;
+    if !remote_output.status.success() {
+        return Err(git_command_error(repo, "list remotes", &remote_output));
+    }
+    let selected = git_config_value(repo, "remote.pushDefault")?;
+    let remotes = String::from_utf8_lossy(&remote_output.stdout)
+        .lines()
+        .filter(|name| !name.trim().is_empty())
+        .map(|name| {
+            let name = name.trim();
+            let url = git_output(repo, &["remote", "get-url", "--push", name])?;
+            if !url.status.success() {
+                return Err(git_command_error(repo, "read push remote", &url));
+            }
+            Ok(json!({
+                "name": name,
+                "pushUrl": String::from_utf8_lossy(&url.stdout).trim(),
+                "selected": selected.as_deref() == Some(name),
+            }))
+        })
+        .collect::<Result<Vec<_>, ApiError>>()?;
+    Ok(json!({
+        "repo": repo.display().to_string(),
+        "pushDefault": selected,
+        "identity": {
+            "name": git_config_value(repo, "user.name")?,
+            "email": git_config_value(repo, "user.email")?,
+        },
+        "remotes": remotes,
+    }))
+}
+
+fn git_config_value(repo: &Path, key: &str) -> Result<Option<String>, ApiError> {
+    let output = git_output(repo, &["config", "--get", key])?;
+    if output.status.success() {
+        return Ok(Some(
+            String::from_utf8_lossy(&output.stdout).trim().to_owned(),
+        ));
+    }
+    if output.status.code() == Some(1) {
+        return Ok(None);
+    }
+    Err(git_command_error(repo, "read Git config", &output))
+}
+
+fn git_output(repo: &Path, args: &[&str]) -> Result<Output, ApiError> {
+    Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(args)
+        .output()
+        .map_err(|error| {
+            ApiError::internal(format!("could not run git in {}: {error}", repo.display()))
+        })
+}
+
+fn git_command_error(repo: &Path, action: &str, output: &Output) -> ApiError {
+    let detail = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+    ApiError::invalid_params(format!(
+        "Git could not {action} in {}: {detail}",
+        repo.display()
+    ))
 }
 
 /// The `agent` parameter of the registry mutation methods: an object
@@ -950,6 +1477,29 @@ fn agent_param(params: &Value) -> Result<AgentRecord, ApiError> {
     })?;
     serde_json::from_value(agent.clone())
         .map_err(|err| ApiError::invalid_params(format!("agent record is not valid: {err}")))
+}
+
+/// Turn unresolved skill ids into one actionable error naming all of them.
+fn report_unresolved(unresolved: Vec<(String, String)>) -> Result<(), ApiError> {
+    if unresolved.is_empty() {
+        return Ok(());
+    }
+    let detail = unresolved
+        .iter()
+        .map(|(id, reason)| format!("{id} ({reason})"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    Err(ApiError::invalid_params(format!(
+        "these skills are neither registered nor in the local skill library: {detail}"
+    )))
+}
+
+fn skill_param(params: &Value) -> Result<SkillRecord, ApiError> {
+    let skill = params.get("skill").ok_or_else(|| {
+        ApiError::invalid_params("skill must be an object (the full skill record)")
+    })?;
+    serde_json::from_value(skill.clone())
+        .map_err(|err| ApiError::invalid_params(format!("skill record is not valid: {err}")))
 }
 
 /// Registry failures → §2.2 codes: domain rejections are `invalid_params`
@@ -969,9 +1519,44 @@ fn session_error(err: SessionError) -> ApiError {
         SessionError::InvalidParams(detail) => ApiError::invalid_params(detail),
         SessionError::NotFound(detail) => ApiError::invalid_params(detail),
         SessionError::Registry(registry) => registry_error(registry),
+        // A caller mistake stays a caller mistake even when the adapter is
+        // the one that spots it: sending to a finished session, sending
+        // mid-turn, or asking for a capability the runtime has not got are
+        // all `invalid_params` everywhere else on this API.
+        SessionError::Adapter(
+            adapter @ (agentos_adapters::AdapterError::SessionNotActive(_)
+            | agentos_adapters::AdapterError::Busy(_)
+            | agentos_adapters::AdapterError::Unsupported(_)),
+        ) => ApiError::invalid_params(adapter.to_string()),
         SessionError::Adapter(adapter) => ApiError::internal(format!("adapter failure: {adapter}")),
         SessionError::Core(core) => ApiError::internal(format!("journal failure: {core}")),
         SessionError::Internal(detail) => ApiError::internal(detail),
+    }
+}
+
+/// F-12 failures: a caller mistake (bad session id, missing repo, no commit
+/// yet) is `invalid_params`; anything else is the machinery failing.
+fn mastermind_error(err: crate::mastermind::MastermindError) -> ApiError {
+    use crate::mastermind::MastermindError as E;
+    match err {
+        E::UnknownSession(detail) => ApiError::invalid_params(format!("unknown session {detail}")),
+        E::NotCommitted(detail) => {
+            ApiError::invalid_params(format!("session {detail} has no committed run yet"))
+        }
+        E::NoRepo(path) => {
+            ApiError::invalid_params(format!("repo {} does not exist", path.display()))
+        }
+        E::NoHead { .. } => ApiError::invalid_params(err.to_string()),
+        // Reopening a run that is not failed is a caller mistake, not a
+        // daemon fault: the engine's own status says there is nothing
+        // stranded to recover.
+        E::RunNotFailed { .. } => ApiError::invalid_params(err.to_string()),
+        E::DiscoveryIncomplete(_)
+        | E::DiscoveryAwaitingApproval(_)
+        | E::InvalidPhase { .. }
+        | E::UnknownArtifact { .. } => ApiError::invalid_params(err.to_string()),
+        E::Registry(registry) => registry_error(registry),
+        other => ApiError::internal(other.to_string()),
     }
 }
 
@@ -1058,6 +1643,31 @@ mod tests {
         ));
     }
 
+    /// `mastermind.reopenRun` refusals are the caller's fault, not the
+    /// daemon's: asking to reopen a run that is not failed, or naming a
+    /// session that does not exist, must answer `invalid_params` so the
+    /// desktop can show the reason instead of an opaque internal error.
+    #[test]
+    fn reopening_a_run_that_is_not_failed_is_a_caller_error() {
+        use crate::mastermind::MastermindError as E;
+
+        let not_failed = mastermind_error(E::RunNotFailed {
+            session: "sess-1".to_owned(),
+            status: "completed".to_owned(),
+        });
+        assert_eq!(not_failed.code, CODE_INVALID_PARAMS);
+        assert!(not_failed.message.contains("not failed"), "{not_failed:?}");
+
+        assert_eq!(
+            mastermind_error(E::NotCommitted("sess-1".to_owned())).code,
+            CODE_INVALID_PARAMS
+        );
+        assert_eq!(
+            mastermind_error(E::UnknownSession("ghost".to_owned())).code,
+            CODE_INVALID_PARAMS
+        );
+    }
+
     /// §3.1: the wire event is the core serde shape plus `seq`.
     #[test]
     fn sequenced_events_carry_seq_on_the_wire() {
@@ -1077,5 +1687,50 @@ mod tests {
         ] {
             assert!(wire.get(key).is_some(), "missing {key} in {wire}");
         }
+    }
+
+    #[test]
+    fn push_target_profile_selects_only_existing_remotes() {
+        let repo = tempfile::tempdir().expect("repo dir");
+        let git = |args: &[&str]| {
+            let output = Command::new("git")
+                .arg("-C")
+                .arg(repo.path())
+                .args(args)
+                .output()
+                .expect("git runs");
+            assert!(output.status.success(), "git {args:?} failed");
+        };
+        git(&["init", "--initial-branch=main"]);
+        git(&[
+            "remote",
+            "add",
+            "personal",
+            "git@github-personal:me/demo.git",
+        ]);
+        git(&["remote", "add", "work", "git@github-work:org/demo.git"]);
+
+        let before = git_push_targets(&json!({ "repo": repo.path() })).expect("profile");
+        assert_eq!(before["pushDefault"], Value::Null);
+        assert_eq!(before["remotes"].as_array().unwrap().len(), 2);
+
+        let after = git_push_target_set(&json!({
+            "repo": repo.path(),
+            "remote": "work",
+        }))
+        .expect("set selected remote");
+        assert_eq!(after["pushDefault"], json!("work"));
+        assert!(after["remotes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|remote| remote["name"] == "work" && remote["selected"] == true));
+        assert!(matches!(
+            git_push_target_set(&json!({ "repo": repo.path(), "remote": "unknown" })),
+            Err(ApiError {
+                code: CODE_INVALID_PARAMS,
+                ..
+            })
+        ));
     }
 }

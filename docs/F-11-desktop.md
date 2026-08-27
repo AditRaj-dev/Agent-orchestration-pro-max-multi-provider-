@@ -145,6 +145,9 @@ toward `lastEventType`/`eventCount` — forward compatible by construction):
 | `session.spawn` | agent status planning |
 | `session.started` | agent status running |
 | `agent.tool_use` | agent status running (activity ticker) |
+| `agent.decision` | Agents chat renders the plan-mode options as buttons; clicking sends the label back as an instruction |
+
+**Chat sessions are multi-turn.** `session.finished` ends a *turn*, not the session: every adapter (F-03/F-04/F-05) delivers a follow-up as a resumed provider run, so the daemon keeps the session in its active map and the per-turn timeout clock restarts. An idle session ages out as `session.cancelled` (reason names the idle window and the turn count); `agent.session_failed` and `agent.session.cancel` are what actually end one. Until 2026-08-23 the daemon evicted a session on the first `Finished`, so every second message in a chat was refused — and the desktop silently started a new session, losing the conversation. The desktop now restarts only on a genuinely dead session, and says so in the chat.
 | `agent.rate_limit` | agent status waiting |
 | `agent.spawn_failed` | agent status failed |
 | `review.requested` (reviewer agent) | agent status reviewing |
@@ -338,7 +341,8 @@ draft, never a registration), `agent.proposal_invalid` (`{sessionId, reason}`).
 Chat sessions set `agent_id` = the registry agent slug and share one
 `trace_id` per conversation; they carry **no** `run_id`/`task_id` (no
 fabricated projections). `session.spawn` payloads gain `model` and
-`objectivePreview` (first 2 000 chars, preamble included) on both the
+`objectivePreview` (2 000-char capped head/tail preview, preamble and task
+objective included) on both the
 supervisor and chat paths.
 
 The read-only promise of §1 is narrowed, deliberately and visibly: the

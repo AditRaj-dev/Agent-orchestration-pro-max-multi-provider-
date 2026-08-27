@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use agentos_core::{Priority, TaskState};
+use agentos_core::{CoreError, Priority, TaskState};
 use agentos_workflow::{
     Budgets, FailureKind, NodeSpec, NodeType, Outcome, RetryPolicy, RunStatus, TaskContract,
     TaskExecutor, TaskRecord, TaskStore, WorkflowEngine, WorkflowError, WorkflowSpec,
@@ -616,6 +616,43 @@ async fn add_task_blocks_behind_a_failed_dependency() {
     );
 }
 
+/// A bounded reasoning escalation consumes the first attempt, then changes
+/// the durable route before another engine can lease the retry.
+#[tokio::test]
+async fn reasoning_escalation_retargets_the_next_retry_atomically() {
+    let (_dir, store) = temp_store();
+    let executor = Arc::new(ScriptedExecutor::new());
+    executor.then_outcomes(
+        "debug",
+        vec![Outcome::EscalatedReasoningFailure {
+            agent_role: "debugger-sol-escalation".to_owned(),
+        }],
+    );
+    let engine = WorkflowEngine::new(store, Arc::clone(&executor) as Arc<dyn TaskExecutor>);
+    let mut debug = node("debug", NodeType::Run, &[]);
+    debug.agent_role = Some("debugger".to_owned());
+    let run_id = engine
+        .start_run(&spec("debugging", vec![debug]), "diagnose it")
+        .expect("start run");
+
+    engine.tick().await.expect("Terra attempt");
+    let task = engine.store().tasks_for_run(&run_id).unwrap().remove(0);
+    assert_eq!(task.state, TaskState::Ready);
+    assert_eq!(task.attempt_count, 1);
+    assert_eq!(
+        task.node.agent_role.as_deref(),
+        Some("debugger-sol-escalation")
+    );
+
+    engine.tick().await.expect("Sol retry");
+    let task = engine.store().tasks_for_run(&run_id).unwrap().remove(0);
+    assert_eq!(task.state, TaskState::Done);
+    assert_eq!(
+        task.node.agent_role.as_deref(),
+        Some("debugger-sol-escalation")
+    );
+}
+
 /// The engine stays authoritative over re-planning: cycles, duplicate ids,
 /// dangling dependencies and terminal runs are all rejected, and nothing is
 /// written when they are.
@@ -777,4 +814,181 @@ async fn set_agent_role_retargets_queued_tasks_and_refuses_executing_ones() {
         .set_agent_role(&planned.id, Some("stronger"))
         .expect("no storage failure")
         .is_none());
+}
+
+// ------------------------------------------------- operator reopen (F-12)
+
+/// The observed Phase-8 failure, reproduced and then repaired.
+///
+/// `t07` burns its whole attempt budget against a provider outage that is
+/// still in force, fails terminally, and parks its two transitive dependents
+/// as `Blocked`; the run goes `Failed` with finished work stranded behind it.
+/// Once the outage clears, one `reopen_run` has to give all three of them
+/// back — with a *fresh* attempt budget, or the reopened task would be failed
+/// again by the first budget gate it meets.
+#[tokio::test]
+async fn reopen_run_returns_a_failed_task_and_its_blocked_dependents_to_work() {
+    let (_dir, store) = temp_store();
+    let executor = Arc::new(ScriptedExecutor::new());
+    // Exactly the attempts the budget allows fail; the outage "clears"
+    // after that, so anything later succeeds.
+    executor.then_transient_failures("t07", 2);
+    let engine = WorkflowEngine::new(
+        Arc::clone(&store),
+        Arc::clone(&executor) as Arc<dyn TaskExecutor>,
+    );
+    let workflow = spec(
+        "quota-outage",
+        vec![
+            governed_node(
+                "t07",
+                NodeType::Run,
+                &[],
+                Budgets {
+                    max_attempts: 2,
+                    ..Budgets::default()
+                },
+                RetryPolicy {
+                    transient_retries: 9,
+                    reasoning_retries: 0,
+                },
+            ),
+            node("t09", NodeType::Run, &["t07"]),
+            node("t10", NodeType::Run, &["t09"]),
+        ],
+    );
+    let run_id = engine.start_run(&workflow, "phase 8 build").unwrap();
+    engine.run_until_idle(20).await.unwrap();
+
+    // The observed end state.
+    let before = states_by_node(&engine, run_id);
+    assert_eq!(before["t07"], TaskState::Failed);
+    assert_eq!(before["t09"], TaskState::Blocked, "direct dependent");
+    assert_eq!(before["t10"], TaskState::Blocked, "transitive dependent");
+    assert_eq!(engine.run_status(&run_id).unwrap(), RunStatus::Failed);
+    assert_eq!(store.runs().unwrap()[0].status, RunStatus::Failed);
+
+    let report = store.reopen_run(&run_id).expect("reopen");
+
+    assert_eq!(report.reopened, vec!["t07".to_owned()]);
+    assert_eq!(report.unblocked, vec!["t09".to_owned(), "t10".to_owned()]);
+    assert_eq!(report.status, RunStatus::Running, "the run leaves Failed");
+    assert!(report.changed_anything());
+
+    let after = states_by_node(&engine, run_id);
+    assert_eq!(after["t07"], TaskState::Ready, "queued again");
+    assert_eq!(
+        after["t09"],
+        TaskState::Planned,
+        "the exact inverse of block_dependents_of; the dependency gate \
+         promotes it when t07 is actually Done"
+    );
+    assert_eq!(after["t10"], TaskState::Planned);
+    let reopened = store
+        .tasks_for_run(&run_id)
+        .unwrap()
+        .into_iter()
+        .find(|task| task.node_id == "t07")
+        .unwrap();
+    assert_eq!(
+        reopened.attempt_count, 0,
+        "a task reopened with an exhausted budget would fail again immediately"
+    );
+    assert!(reopened.lease_owner.is_none());
+    assert_eq!(
+        store.run(&run_id).unwrap().status,
+        RunStatus::Running,
+        "the cached run-status projection is recomputed, not left stale"
+    );
+
+    // The fresh attempts are real: the run now finishes the work it stranded.
+    engine.run_until_idle(20).await.unwrap();
+    let finished = states_by_node(&engine, run_id);
+    assert!(
+        finished.values().all(|state| *state == TaskState::Done),
+        "{finished:?}"
+    );
+    assert_eq!(engine.run_status(&run_id).unwrap(), RunStatus::Completed);
+}
+
+/// The invariant the reopen must not have cost us: `Failed` is still
+/// terminal for every path the engine itself can take. Reopening is an
+/// operator's explicit act, never something a tick can infer.
+#[tokio::test]
+async fn the_engine_never_resurrects_a_failed_task_on_its_own() {
+    let (_dir, store) = temp_store();
+    let executor = Arc::new(ScriptedExecutor::new());
+    executor.then_transient_failures("t07", 2);
+    let engine = WorkflowEngine::new(
+        Arc::clone(&store),
+        Arc::clone(&executor) as Arc<dyn TaskExecutor>,
+    );
+    let workflow = spec(
+        "terminal-stays-terminal",
+        vec![
+            governed_node(
+                "t07",
+                NodeType::Run,
+                &[],
+                Budgets {
+                    max_attempts: 2,
+                    ..Budgets::default()
+                },
+                RetryPolicy {
+                    transient_retries: 9,
+                    reasoning_retries: 0,
+                },
+            ),
+            node("t09", NodeType::Run, &["t07"]),
+        ],
+    );
+    let run_id = engine.start_run(&workflow, "phase 8 build").unwrap();
+    engine.run_until_idle(20).await.unwrap();
+    let failed = store
+        .tasks_for_run(&run_id)
+        .unwrap()
+        .into_iter()
+        .find(|task| task.node_id == "t07")
+        .unwrap();
+    assert_eq!(failed.state, TaskState::Failed);
+
+    // The state machine still has no arc out of Failed, so the store's
+    // CAS door — the one every engine path goes through — stays shut.
+    for target in [
+        TaskState::Ready,
+        TaskState::Planned,
+        TaskState::Retryable,
+        TaskState::Running,
+    ] {
+        assert!(
+            !TaskState::Failed.can_transition(&target),
+            "failed -> {target} must stay illegal"
+        );
+        let err = store
+            .cas_transition(&failed.id, TaskState::Failed, target)
+            .expect_err("terminal tasks must refuse a CAS out");
+        assert!(
+            matches!(
+                err,
+                CoreError::IllegalTransition {
+                    from: TaskState::Failed,
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
+    }
+
+    // And no amount of ticking moves it: the executor's remaining scripted
+    // outcomes are never reached, because the task is never leased again.
+    for _ in 0..5 {
+        let report = engine.tick().await.unwrap();
+        assert_eq!(report.leased, 0);
+        assert_eq!(report.requeued, 0);
+        assert_eq!(report.promoted, 0);
+    }
+    let states = states_by_node(&engine, run_id);
+    assert_eq!(states["t07"], TaskState::Failed);
+    assert_eq!(states["t09"], TaskState::Blocked);
+    assert_eq!(engine.run_status(&run_id).unwrap(), RunStatus::Failed);
 }

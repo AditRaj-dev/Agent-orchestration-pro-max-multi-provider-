@@ -17,7 +17,7 @@ use crate::error::AgentsError;
 
 /// Adapter ids this build can route to (F-02/F-03/F-05 adapters; codex and
 /// zcode join this list when their adapters land).
-pub const KNOWN_ADAPTERS: [&str; 3] = ["mock", "claude-code", "antigravity-agy"];
+pub const KNOWN_ADAPTERS: [&str; 4] = ["mock", "claude-code", "antigravity-agy", "codex"];
 
 /// The agy adapter id (routes to claude/gemini/oss models upstream).
 pub const ADAPTER_ANTIGRAVITY_AGY: &str = "antigravity-agy";
@@ -163,7 +163,7 @@ fn default_enabled() -> bool {
     true
 }
 
-fn now() -> DateTime<Utc> {
+pub(crate) fn now() -> DateTime<Utc> {
     Utc::now()
 }
 

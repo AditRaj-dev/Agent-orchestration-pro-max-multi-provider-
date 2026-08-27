@@ -210,6 +210,42 @@ reopen; per-repo queue independence; ledger round-trips in both query
 directions; ownership exclusive-vs-advisory conflicts, release, and
 self-upgrade.
 
+## 6a. Model advisor (`git-manager` agent)
+
+The git manager has an optional model half, configured like any other agent:
+the `git-manager` registry record (seeded as **agy / `gemini-3.1-pro-high`**,
+mode `plan`, 300s). No record and no `role_adapters` entry means no advisor,
+and every path below falls back to the behavior F-09 shipped with. The
+advisor is an addition to the git manager, never a dependency of it.
+
+It contributes exactly two things, both bounded:
+
+**Commit detail.** `commit_message` keeps the deterministic subject
+(`agentos: audit bundle for run <run_id>`) and appends a sanitized body
+describing what changed, derived from `git status --porcelain` paths. The
+sanitizer drops control characters and leading `-`/`*`/`#`/`>`, caps the body
+at 5 lines / 400 bytes, and yields nothing when nothing survives. GIT-03 is
+unchanged: attribution still lives in the ledger, never in commit text. A
+slow or failed advisor leaves the subject alone — a commit never fails
+because a model was unavailable.
+
+**Stale-base routing.** On a `stale_base` rejection the advisor answers with
+one line: `REBASE <sha>` or `ESCALATE <reason>`. The sha must be hex, 7–40
+chars, and must prefix-match one of the two commits the harness already
+named (recorded `base_commit` or current head) — a commit it was not offered
+escalates. The chosen sha is then re-resolved through
+`git rev-parse --verify <rev>^{commit}` before any argv is built, so no model
+text reaches the CLI. The replay runs as
+`git rebase --onto <resolved> <base_commit>` **inside the task's own isolated
+worktree**, and aborts itself on failure; the mutation is retried either way,
+so a successful rebase only means the retry finds a fresh base. Push remains
+approval-gated (GIT-01) and branch names remain UUID-derived (GIT-04) — the
+advisor cannot touch either.
+
+The routing value on the `git.stale_base` event widens accordingly:
+`rebase-or-review` (no advisor, or the replay failed), `rebased`, or
+`review`, with the advisor's reason carried alongside in `advisor`.
+
 ## 7. Known limitations / next steps
 
 - Queue consumer loop, merge/rebase execution, and remote push are the
@@ -218,3 +254,6 @@ self-upgrade.
 - `stale_base_check` trusts the caller-supplied integration head; wiring it
   to the daemon's repo watch is future work.
 - Glob overlap within a segment is conservative (see §5).
+- The model advisor (§6a) is covered by unit tests over its sanitizer and
+  answer parser; the supervisor wiring has no end-to-end test against a live
+  provider, and an unconfigured advisor is the tested default.

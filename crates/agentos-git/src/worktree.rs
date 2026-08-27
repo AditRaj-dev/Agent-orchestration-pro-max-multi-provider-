@@ -100,7 +100,7 @@ impl WorktreeManager {
     ) -> Result<WorktreeRef, GitError> {
         let branch = Self::branch_name(run_id, task_id)?;
         let path = self.managed_root().join(task_id);
-        ensure_excluded(&self.repo);
+        ensure_excluded(&self.repo, EXCLUDE_LINE);
         cli::worktree_add(&self.repo, &path, &branch, base_commit)?;
         Ok(WorktreeRef {
             repo: self.repo.clone(),
@@ -184,29 +184,29 @@ fn short_hex(id: &str, field: &str) -> Result<String, GitError> {
         .ok_or_else(|| GitError::Invalid(format!("{field} `{id}` yielded truncated hex")))
 }
 
-/// Append the managed-worktree ignore line to `.git/info/exclude`, creating
+/// Append `line` to `.git/info/exclude`, creating
 /// the file and its parent directory when possible. Best effort: a missing
 /// or unusual `.git` layout (e.g. a linked worktree's `.git` file) only
 /// logs — it must not fail worktree creation.
-fn ensure_excluded(repo: &Path) {
+pub fn ensure_excluded(repo: &Path, line: &str) {
     let exclude = repo.join(".git").join("info").join("exclude");
     let attempt = || -> std::io::Result<()> {
         if let Some(parent) = exclude.parent() {
             fs::create_dir_all(parent)?;
         }
         let existing = fs::read_to_string(&exclude).unwrap_or_default();
-        if !existing.lines().any(|line| line.trim() == EXCLUDE_LINE) {
+        if !existing.lines().any(|existing| existing.trim() == line) {
             use std::io::Write;
             let mut file = fs::OpenOptions::new()
                 .create(true)
                 .append(true)
                 .open(&exclude)?;
-            writeln!(file, "{EXCLUDE_LINE}")?;
+            writeln!(file, "{line}")?;
         }
         Ok(())
     };
     if let Err(error) = attempt() {
-        tracing::debug!(%error, ?exclude, "could not update .git/info/exclude");
+        tracing::debug!(%error, ?exclude, %line, "could not update .git/info/exclude");
     }
 }
 

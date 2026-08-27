@@ -9,7 +9,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-use agentos_adapters::{MockAdapter, MockBehavior, RuntimeAdapter};
+use agentos_adapters::{AdapterFailure, MockAdapter, MockBehavior, RuntimeAdapter};
 use agentos_core::{EventType, TaskState};
 use agentos_git::cli;
 use agentos_git::queue::RequestStatus;
@@ -115,7 +115,26 @@ fn success_adapter() -> Arc<MockAdapter> {
 }
 
 fn supervisor_for(repo: &Path, state_dir: &Path, mock: Arc<MockAdapter>) -> Supervisor {
-    let config = SupervisorConfig::for_repo(state_dir, repo);
+    // The graph refresh defaults to `Auto`, which spawns graphify wherever it
+    // happens to be installed. Pin it off so the suite behaves the same on a
+    // developer machine and in CI; the graph tests opt back in explicitly.
+    let config = SupervisorConfig::for_repo(state_dir, repo)
+        .with_graph_refresh(agentos_runtime::GraphRefresh::Disabled);
+    Supervisor::new(config, vec![mock as Arc<dyn RuntimeAdapter>]).expect("supervisor")
+}
+
+fn supervisor_with_graph_refresh(
+    repo: &Path,
+    state_dir: &Path,
+    mock: Arc<MockAdapter>,
+    refresh: agentos_runtime::GraphRefresh,
+) -> Supervisor {
+    // Shared workspace mirrors the Mastermind configuration, where the graph
+    // refresh actually runs: worker edits land in the checkout itself, so
+    // `git status` there is the change set the refresh reasons about.
+    let config = SupervisorConfig::for_repo(state_dir, repo)
+        .with_graph_refresh(refresh)
+        .with_shared_task_workspace();
     Supervisor::new(config, vec![mock as Arc<dyn RuntimeAdapter>]).expect("supervisor")
 }
 
@@ -651,9 +670,9 @@ async fn e2e_crash_recovery_reclaims_expired_lease_and_completes() {
 async fn e2e_ownership_conflict_is_journaled_and_retried() {
     let (dir, repo, head) = temp_repo();
     // Two concurrent Run nodes claiming the SAME scope: one wins the
-    // exclusive hold; the other's first attempt conflicts, is journaled,
-    // and is retried as a transient failure once the winner has released
-    // (its attempt ended), after which the hold is free.
+    // exclusive hold; the other conflicts, is journaled, and returns to
+    // `Ready` *without* consuming an attempt — queueing behind a peer is
+    // not a failed try. It runs once the winner releases the hold.
     let spec = WorkflowSpec {
         id: "conflict".to_owned(),
         version: 1,
@@ -696,12 +715,17 @@ async fn e2e_ownership_conflict_is_journaled_and_retried() {
         types.contains(&"ownership.conflict".to_owned()),
         "the conflict is journaled: {types:?}"
     );
+    // Every task ran exactly once: the deferral cost no retry budget. With
+    // the old transient-failure path a serialized graph exhausted its
+    // attempts queueing rather than working.
     let tasks = tasks_by_node(&supervisor, run_id);
-    let conflicted_attempts: u32 = tasks.values().map(|t| t.attempt_count).sum();
-    assert!(
-        conflicted_attempts >= 1,
-        "the conflicting attempt was consumed and retried"
-    );
+    for (node_id, task) in &tasks {
+        assert_eq!(
+            task.attempt_count, 0,
+            "{node_id} billed a failed attempt for queueing: {}",
+            task.attempt_count
+        );
+    }
     assert!(supervisor.ownership().holds_for_task("").is_empty());
 }
 
@@ -1074,6 +1098,7 @@ async fn registry_agent_drives_model_and_skill_preamble() {
 
     // The registry: a mock-backed worker holding the tech-research skill.
     let registry = agentos_agents::AgentRegistry::open(&state.join("agents.db")).expect("registry");
+    registry.seed_builtin_skills().expect("seed skills");
     registry.seed_builtins().expect("seeds");
     registry
         .create_agent(agentos_agents::AgentRecord {
@@ -1157,6 +1182,7 @@ async fn disabled_registry_agent_falls_back_to_static_routing() {
     let state = dir.path().join("state");
     std::fs::create_dir_all(&state).expect("state dir");
     let registry = agentos_agents::AgentRegistry::open(&state.join("agents.db")).expect("registry");
+    registry.seed_builtin_skills().expect("seed skills");
     registry.seed_builtins().expect("seeds");
     registry
         .create_agent(agentos_agents::AgentRecord {
@@ -1213,12 +1239,383 @@ async fn disabled_registry_agent_falls_back_to_static_routing() {
     let summary = supervisor.drive(&run_id, 20).await.expect("drive");
     assert_eq!(summary.status, RunStatus::Completed);
 
-    // Static default (mock) served the spawn; no skill preamble was
-    // composed and the model key reflects the default path.
+    // Static default (mock) served the spawn, but both application-level
+    // global skills still ride ahead of its objective.
     let spawn = first_payload(&supervisor, run_id, "session.spawn");
     let preview = spawn["objectivePreview"].as_str().expect("preview");
+    let caveman = preview.find("Global skill: /caveman").expect("caveman");
+    let ponytail = preview.find("Global skill: Ponytail").expect("ponytail");
+    assert!(caveman < ponytail, "{spawn}");
+    assert!(preview.ends_with("fallback objective"), "{spawn}");
+}
+
+#[tokio::test]
+async fn mastermind_shared_workspace_is_the_selected_checkout() {
+    let (dir, repo, head) = temp_repo();
+    let spec = WorkflowSpec {
+        id: "visible-output".to_owned(),
+        version: 1,
+        nodes: vec![node("build", NodeType::Run, &[])],
+    };
+    let contracts = HashMap::from([(
+        "build".to_owned(),
+        TaskContract::builder("TASK-BUILD", "write into the selected project")
+            .allowed_paths(vec!["**".to_owned()])
+            .base_commit(head)
+            .build()
+            .expect("contract"),
+    )]);
+    let config =
+        SupervisorConfig::for_repo(dir.path().join("state"), &repo).with_shared_task_workspace();
+    let supervisor = Supervisor::new(config, vec![success_adapter() as Arc<dyn RuntimeAdapter>])
+        .expect("supervisor");
+
+    let run_id = supervisor
+        .start_run(&spec, "make output visible", contracts)
+        .expect("start run");
+    let summary = supervisor.drive(&run_id, 20).await.expect("drive");
+    assert_eq!(summary.status, RunStatus::Completed);
+
+    let spawn = first_payload(&supervisor, run_id, "session.spawn");
     assert_eq!(
-        preview, "fallback objective",
-        "no preamble without a resolved record: {spawn}"
+        Path::new(spawn["workspace"].as_str().expect("workspace")),
+        repo,
+        "Mastermind workers must receive the project selected in the UI, not a hidden worktree"
+    );
+}
+
+#[tokio::test]
+async fn terminal_failure_is_idempotent_and_exposes_provider_detail() {
+    let (dir, repo, head) = temp_repo();
+    let spec = WorkflowSpec {
+        id: "provider-failure".to_owned(),
+        version: 1,
+        nodes: vec![node("product-spec", NodeType::Run, &[])],
+    };
+    let contracts = HashMap::from([(
+        "product-spec".to_owned(),
+        TaskContract::builder("TASK-SPEC", "write the product specification")
+            .allowed_paths(vec!["docs/**".to_owned()])
+            .base_commit(head)
+            .build()
+            .expect("contract"),
+    )]);
+    let adapter = Arc::new(MockAdapter::new(MockBehavior::FailWith(
+        AdapterFailure::Transient {
+            detail: "provider rate limit (status 429)".to_owned(),
+        },
+    )));
+    let supervisor = supervisor_for(&repo, &dir.path().join("state"), adapter);
+
+    let run_id = supervisor
+        .start_run(&spec, "surface the real failure", contracts)
+        .expect("start run");
+    let first = supervisor.drive(&run_id, 30).await.expect("first drive");
+    assert_eq!(first.status, RunStatus::Failed);
+    let failed_events = event_types(&supervisor, run_id)
+        .into_iter()
+        .filter(|event| event == "run.failed")
+        .count();
+
+    let details = supervisor
+        .failure_details(&run_id)
+        .expect("failure details");
+    assert!(
+        details.iter().any(|failure| {
+            failure["detail"]
+                .as_str()
+                .is_some_and(|detail| detail.contains("provider rate limit (status 429)"))
+        }),
+        "provider failure must reach the desktop: {details:#?}"
+    );
+
+    let second = supervisor.drive(&run_id, 30).await.expect("second drive");
+    assert_eq!(second.status, RunStatus::Failed);
+    assert_eq!(second.ticks, 0, "terminal runs cannot be driven again");
+    assert_eq!(
+        event_types(&supervisor, run_id)
+            .into_iter()
+            .filter(|event| event == "run.failed")
+            .count(),
+        failed_events,
+        "repeated Continue clicks cannot append duplicate terminal events"
+    );
+}
+
+// ------------------------------------------- code-graph refresh (F-09)
+
+/// A supervisor with the refresh off must journal exactly what it journaled
+/// before the feature existed — the GitAdvisor property, enforced.
+#[tokio::test]
+async fn graph_refresh_is_silent_when_disabled() {
+    let (dir, repo, head) = temp_repo();
+    let spec = WorkflowSpec {
+        id: "graph-off".to_owned(),
+        version: 1,
+        nodes: vec![node("a", NodeType::Run, &[])],
+    };
+    let supervisor = supervisor_for(&repo, &dir.path().join("state"), success_adapter());
+    let run_id = supervisor
+        .start_run(&spec, "no graph", contracts_for(&spec, &head))
+        .expect("start run");
+    supervisor.drive(&run_id, 20).await.expect("drive");
+
+    let types = event_types(&supervisor, run_id);
+    assert!(
+        !types.iter().any(|event| event.starts_with("graph.")),
+        "a disabled refresh emits nothing at all: {types:?}"
+    );
+}
+
+/// The sharpest test available, and it needs no graphify binary: the mock
+/// adapter *claims* it changed `src/a/mod.rs` but writes nothing, so the
+/// working tree is clean. The refresh must trust `git status` over the
+/// worker's account of itself, spawn nothing, and journal the discrepancy.
+#[tokio::test]
+async fn graph_refresh_trusts_git_over_the_models_file_claim() {
+    let (dir, repo, head) = temp_repo();
+    let spec = WorkflowSpec {
+        id: "graph-claim".to_owned(),
+        version: 1,
+        nodes: vec![node("a", NodeType::Run, &[])],
+    };
+    // A binary that would fail loudly if it were ever spawned.
+    let supervisor = supervisor_with_graph_refresh(
+        &repo,
+        &dir.path().join("state"),
+        success_adapter(),
+        agentos_runtime::GraphRefresh::Binary(repo.join("no-such-graphify")),
+    );
+    let run_id = supervisor
+        .start_run(&spec, "claim vs truth", contracts_for(&spec, &head))
+        .expect("start run");
+    let summary = supervisor.drive(&run_id, 20).await.expect("drive");
+    assert_eq!(summary.status, RunStatus::Completed);
+
+    let skipped = first_payload(&supervisor, run_id, "graph.skipped");
+    assert_eq!(skipped["reason"], json!("no-code-changes"), "{skipped}");
+    assert_eq!(skipped["codeFiles"], json!(0), "{skipped}");
+    assert_eq!(
+        skipped["claimedOnly"],
+        json!(["src/a/mod.rs"]),
+        "the unbacked claim is surfaced, not executed: {skipped}"
+    );
+    let types = event_types(&supervisor, run_id);
+    assert!(
+        !types.iter().any(|event| event == "graph.failed"),
+        "nothing should have been spawned: {types:?}"
+    );
+}
+
+/// The load-bearing non-fatality test: graphify blows up, the task still
+/// succeeds. A stale graph degrades a review; losing completed work does not.
+#[tokio::test]
+async fn graph_refresh_failure_never_fails_the_task() {
+    let (dir, repo, head) = temp_repo();
+    // A real code change, so the skip guard does not short-circuit us.
+    std::fs::write(
+        repo.join("touched.rs"),
+        "pub fn f() {}
+",
+    )
+    .expect("write");
+
+    let spec = WorkflowSpec {
+        id: "graph-fail".to_owned(),
+        version: 1,
+        nodes: vec![node("a", NodeType::Run, &[])],
+    };
+    let missing = repo.join("definitely-not-a-binary");
+    let supervisor = supervisor_with_graph_refresh(
+        &repo,
+        &dir.path().join("state"),
+        success_adapter(),
+        agentos_runtime::GraphRefresh::Binary(missing),
+    );
+    let run_id = supervisor
+        .start_run(&spec, "graph fails", contracts_for(&spec, &head))
+        .expect("start run");
+    let summary = supervisor.drive(&run_id, 20).await.expect("drive");
+
+    assert_eq!(
+        summary.status,
+        RunStatus::Completed,
+        "a graph failure must not fail the run"
+    );
+    let failed = first_payload(&supervisor, run_id, "graph.failed");
+    assert!(
+        failed["reason"]
+            .as_str()
+            .is_some_and(|r| r.contains("spawn")),
+        "{failed}"
+    );
+}
+
+// --------------------------------------------- operator reopen (F-12)
+
+/// E2E reproduction of the observed Phase-8 stall, and its repair.
+///
+/// `t07` hits a provider outage, exhausts its attempt budget while the
+/// outage is still in force, and fails terminally; `t09` and `t10` park as
+/// `Blocked` behind it and the run goes `Failed` with no path back. Once the
+/// provider recovers, `reopen_run` returns all three to work with a fresh
+/// attempt budget, journals what it did, and the next `drive` finishes the
+/// run the outage stranded.
+#[tokio::test]
+async fn e2e_reopen_run_recovers_a_run_stranded_by_a_cleared_outage() {
+    let (dir, repo, head) = temp_repo();
+    let spec = WorkflowSpec {
+        id: "phase-8-build".to_owned(),
+        version: 1,
+        nodes: vec![
+            NodeSpec {
+                budgets: Budgets {
+                    max_attempts: 2,
+                    ..Budgets::default()
+                },
+                retry: RetryPolicy {
+                    transient_retries: 9,
+                    reasoning_retries: 0,
+                },
+                ..node("t07", NodeType::Run, &[])
+            },
+            node("t09", NodeType::Run, &["t07"]),
+            node("t10", NodeType::Run, &["t09"]),
+        ],
+    };
+    let contracts: HashMap<String, TaskContract> = spec
+        .nodes
+        .iter()
+        .map(|n| {
+            (
+                n.id.clone(),
+                TaskContract::builder(
+                    format!("TASK-{}", n.id.to_uppercase()),
+                    format!("execute `{}` of the phase-8 build", n.id),
+                )
+                .allowed_paths(vec!["**".to_owned()])
+                .base_commit(head.clone())
+                .budgets(ContractBudgets::new(10, 2))
+                .build()
+                .expect("contract"),
+            )
+        })
+        .collect();
+    // The outage lasts exactly as long as t07's attempt budget: both of its
+    // allowed attempts fail, and the provider is healthy afterwards.
+    let mock = Arc::new(MockAdapter::new(MockBehavior::FlakyThenSuccess {
+        failures_before_success: 2,
+    }));
+    let supervisor = supervisor_for(&repo, &dir.path().join("state"), mock);
+    let run_id = supervisor
+        .start_run(&spec, "build the thing", contracts)
+        .expect("start run");
+
+    let failed_drive = supervisor.drive(&run_id, 30).await.expect("first drive");
+    assert_eq!(failed_drive.status, RunStatus::Failed);
+    let stranded = tasks_by_node(&supervisor, run_id);
+    assert_eq!(stranded["t07"].state, TaskState::Failed);
+    assert_eq!(
+        stranded["t07"].attempt_count, 2,
+        "budget spent on the outage"
+    );
+    assert_eq!(stranded["t09"].state, TaskState::Blocked);
+    assert_eq!(stranded["t10"].state, TaskState::Blocked);
+    // Driving again changes nothing: terminal is terminal.
+    assert_eq!(
+        supervisor.drive(&run_id, 30).await.expect("re-drive").ticks,
+        0
+    );
+
+    // The provider quota has reset; the operator reopens the run.
+    let report = supervisor.reopen_run(&run_id).expect("reopen");
+    assert_eq!(report.reopened, vec!["t07".to_owned()]);
+    assert_eq!(report.unblocked, vec!["t09".to_owned(), "t10".to_owned()]);
+    assert_eq!(report.status, RunStatus::Running);
+
+    let reopened = tasks_by_node(&supervisor, run_id);
+    assert_eq!(reopened["t07"].state, TaskState::Ready);
+    assert_eq!(
+        reopened["t07"].attempt_count, 0,
+        "fresh attempts, or the first budget gate fails it again"
+    );
+    assert_eq!(reopened["t09"].state, TaskState::Planned);
+    assert_eq!(reopened["t10"].state, TaskState::Planned);
+
+    // The reopen is auditable on its own terms: a run leaving `failed`
+    // without any task succeeding must name the human action that did it.
+    let types = event_types(&supervisor, run_id);
+    assert!(types.contains(&"run.reopened".to_owned()), "{types:?}");
+    let payload = first_payload(&supervisor, run_id, "run.reopened");
+    assert_eq!(payload["reopened"], json!(["t07"]));
+    assert_eq!(payload["unblocked"], json!(["t09", "t10"]));
+    assert_eq!(payload["status"], json!("running"));
+    // The revived task's last journaled state was `task.failed`, and no
+    // tick will ever correct it (the next drive's before/after diff starts
+    // from the already-reopened store). The reopen therefore journals the
+    // correction itself, or every projection keeps rendering t07 as failed.
+    let reopened_ready = supervisor
+        .events(&run_id)
+        .expect("events")
+        .into_iter()
+        .filter(|event| event.event_type.to_string() == "task.ready")
+        .any(|event| {
+            event.payload["node"] == json!("t07") && event.payload["reopened"] == json!(true)
+        });
+    assert!(
+        reopened_ready,
+        "the reopen journals the revived task's state"
+    );
+
+    // ...and the stranded work actually finishes.
+    let recovered = supervisor.drive(&run_id, 30).await.expect("second drive");
+    assert_eq!(recovered.status, RunStatus::Completed);
+    assert!(
+        tasks_by_node(&supervisor, run_id)
+            .values()
+            .all(|task| task.state == TaskState::Done),
+        "every stranded task completed after the reopen"
+    );
+}
+
+/// Reopening is operator-initiated and total: a healthy run has nothing
+/// stranded, so the store reports an empty reopen rather than inventing
+/// work. (The daemon's `mastermind.reopenRun` turns that into
+/// `invalid_params`; the runtime layer stays a mechanism, not a policy.)
+#[tokio::test]
+async fn e2e_reopen_run_on_a_healthy_run_changes_nothing() {
+    let (dir, repo, head) = temp_repo();
+    let spec = WorkflowSpec {
+        id: "healthy".to_owned(),
+        version: 1,
+        nodes: vec![node("only", NodeType::Run, &[])],
+    };
+    let contracts = HashMap::from([(
+        "only".to_owned(),
+        TaskContract::builder("TASK-ONLY", "do the one thing")
+            .allowed_paths(vec!["**".to_owned()])
+            .base_commit(head)
+            .build()
+            .expect("contract"),
+    )]);
+    let supervisor = supervisor_for(&repo, &dir.path().join("state"), success_adapter());
+    let run_id = supervisor
+        .start_run(&spec, "healthy run", contracts)
+        .expect("start run");
+    assert_eq!(
+        supervisor.drive(&run_id, 30).await.expect("drive").status,
+        RunStatus::Completed
+    );
+
+    let report = supervisor.reopen_run(&run_id).expect("reopen");
+    assert!(report.reopened.is_empty());
+    assert!(report.unblocked.is_empty());
+    assert!(!report.changed_anything());
+    assert_eq!(report.status, RunStatus::Completed, "still completed");
+    assert!(
+        tasks_by_node(&supervisor, run_id)
+            .values()
+            .all(|task| task.state == TaskState::Done),
+        "a reopen never disturbs finished work"
     );
 }

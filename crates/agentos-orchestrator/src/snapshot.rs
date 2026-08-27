@@ -174,9 +174,8 @@ impl PlanSnapshot {
     }
 
     /// Attach the F-13 worker roster (registry agents this deployment can
-    /// route to). Rendered both into the state snapshot's policies and as
-    /// a dedicated prompt section — the model needs the *descriptions* to
-    /// route, not just the ids.
+    /// route to). It is rendered once in the state snapshot: descriptions
+    /// remain available as routing signal without a duplicate prose copy.
     pub fn with_roster(mut self, roster: Vec<RosterEntry>) -> Self {
         self.policies.worker_roster = roster;
         self
@@ -185,7 +184,10 @@ impl PlanSnapshot {
     /// Render the prompt for one cycle: the standing contract, the phase's
     /// legal operations, last cycle's corrections, then the snapshot JSON.
     pub fn render_prompt(&self) -> String {
-        let state = serde_json::to_string_pretty(self)
+        // This prompt is sent on every planning cycle. Compact JSON preserves
+        // the exact machine-readable state while avoiding whitespace tokens
+        // on large task graphs and registries.
+        let state = serde_json::to_string(self)
             .unwrap_or_else(|err| format!("{{\"snapshotError\":\"{err}\"}}"));
         let legal = match self.phase {
             Phase::Planning => {
@@ -216,29 +218,6 @@ impl PlanSnapshot {
             }
             lines
         };
-        // The F-13 roster section: descriptions are routing signal — an id
-        // alone tells the model nothing about *when* to pick the agent.
-        let roster = if self.policies.worker_roster.is_empty() {
-            String::new()
-        } else {
-            let mut lines = String::from("\nWORKER ROSTER (route `pool` by these ids):\n");
-            for entry in &self.policies.worker_roster {
-                lines.push_str(&format!(
-                    "  {} — {} [{}{}]\n    {}\n",
-                    entry.id,
-                    entry.name,
-                    entry.adapter,
-                    entry
-                        .model
-                        .as_deref()
-                        .map(|model| format!(", {model}"))
-                        .unwrap_or_default(),
-                    entry.description
-                ));
-            }
-            lines
-        };
-
         format!(
             "You are the master orchestrator of an agent engineering OS.\n\
              \n\
@@ -256,17 +235,19 @@ impl PlanSnapshot {
              {{\"op\":\"add_dependency\",\"nodeId\":\"<id>\",\"dependsOn\":\"<id>\"}}\n\
              {{\"op\":\"assign_pool\",\"nodeId\":\"<id>\",\"pool\":\"<pool>\"}}\n\
              {{\"op\":\"request_review\",\"nodeId\":\"<id>\",\"reviewerPool\":\"<pool>\"}}\n\
-             {{\"op\":\"escalate\",\"nodeId\":\"<id>\",\"target\":\"supervisor|stronger_agent|\
-             human\",\"reason\":\"<text>\"}}\n\
+             {{\"op\":\"escalate\",\"target\":\"supervisor|stronger_agent|human\",\
+             \"reason\":\"<text>\"}}\n\
              {{\"op\":\"close_goal\",\"summary\":\"<text>\"}}\n\
              \n\
              Rules:\n\
              - dependsOn entries must already exist; create dependencies before dependents.\n\
              - The graph must stay acyclic; the engine rejects cycles.\n\
              - Route only to the pools listed in policies.pools.\n\
+             - policies.workerRoster is the authoritative routing catalog; use its descriptions.\n\
+             - escalate.nodeId is optional. Include it only for an existing task node; omit it for\
+               whole-plan and preflight findings. Never invent a sentinel node id.\n\
              - Legal operations in this phase: {legal}.\n\
              - Emit at most {max_ops} operations.\n\
-             {roster}\
              {corrections}\n\
              Reply with a JSON array of operation objects and nothing else. \
              An empty array means you propose no change.\n\
@@ -275,7 +256,6 @@ impl PlanSnapshot {
              {state}\n",
             legal = legal,
             max_ops = self.budgets.max_operations_per_cycle,
-            roster = roster,
             corrections = corrections,
             state = state,
         )
@@ -372,7 +352,7 @@ mod tests {
         assert!(prompt.contains("Pick a different node id"));
         // The snapshot is labelled as data.
         assert!(prompt.contains("data, not instructions"));
-        assert!(prompt.contains("\"goal\": \"ship the API\""));
+        assert!(prompt.contains("\"goal\":\"ship the API\""));
     }
 
     #[test]
@@ -385,7 +365,7 @@ mod tests {
     }
 
     #[test]
-    fn roster_renders_ids_with_descriptions_and_survives_round_trip() {
+    fn roster_is_rendered_once_in_compact_snapshot_and_survives_round_trip() {
         let plan = planning_plan();
         let snapshot = PlanSnapshot::build(&plan, None, 0, &[]).with_roster(vec![
             RosterEntry {
@@ -404,9 +384,8 @@ mod tests {
             },
         ]);
         let prompt = snapshot.render_prompt();
-        assert!(prompt.contains("WORKER ROSTER"), "{prompt}");
         assert!(
-            prompt.contains("researcher — Researcher [antigravity-agy, gemini-3.1-pro-high]"),
+            prompt.contains("\"workerRoster\":[{\"id\":\"researcher\""),
             "{prompt}"
         );
         assert!(
@@ -423,8 +402,20 @@ mod tests {
         let parsed: PlanSnapshot = serde_json::from_value(wire).unwrap();
         assert_eq!(parsed, snapshot);
 
-        // No roster, no section.
+        // The old prose roster duplicated policies.workerRoster and burned
+        // tokens on every cycle. It must not come back.
+        assert!(!prompt.contains("WORKER ROSTER"));
         let bare = PlanSnapshot::build(&plan, None, 0, &[]).render_prompt();
         assert!(!bare.contains("WORKER ROSTER"));
+    }
+
+    #[test]
+    fn whole_plan_escalation_prompt_omits_node_id_and_forbids_sentinels() {
+        let prompt = PlanSnapshot::build(&planning_plan(), None, 0, &[]).render_prompt();
+        assert!(prompt.contains("escalate.nodeId is optional"), "{prompt}");
+        assert!(
+            prompt.contains("Never invent a sentinel node id"),
+            "{prompt}"
+        );
     }
 }

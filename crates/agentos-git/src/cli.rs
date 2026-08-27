@@ -256,3 +256,60 @@ pub fn diff_name_only(repo: &Path, a: &str, b: &str) -> Result<Vec<String>, GitC
         .map(str::to_string)
         .collect())
 }
+
+/// `git status --porcelain` reduced to repo-relative paths, for describing a
+/// commit before it is made. Rename entries (`old -> new`) report the new
+/// path; quoted paths keep git's quoting, which is fine for prose.
+pub fn status_paths(repo: &Path) -> Result<Vec<String>, GitCliError> {
+    // `-uall` expands untracked *directories* into their files. Without it
+    // git collapses a new directory to a single `dir/` entry, so a task that
+    // created `components/Timer.tsx` reports only `components/` — no
+    // extension, and therefore invisible to any per-file classification.
+    let out = run(Some(repo), &str_args(&["status", "--porcelain", "-uall"]))?;
+    Ok(out
+        .stdout
+        .lines()
+        .filter_map(|line| line.get(3..))
+        .map(|path| match path.split_once(" -> ") {
+            Some((_, new)) => new.trim(),
+            None => path.trim(),
+        })
+        .filter(|path| !path.is_empty())
+        .map(str::to_string)
+        .collect())
+}
+
+/// `git rebase --onto <onto> <upstream>`: replay this branch's own commits
+/// onto `onto`. Both arguments must already be resolved object names — the
+/// caller validates them with [`rev_parse_verify`] first, so nothing that
+/// is not a real commit in this repository ever reaches argv.
+///
+/// On failure the rebase is aborted before the error is returned, so the
+/// worktree is never left mid-rebase for the next lease to trip over.
+pub fn rebase_onto(repo: &Path, onto: &str, upstream: &str) -> Result<(), GitCliError> {
+    let args = str_args(&["rebase", "--onto", onto, upstream]);
+    let out = capture(Some(repo), &args)?;
+    if out.code == 0 {
+        return Ok(());
+    }
+    let _ = run(Some(repo), &str_args(&["rebase", "--abort"]));
+    Err(failure(&args, Some(out.code), out.stderr))
+}
+
+/// `git rev-parse --verify <rev>^{commit}` — resolves to a full sha, or
+/// `None` when the revision does not name a commit in this repository.
+pub fn rev_parse_verify(repo: &Path, rev: &str) -> Result<Option<String>, GitCliError> {
+    let spec = format!("{rev}^{{commit}}");
+    let args = vec![
+        OsString::from("rev-parse"),
+        OsString::from("--verify"),
+        OsString::from("--quiet"),
+        OsString::from(spec),
+    ];
+    let out = capture(Some(repo), &args)?;
+    match out.code {
+        0 => Ok(Some(trimmed(&out))),
+        1 => Ok(None),
+        code => Err(failure(&args, Some(code), out.stderr)),
+    }
+}

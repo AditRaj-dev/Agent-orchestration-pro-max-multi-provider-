@@ -47,6 +47,10 @@ pub enum Outcome {
     /// The agent failed by reasoning (bad output, wrong path, contract
     /// violation) — governed by `retry.reasoning_retries`.
     ReasoningFailure,
+    /// A reasoning failure that should route the next allowed attempt to a
+    /// different agent role. The engine consumes the failed attempt and
+    /// retargets atomically before the task becomes leaseable again.
+    EscalatedReasoningFailure { agent_role: String },
     /// The failure is transient infrastructure (worker crash, IO, provider
     /// outage) — governed by `retry.transient_retries`.
     TransientFailure,
@@ -59,6 +63,12 @@ pub enum Outcome {
     /// CAS by whoever resolves the approval, and `-> Failed`/`-> Cancelled`
     /// stay available so a parked task is never un-cancellable.
     AwaitingApproval,
+    /// The task could not start for a reason that is nobody's failure and
+    /// will clear on its own — today: another task holds overlapping path
+    /// ownership. The task returns to `Ready` and **consumes no attempt**:
+    /// waiting your turn is not a failed try, and a serialized graph used
+    /// to exhaust its retry budget queueing rather than working.
+    Deferred { reason: String },
 }
 
 /// Executes one leased task against its contract (the F-02 adapter layer
@@ -129,6 +139,9 @@ pub struct TickReport {
     /// attempt was consumed and the engine will not pick them up again
     /// until someone transitions them out.
     pub awaiting_approval: usize,
+    /// Tasks returned to `Ready` without consuming an attempt because they
+    /// could not start yet (path ownership held by a peer).
+    pub deferred: usize,
 }
 
 impl TickReport {
@@ -139,6 +152,7 @@ impl TickReport {
             || !self.succeeded.is_empty()
             || !self.failed.is_empty()
             || self.requeued > 0
+            || self.deferred > 0
             || self.escalated_over_budget > 0
             || self.blocked > 0
             || self.conflicted > 0
@@ -399,12 +413,46 @@ impl WorkflowEngine {
                     Err(err) => return Err(err.into()),
                 }
             }
-            Outcome::TransientFailure | Outcome::ReasoningFailure => {
-                let reasoning = outcome == Outcome::ReasoningFailure;
+            Outcome::Deferred { reason } => {
+                // Running -> Retryable -> Ready: the lifecycle graph has no
+                // direct `Running -> Ready` arc, and `record_failure` is the
+                // wrong door — it would bill an attempt.
+                match self
+                    .store
+                    .cas_transition(&task_id, TaskState::Running, TaskState::Retryable)
+                    .and_then(|_| {
+                        self.store
+                            .cas_transition(&task_id, TaskState::Retryable, TaskState::Ready)
+                    }) {
+                    Ok(_) => {
+                        tracing::info!(task_id = %task_id, node = %node_id, %reason,
+                            "task deferred; requeued without consuming an attempt");
+                        report.deferred += 1;
+                    }
+                    Err(CoreError::IllegalTransition { .. }) => {
+                        tracing::warn!(task_id = %task_id, "outcome dropped; task moved on");
+                        report.conflicted += 1;
+                    }
+                    Err(err) => return Err(err.into()),
+                }
+            }
+            Outcome::TransientFailure
+            | Outcome::ReasoningFailure
+            | Outcome::EscalatedReasoningFailure { .. } => {
+                let (reasoning, retarget_role) = match outcome {
+                    Outcome::TransientFailure => (false, None),
+                    Outcome::ReasoningFailure => (true, None),
+                    Outcome::EscalatedReasoningFailure { agent_role } => (true, Some(agent_role)),
+                    _ => unreachable!("success, approval and deferral matched above"),
+                };
                 let task = self.store.task(&task_id)?;
                 let failures_after = task.attempt_count + 1;
                 let requeue = self.scheduler.may_requeue(&task, reasoning, failures_after);
-                match self.store.record_failure(&task_id, requeue) {
+                match self.store.record_failure_with_retarget(
+                    &task_id,
+                    requeue,
+                    retarget_role.as_deref(),
+                ) {
                     Ok(record) => {
                         if record.state == TaskState::Ready {
                             report.requeued += 1;

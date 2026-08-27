@@ -51,6 +51,8 @@
 pub mod adapter;
 pub mod agy;
 pub mod claude;
+pub mod codex;
+pub mod decision;
 pub mod error;
 pub mod events;
 pub mod mock;

@@ -7,7 +7,7 @@ license.workspace = true
 
 [dependencies]
 agentos-core = { path = "../agentos-core" }
-agentos-daemon = { path = "../agentos-daemon" }
+agentos-journal = { path = "../agentos-journal" }
 agentos-adapters = { path = "../agentos-adapters" }
 agentos-workflow = { path = "../agentos-workflow" }
 agentos-git = { path = "../agentos-git" }

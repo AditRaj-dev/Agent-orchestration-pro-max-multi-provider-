@@ -46,15 +46,41 @@
 //! F-03's `AGENTOS_CLAUDE_E2E=1`.
 
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
-use agentos_adapters::{AdapterEvent, RuntimeAdapter, SpawnSpec, UsageSnapshot};
+use agentos_adapters::{
+    AdapterError, AdapterEvent, AdapterFailure, RuntimeAdapter, SpawnSpec, UsageSnapshot,
+};
 use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast::error::RecvError;
 use uuid::Uuid;
 
 use crate::error::OrchestratorError;
+
+/// Preserve the adapter's structured quota signal instead of reducing it to
+/// display text. Mastermind can then switch providers without treating an
+/// ordinary task/model failure as a quota event.
+fn adapter_model_error(error: AdapterError) -> OrchestratorError {
+    match error {
+        AdapterError::SessionFailed(AdapterFailure::Transient { detail }) => {
+            OrchestratorError::ProviderLimit { detail }
+        }
+        other => OrchestratorError::Model {
+            detail: other.to_string(),
+        },
+    }
+}
+
+fn provider_model_error(failure: AdapterFailure) -> OrchestratorError {
+    match failure {
+        AdapterFailure::Transient { detail } => OrchestratorError::ProviderLimit { detail },
+        other => OrchestratorError::Model {
+            detail: other.to_string(),
+        },
+    }
+}
 
 /// The pinned orchestrator model (F-00 §4; `opus-5` 404s, `opus` is an
 /// accepted alias).
@@ -124,6 +150,59 @@ pub struct ModelResponse {
     /// on this account at seven-day utilization 0.86 (handoff §"SESSION 4"):
     /// not a failure, but the caller should back off (OR-08).
     pub rate_limited: bool,
+    /// Structured plan-mode questions emitted during this turn. The model
+    /// may still finish the turn after asking; callers keep these separate
+    /// from the operation text so a desktop can render real choices.
+    pub decisions: Vec<PlanningDecision>,
+}
+
+/// One provider-neutral question raised while the planner is in plan mode.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlanningDecision {
+    pub tool: String,
+    pub prompt: String,
+    pub options: Vec<String>,
+    pub multi_select: bool,
+}
+
+/// Provider conversation retained for the duration of one Mastermind phase.
+///
+/// A CLI process may still be one-shot, but Claude, Codex, and agy all expose
+/// a provider conversation id that lets the next process resume the same
+/// context. Mastermind shares this handle between its read-only preparation
+/// model and the scoped author model, then clears it at the approved phase
+/// boundary.
+#[derive(Debug, Clone, Default)]
+pub struct PlanningConversation {
+    provider_session_id: Arc<StdMutex<Option<String>>>,
+}
+
+impl PlanningConversation {
+    pub fn new(provider_session_id: Option<String>) -> Self {
+        Self {
+            provider_session_id: Arc::new(StdMutex::new(provider_session_id)),
+        }
+    }
+
+    pub fn provider_session_id(&self) -> Option<String> {
+        self.provider_session_id
+            .lock()
+            .ok()
+            .and_then(|id| id.clone())
+    }
+
+    pub fn reset(&self) {
+        if let Ok(mut id) = self.provider_session_id.lock() {
+            *id = None;
+        }
+    }
+
+    fn remember(&self, provider_session_id: String) {
+        if let Ok(mut id) = self.provider_session_id.lock() {
+            *id = Some(provider_session_id);
+        }
+    }
 }
 
 /// A model that proposes plan operations.
@@ -145,6 +224,17 @@ pub struct ClaudePlanningModel {
     /// `mastermind-commands` skill body, loaded from the registry by the
     /// caller). `None` keeps the bare prompt.
     skill_preamble: Option<String>,
+    /// Write roots granted to this provider turn. Empty keeps the
+    /// orchestrator read-only; phase document authors opt into the one
+    /// project subtree they own.
+    allowed_paths: Vec<String>,
+    tool_allowlist: Vec<String>,
+    /// Optional denylist override for delegated document/design sessions.
+    /// The top-tier orchestrator retains [`ORCHESTRATOR_TOOL_DENYLIST`].
+    tool_denylist: Option<Vec<String>>,
+    /// Shared provider conversation. The full skill envelope is sent only
+    /// when this is empty; resumed turns send their incremental prompt.
+    conversation: PlanningConversation,
 }
 
 impl ClaudePlanningModel {
@@ -161,6 +251,10 @@ impl ClaudePlanningModel {
             model: ORCHESTRATOR_MODEL.to_owned(),
             timeout: Duration::from_secs(DEFAULT_PLANNING_TIMEOUT_SECS),
             skill_preamble: None,
+            allowed_paths: Vec::new(),
+            tool_allowlist: Vec::new(),
+            tool_denylist: None,
+            conversation: PlanningConversation::default(),
         }
     }
 
@@ -184,26 +278,63 @@ impl ClaudePlanningModel {
         self
     }
 
+    /// Grant this turn edit access to explicit paths. This is used only by
+    /// the phase document/design author spawned by Mastermind; the command
+    /// orchestrator never calls it.
+    /// Tools this turn may use without a permission prompt.
+    ///
+    /// A headless `-p` run cannot answer a prompt, so anything not
+    /// pre-approved is denied in silence. `acceptEdits` covers file edits
+    /// only: a phase whose procedure is a shell command gets zero Bash calls
+    /// and returns an empty result, which is exactly how Phase 7.5 failed.
+    pub fn with_tool_allowlist(mut self, tools: Vec<String>) -> Self {
+        self.tool_allowlist = tools;
+        self
+    }
+
+    pub fn with_allowed_paths(mut self, paths: Vec<String>) -> Self {
+        self.allowed_paths = paths;
+        self
+    }
+
+    /// Override the top-tier denylist for a delegated author/reviewer.
+    pub fn with_tool_denylist(mut self, tools: Vec<String>) -> Self {
+        self.tool_denylist = Some(tools);
+        self
+    }
+
+    /// Reuse a provider conversation across read-only and scoped-write turns.
+    pub fn with_conversation(mut self, conversation: PlanningConversation) -> Self {
+        self.conversation = conversation;
+        self
+    }
+
     /// The spawn spec for one planning turn.
     ///
     /// Pure and unit-testable: the denylist, model pin and empty
     /// allowed-paths list are asserted in tests without spawning anything.
     pub fn spawn_spec(&self, prompt: &str) -> SpawnSpec {
-        let objective = match &self.skill_preamble {
-            Some(preamble) => format!("{preamble}{prompt}"),
-            None => prompt.to_owned(),
+        self.spawn_spec_for_turn(prompt, true)
+    }
+
+    fn spawn_spec_for_turn(&self, prompt: &str, include_preamble: bool) -> SpawnSpec {
+        let objective = match (&self.skill_preamble, include_preamble) {
+            (Some(preamble), true) => format!("{preamble}{prompt}"),
+            _ => prompt.to_owned(),
         };
         SpawnSpec {
             task_id: Uuid::now_v7(),
             objective,
             workspace: self.workspace.clone(),
-            allowed_paths: Vec::new(),
+            allowed_paths: self.allowed_paths.clone(),
             forbidden_paths: Vec::new(),
-            tool_allowlist: Vec::new(),
-            tool_denylist: ORCHESTRATOR_TOOL_DENYLIST
-                .iter()
-                .map(|tool| (*tool).to_owned())
-                .collect(),
+            tool_allowlist: self.tool_allowlist.clone(),
+            tool_denylist: self.tool_denylist.clone().unwrap_or_else(|| {
+                ORCHESTRATOR_TOOL_DENYLIST
+                    .iter()
+                    .map(|tool| (*tool).to_owned())
+                    .collect()
+            }),
             model: Some(self.model.clone()),
             timeout_secs: self.timeout.as_secs(),
             isolated_home: None,
@@ -214,14 +345,56 @@ impl ClaudePlanningModel {
 #[async_trait]
 impl PlanningModel for ClaudePlanningModel {
     async fn propose(&self, prompt: &str) -> Result<ModelResponse, OrchestratorError> {
-        let spec = self.spawn_spec(prompt);
-        let handle =
-            self.adapter
-                .start_session(spec)
-                .await
-                .map_err(|err| OrchestratorError::Model {
-                    detail: err.to_string(),
-                })?;
+        let resume_id = self.conversation.provider_session_id();
+        // Establishing the session spawns a provider process and waits on its
+        // handshake, so it shares the turn timeout rather than running before
+        // it. The event-loop timeout below cannot cover this await, and a
+        // provider that never completes its handshake used to park the caller
+        // forever: the phase stayed `running` with no timer, no error and no
+        // terminal state, which left every recovery action gated off because
+        // each one requires `blocked`. Only a daemon restart cleared it.
+        let handle = match tokio::time::timeout(self.timeout, async {
+            let handle = if let Some(provider_session_id) = resume_id {
+                let resume_spec = self.spawn_spec_for_turn(prompt, false);
+                match self
+                    .adapter
+                    .resume_session(resume_spec, provider_session_id.clone())
+                    .await
+                {
+                    Ok(handle) => handle,
+                    Err(error) => {
+                        tracing::warn!(
+                            provider_session_id,
+                            %error,
+                            "planning conversation resume failed; rebuilding from the durable envelope"
+                        );
+                        self.conversation.reset();
+                        self.adapter
+                            .start_session(self.spawn_spec_for_turn(prompt, true))
+                            .await
+                            .map_err(adapter_model_error)?
+                    }
+                }
+            } else {
+                self.adapter
+                    .start_session(self.spawn_spec_for_turn(prompt, true))
+                    .await
+                    .map_err(adapter_model_error)?
+            };
+            Ok::<_, OrchestratorError>(handle)
+        })
+        .await
+        {
+            Ok(result) => result?,
+            Err(_elapsed) => {
+                return Err(OrchestratorError::Model {
+                    detail: format!(
+                        "provider session did not start within {}s",
+                        self.timeout.as_secs()
+                    ),
+                });
+            }
+        };
         // NOTE (discovered constraint): `SessionHandle::events()` is a
         // broadcast subscription with no replay, and F-02's adapters spawn
         // their driving task inside `start_session`. Early events can
@@ -238,6 +411,7 @@ impl PlanningModel for ClaudePlanningModel {
             loop {
                 match events.recv().await {
                     Ok(AdapterEvent::Started { session_id, .. }) => {
+                        self.conversation.remember(session_id.clone());
                         response.session_id = Some(session_id);
                     }
                     Ok(AdapterEvent::TextDelta(text)) => deltas.push_str(&text),
@@ -252,17 +426,28 @@ impl PlanningModel for ClaudePlanningModel {
                     Ok(AdapterEvent::ToolUse { tool, .. }) => {
                         tracing::debug!(tool = %tool, "orchestrator model used a tool");
                     }
+                    Ok(AdapterEvent::Decision {
+                        tool,
+                        prompt,
+                        options,
+                        multi_select,
+                    }) => {
+                        tracing::info!(tool = %tool,
+                            "orchestrator model asked for a human decision");
+                        response.decisions.push(PlanningDecision {
+                            tool,
+                            prompt,
+                            options,
+                            multi_select,
+                        });
+                    }
                     Ok(AdapterEvent::Finished { final_result, .. }) => {
                         if let Some(text) = final_result {
                             response.text = text;
                         }
                         return Ok(());
                     }
-                    Ok(AdapterEvent::Failed(failure)) => {
-                        return Err(OrchestratorError::Model {
-                            detail: failure.to_string(),
-                        });
-                    }
+                    Ok(AdapterEvent::Failed(failure)) => return Err(provider_model_error(failure)),
                     // A slow consumer dropped events; the terminal event is
                     // still ahead of us, so keep reading.
                     Err(RecvError::Lagged(skipped)) => {
@@ -347,6 +532,7 @@ impl PlanningModel for ScriptedPlanningModel {
                 session_id: Some("scripted".to_owned()),
                 usage: None,
                 rate_limited: false,
+                decisions: Vec::new(),
             }),
             Some(Err(detail)) => Err(OrchestratorError::Model {
                 detail: detail.clone(),
@@ -361,6 +547,146 @@ mod tests {
     use super::*;
     use agentos_adapters::claude::{ClaudeAdapter, ClaudeInvocation};
     use agentos_adapters::mock::{MockAdapter, MockBehavior};
+    use agentos_adapters::{
+        AdapterError, AuthStatus, Capabilities, RuntimeAdapter, RuntimeInfo, SessionHandle,
+        SpawnSpec,
+    };
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// A provider whose session establishment never completes. Before the
+    /// turn timeout covered `start_session`, this hung the caller forever and
+    /// stranded the phase in `running`.
+    struct HangingStartAdapter {
+        inner: MockAdapter,
+    }
+
+    impl HangingStartAdapter {
+        fn new() -> Self {
+            Self {
+                inner: MockAdapter::new(MockBehavior::Success {
+                    turns: 1,
+                    files_changed: vec![],
+                }),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl RuntimeAdapter for HangingStartAdapter {
+        fn id(&self) -> &str {
+            "hanging-start"
+        }
+
+        async fn detect(&self) -> RuntimeInfo {
+            self.inner.detect().await
+        }
+
+        async fn auth_status(&self) -> AuthStatus {
+            self.inner.auth_status().await
+        }
+
+        async fn capabilities(&self) -> Capabilities {
+            self.inner.capabilities().await
+        }
+
+        async fn start_session(&self, _spec: SpawnSpec) -> Result<SessionHandle, AdapterError> {
+            std::future::pending::<()>().await;
+            unreachable!("pending future never resolves")
+        }
+
+        async fn resume_session(
+            &self,
+            _spec: SpawnSpec,
+            _provider_session_id: String,
+        ) -> Result<SessionHandle, AdapterError> {
+            std::future::pending::<()>().await;
+            unreachable!("pending future never resolves")
+        }
+
+        async fn shutdown(&self) -> Result<(), AdapterError> {
+            self.inner.shutdown().await
+        }
+    }
+
+    #[tokio::test]
+    async fn hanging_session_start_fails_within_the_turn_timeout() {
+        let model = ClaudePlanningModel::new(
+            std::sync::Arc::new(HangingStartAdapter::new()),
+            std::path::Path::new("."),
+        )
+        .with_timeout(Duration::from_secs(1));
+
+        let error = model
+            .propose("anything")
+            .await
+            .expect_err("a provider that never starts must not hang the turn");
+
+        assert!(
+            error.to_string().contains("did not start within 1s"),
+            "expected a session-start timeout, got: {error}"
+        );
+    }
+
+    struct ResumeFailsAdapter {
+        inner: MockAdapter,
+        resume_calls: AtomicUsize,
+        started_objectives: StdMutex<Vec<String>>,
+    }
+
+    impl ResumeFailsAdapter {
+        fn new() -> Self {
+            Self {
+                inner: MockAdapter::new(MockBehavior::Success {
+                    turns: 1,
+                    files_changed: vec![],
+                }),
+                resume_calls: AtomicUsize::new(0),
+                started_objectives: StdMutex::new(Vec::new()),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl RuntimeAdapter for ResumeFailsAdapter {
+        fn id(&self) -> &str {
+            "resume-fails"
+        }
+
+        async fn detect(&self) -> RuntimeInfo {
+            self.inner.detect().await
+        }
+
+        async fn auth_status(&self) -> AuthStatus {
+            self.inner.auth_status().await
+        }
+
+        async fn capabilities(&self) -> Capabilities {
+            self.inner.capabilities().await
+        }
+
+        async fn start_session(&self, spec: SpawnSpec) -> Result<SessionHandle, AdapterError> {
+            self.started_objectives
+                .lock()
+                .expect("objectives")
+                .push(spec.objective.clone());
+            self.inner.start_session(spec).await
+        }
+
+        async fn resume_session(
+            &self,
+            _spec: SpawnSpec,
+            _provider_session_id: String,
+        ) -> Result<SessionHandle, AdapterError> {
+            self.resume_calls.fetch_add(1, Ordering::Relaxed);
+            Err(AdapterError::Unsupported(
+                "expired mock conversation".to_owned(),
+            ))
+        }
+
+        async fn shutdown(&self) -> Result<(), AdapterError> {
+            self.inner.shutdown().await
+        }
+    }
 
     fn planner() -> ClaudePlanningModel {
         ClaudePlanningModel::new(Arc::new(ClaudeAdapter::new()), PathBuf::from("."))
@@ -469,6 +795,12 @@ mod tests {
         );
         assert!(spec.objective.ends_with("plan this"));
 
+        let discovery = skilled.spawn_spec("# DISCOVERY INTERVIEW\nAsk questions.");
+        assert!(discovery.objective.starts_with("# Mastermind"));
+        assert!(discovery
+            .objective
+            .ends_with("# DISCOVERY INTERVIEW\nAsk questions."));
+
         // Absent and empty preambles keep the bare prompt.
         assert_eq!(planner().spawn_spec("plan this").objective, "plan this");
         assert_eq!(
@@ -492,6 +824,60 @@ mod tests {
             .with_timeout(Duration::from_secs(5));
         let response = planner.propose("plan this").await.unwrap();
         assert!(response.session_id.is_some() || !response.text.is_empty());
+    }
+
+    #[tokio::test]
+    async fn planning_turns_resume_one_provider_conversation_until_reset() {
+        let adapter = Arc::new(MockAdapter::new(MockBehavior::Success {
+            turns: 1,
+            files_changed: vec![],
+        }));
+        let conversation = PlanningConversation::default();
+        let planner = ClaudePlanningModel::new(adapter, PathBuf::from("."))
+            .with_skill_preamble(Some("# full envelope\n".to_owned()))
+            .with_conversation(conversation.clone())
+            .with_timeout(Duration::from_secs(5));
+
+        let first = planner.propose("first turn").await.expect("first turn");
+        let second = planner.propose("incremental turn").await.expect("resume");
+        assert_eq!(first.session_id, second.session_id);
+        assert_eq!(conversation.provider_session_id(), second.session_id);
+
+        conversation.reset();
+        let third = planner.propose("new phase").await.expect("new session");
+        assert_ne!(second.session_id, third.session_id);
+    }
+
+    #[tokio::test]
+    async fn failed_resume_retries_once_with_the_full_durable_envelope() {
+        let adapter = Arc::new(ResumeFailsAdapter::new());
+        let conversation = PlanningConversation::default();
+        let planner = ClaudePlanningModel::new(adapter.clone(), PathBuf::from("."))
+            .with_skill_preamble(Some("# checkpoint envelope\n".to_owned()))
+            .with_conversation(conversation.clone())
+            .with_timeout(Duration::from_secs(5));
+
+        let first = planner.propose("prepare").await.expect("initial session");
+        let fallback = planner
+            .propose("author from checkpoint")
+            .await
+            .expect("fresh fallback");
+
+        assert_eq!(adapter.resume_calls.load(Ordering::Relaxed), 1);
+        assert_ne!(first.session_id, fallback.session_id);
+        assert_eq!(conversation.provider_session_id(), fallback.session_id);
+        assert_eq!(
+            adapter
+                .started_objectives
+                .lock()
+                .expect("objectives")
+                .as_slice(),
+            [
+                "# checkpoint envelope\nprepare",
+                "# checkpoint envelope\nauthor from checkpoint",
+            ],
+            "the one fresh retry reconstructs the full envelope under the same model scope"
+        );
     }
 
     #[tokio::test]
@@ -530,6 +916,14 @@ mod tests {
             ScriptedPlanningModel::with_failures(vec![Err("claude binary not found".to_owned())]);
         let err = model.propose("p").await.unwrap_err();
         assert!(matches!(err, OrchestratorError::Model { .. }));
+    }
+
+    #[test]
+    fn structured_transient_provider_failure_is_preserved_for_failover() {
+        let error = provider_model_error(AdapterFailure::Transient {
+            detail: "provider rate limit (status 429)".to_owned(),
+        });
+        assert!(matches!(error, OrchestratorError::ProviderLimit { .. }));
     }
 
     // -----------------------------------------------------------------

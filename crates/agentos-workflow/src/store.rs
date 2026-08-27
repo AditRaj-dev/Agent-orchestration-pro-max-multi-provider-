@@ -123,6 +123,31 @@ impl RunStatus {
     }
 }
 
+/// What one [`TaskStore::reopen_run`] did.
+///
+/// Both lists are node ids rather than counts because the audit event and
+/// the UI both need to say *which* work came back — "1 task reopened" is
+/// not something an operator can check against the run they were watching.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReopenReport {
+    /// The run that was reopened.
+    pub run_id: Uuid,
+    /// Node ids returned from `Failed` to `Ready` with a fresh budget.
+    pub reopened: Vec<String>,
+    /// Node ids un-parked from `Blocked` back to `Planned`.
+    pub unblocked: Vec<String>,
+    /// The run status recomputed from the resulting tasks.
+    pub status: RunStatus,
+}
+
+impl ReopenReport {
+    /// Whether the reopen actually moved anything.
+    pub fn changed_anything(&self) -> bool {
+        !self.reopened.is_empty() || !self.unblocked.is_empty()
+    }
+}
+
 /// A durable run record.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -706,7 +731,7 @@ impl TaskStore {
                     return Err(CoreError::NotFound(format!(
                         "task {task_id}: lease not held as '{owner}' (state = {})",
                         task.state
-                    )))
+                    )));
                 }
                 Err(err) => return Err(map_sqlite_error(err)),
             }
@@ -745,7 +770,7 @@ impl TaskStore {
                 Ok(_) => {
                     return Err(CoreError::NotFound(format!(
                         "task {task_id}: no longer leased (wanted reclaim from {expect})"
-                    )))
+                    )));
                 }
                 Err(err) => return Err(map_sqlite_error(err)),
             }
@@ -776,6 +801,19 @@ impl TaskStore {
     /// (`Retryable -> Failed`) per the caller's retry decision. One
     /// transaction; returns the final record.
     pub fn record_failure(&self, task_id: &Uuid, requeue: bool) -> Result<TaskRecord, CoreError> {
+        self.record_failure_with_retarget(task_id, requeue, None)
+    }
+
+    /// Record a failed execution and, when it is requeued, atomically route
+    /// the next attempt to `retarget_role`. This is used for bounded
+    /// stronger-model escalation: no other engine can lease the Ready task
+    /// between the failure transition and the role swap.
+    pub fn record_failure_with_retarget(
+        &self,
+        task_id: &Uuid,
+        requeue: bool,
+        retarget_role: Option<&str>,
+    ) -> Result<TaskRecord, CoreError> {
         let final_state = if requeue {
             TaskState::Ready
         } else {
@@ -802,6 +840,29 @@ impl TaskStore {
             cas_update_state(&tx, task_id, TaskState::Running, TaskState::Retryable, now)?;
             debug_assert!(TaskState::Retryable.can_transition(&final_state));
             cas_update_state(&tx, task_id, TaskState::Retryable, final_state, now)?;
+            if requeue {
+                if let Some(role) = retarget_role {
+                    let mut task = task_in_tx(&tx, task_id)?;
+                    task.node.agent_role = Some(role.to_owned());
+                    let node_json = serde_json::to_string(&task.node)
+                        .map_err(|err| CoreError::Serialization(format!("node spec: {err}")))?;
+                    let updated = tx
+                        .execute(
+                            "UPDATE tasks SET node = ?2, updated_at = ?3 \
+                             WHERE id = ?1 AND state = ?4",
+                            rusqlite::params![
+                                task_id.to_string(),
+                                node_json,
+                                now.to_rfc3339(),
+                                TaskState::Ready.as_str(),
+                            ],
+                        )
+                        .map_err(map_sqlite_error)?;
+                    if updated != 1 {
+                        return Err(classify_cas_miss(&tx, task_id, TaskState::Ready));
+                    }
+                }
+            }
             Ok(())
         })();
         match result {
@@ -809,6 +870,145 @@ impl TaskStore {
                 let record = task_in_tx(&tx, task_id)?;
                 tx.commit().map_err(map_sqlite_error)?;
                 Ok(record)
+            }
+            Err(err) => {
+                let _ = tx.rollback();
+                Err(err)
+            }
+        }
+    }
+
+    // ------------------------------------------------- operator reopen
+
+    /// Return a run's terminally `Failed` tasks to the queue and un-park the
+    /// dependents their failure blocked.
+    ///
+    /// **This is the single deliberate exception to terminal-ness, and the
+    /// engine cannot reach it.** `Failed` still has no outgoing arc in
+    /// [`TaskState::can_transition`], and every engine-internal move goes
+    /// through [`cas_update_state`], which asks core for permission before
+    /// it touches SQL. So no scheduler tick, retry decision, lease reclaim
+    /// or budget gate can resurrect a failed task by accident — this method
+    /// writes its own CAS, and the only caller is an explicit operator
+    /// action (`mastermind.reopenRun`). Widening `can_transition` instead
+    /// would have opened the arc to every one of those paths at once.
+    ///
+    /// It exists because terminal-ness is the right answer for a failure
+    /// whose cause is still true and the wrong one for a failure whose
+    /// cause has cleared. Observed: a 20-node build finished 14 tasks, then
+    /// `T07` hit an `antigravity-agy` quota outage and burned its transient
+    /// retries while the quota window was still shut. Five dependents parked
+    /// `Blocked`; the run went `Failed`. When the quota reset there was no
+    /// path back — 14 tasks of finished work stranded behind one node that
+    /// had failed for a reason that no longer existed.
+    ///
+    /// One transaction does all of:
+    ///
+    /// - every `Failed` task -> `Ready`, `attempt_count` reset to 0 and the
+    ///   lease columns cleared, so it genuinely gets fresh attempts rather
+    ///   than one doomed lease;
+    /// - every `Blocked` task -> `Planned`: the exact inverse of
+    ///   [`crate::Scheduler::block_dependents_of`], which parked them from
+    ///   `Planned`. Sending them to `Ready` instead would assert
+    ///   "dependencies satisfied", which is false the moment after a reopen
+    ///   — `Planned` lets the ordinary dependency gate promote them when
+    ///   their upstream actually completes;
+    /// - `created_at` re-stamped on exactly the tasks that moved, because
+    ///   [`crate::Budgets::max_elapsed_secs`] is measured from it. A task
+    ///   reopened after its window elapsed (the default is one hour; a
+    ///   quota outage outlasts that easily) would be escalated straight
+    ///   back to `Failed` by the first budget gate — the same dead end with
+    ///   extra steps. The original creation instant survives in the
+    ///   journal's `task.created` event, which is where the audit trail
+    ///   lives;
+    /// - the run's cached status recomputed from the resulting tasks, so a
+    ///   reopened run reads `running` again instead of advertising a
+    ///   failure it no longer has.
+    ///
+    /// Total and idempotent: reopening a run with nothing failed or blocked
+    /// returns an empty report rather than an error. Deciding that such a
+    /// call was a *caller* mistake is the API edge's job, not the store's.
+    pub fn reopen_run(&self, run_id: &Uuid) -> Result<ReopenReport, CoreError> {
+        let mut conn = self.lock()?;
+        let tx = conn.transaction().map_err(map_sqlite_error)?;
+        let result = (|| -> Result<ReopenReport, CoreError> {
+            // Refuse an unknown run here rather than reporting an empty
+            // reopen for a run that does not exist.
+            run_in_tx(&tx, run_id)?;
+            let now = Utc::now();
+            let mut reopened = Vec::new();
+            let mut unblocked = Vec::new();
+
+            for task in tasks_for_run_in_tx(&tx, run_id)? {
+                match task.state {
+                    TaskState::Failed => {
+                        let updated = tx
+                            .execute(
+                                "UPDATE tasks SET state = ?2, attempt_count = 0,
+                                 lease_owner = NULL, lease_expires_at = NULL,
+                                 heartbeat_at = NULL, created_at = ?3, updated_at = ?3
+                                 WHERE id = ?1 AND state = ?4",
+                                rusqlite::params![
+                                    task.id.to_string(),
+                                    TaskState::Ready.as_str(),
+                                    now.to_rfc3339(),
+                                    TaskState::Failed.as_str()
+                                ],
+                            )
+                            .map_err(map_sqlite_error)?;
+                        if updated == 1 {
+                            reopened.push(task.node_id.clone());
+                        }
+                    }
+                    TaskState::Blocked => {
+                        let updated = tx
+                            .execute(
+                                "UPDATE tasks SET state = ?2, created_at = ?3, updated_at = ?3
+                                 WHERE id = ?1 AND state = ?4",
+                                rusqlite::params![
+                                    task.id.to_string(),
+                                    TaskState::Planned.as_str(),
+                                    now.to_rfc3339(),
+                                    TaskState::Blocked.as_str()
+                                ],
+                            )
+                            .map_err(map_sqlite_error)?;
+                        if updated == 1 {
+                            unblocked.push(task.node_id.clone());
+                        }
+                    }
+                    _ => {}
+                }
+            }
+
+            // The tasks are the source of truth; the column is a cached
+            // projection, so it is recomputed rather than assumed.
+            let status = RunStatus::from_tasks(&tasks_for_run_in_tx(&tx, run_id)?);
+            tx.execute(
+                "UPDATE runs SET status = ?2 WHERE id = ?1",
+                rusqlite::params![run_id.to_string(), status.as_str()],
+            )
+            .map_err(map_sqlite_error)?;
+
+            Ok(ReopenReport {
+                run_id: *run_id,
+                reopened,
+                unblocked,
+                status,
+            })
+        })();
+        match result {
+            Ok(report) => {
+                tx.commit().map_err(map_sqlite_error)?;
+                tracing::warn!(
+                    run_id = %run_id,
+                    reopened = report.reopened.len(),
+                    unblocked = report.unblocked.len(),
+                    status = report.status.as_str(),
+                    "run reopened by operator action; failed tasks returned to the queue \
+                     with a fresh attempt budget"
+                );
+                Ok(report)
             }
             Err(err) => {
                 let _ = tx.rollback();

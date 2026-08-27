@@ -41,14 +41,22 @@
 pub mod contract;
 pub mod digest;
 pub mod error;
+pub mod git_advisor;
+pub mod graphify;
 pub mod handoff;
 pub mod policy;
 pub mod supervisor;
 pub mod usage_ledger;
 
+pub use agentos_workflow::ReopenReport;
 pub use contract::{ContractBudgets, ContractRule, GitPolicy, TaskContract, TaskContractBuilder};
 pub use digest::sha256_hex;
 pub use error::RuntimeError;
+pub use git_advisor::{CommitFacts, GitAdvisor, RebaseAdvice, StaleBaseFacts, GIT_ADVISOR_ROLE};
+pub use graphify::{
+    ChangeContext, GraphRefresh, Graphifier, GraphifyOutcome, GraphifySkip, GRAPHIFY_BIN_ENV,
+    GRAPHIFY_OUT_DIR,
+};
 pub use handoff::{
     ArtifactRef, HandoffPacket, HandoffRule, HandoffStatus, RequestedAction, TestReport, TestStatus,
 };

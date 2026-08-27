@@ -62,6 +62,30 @@ pub trait RuntimeAdapter: Send + Sync {
     /// initial prompt; progress streams via [`SessionHandle::events`].
     async fn start_session(&self, spec: SpawnSpec) -> Result<SessionHandle, AdapterError>;
 
+    /// Start a session that **continues an earlier provider conversation**
+    /// instead of opening a fresh one: the objective in `spec` becomes the
+    /// next turn of `provider_session_id`, with all of its context.
+    ///
+    /// `provider_session_id` is the id the provider reported through
+    /// [`crate::AdapterEvent::Started`] (claude session id, agy
+    /// conversation id, codex thread id) — the daemon keeps it in the
+    /// journal, so a chat survives a daemon restart.
+    ///
+    /// The default refuses with [`AdapterError::Unsupported`]: a runtime
+    /// with no resume surface must say so rather than silently starting a
+    /// session with no memory of the conversation the human is looking at.
+    async fn resume_session(
+        &self,
+        spec: SpawnSpec,
+        provider_session_id: String,
+    ) -> Result<SessionHandle, AdapterError> {
+        let _ = (spec, provider_session_id);
+        Err(AdapterError::Unsupported(format!(
+            "adapter {} cannot resume a provider session",
+            self.id()
+        )))
+    }
+
     /// Stop every session this adapter owns and release resources.
     /// Idempotent.
     async fn shutdown(&self) -> Result<(), AdapterError>;

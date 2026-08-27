@@ -22,6 +22,9 @@
 //!   (creator, researcher, …) spawned over their record's adapter with
 //!   skill preambles composed ahead of the message, adapter events
 //!   translated into journal events.
+//! - [`mastermind`] is the F-12 join: the orchestrator's planning cycles,
+//!   the user-gated commit, and the supervisor drive that actually spawns
+//!   registry agents, exposed as the `mastermind.*` methods.
 //! - [`server`] is the loopback WebSocket JSON API (framing, method table,
 //!   replay-then-tail subscriptions, `daemon.stopping` broadcast) — since
 //!   F-13 it also carries the registry write methods and the chat-session
@@ -35,8 +38,16 @@
 #![forbid(unsafe_code)]
 
 pub mod agent_sessions;
-pub mod db;
-pub mod events;
+pub mod chat_history;
+pub mod mastermind;
+pub mod memex;
 pub mod projection;
 pub mod seed;
 pub mod server;
+pub mod skill_import;
+pub mod usage_meters;
+
+/// The F-01 storage floor, now owned by `agentos-journal` and re-exported
+/// here so every existing `agentos_daemon::db` / `agentos_daemon::events`
+/// path keeps working.
+pub use agentos_journal::{db, events};

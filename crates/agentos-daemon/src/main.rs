@@ -35,9 +35,13 @@ async fn main() -> ExitCode {
         .init();
 
     let args: Vec<String> = std::env::args().collect();
+    // `args.get(2..)`, not `args[2..]`: invoked bare (`agentos-daemon`) the
+    // vector holds only argv[0], and slicing from 2 panics before the
+    // daemon ever starts.
+    let rest: &[String] = args.get(2..).unwrap_or(&[]);
     match args.get(1).map(String::as_str) {
-        None | Some("serve") => serve(&args[2..]).await,
-        Some("demo-seed") => demo_seed(&args[2..]),
+        None | Some("serve") => serve(rest).await,
+        Some("demo-seed") => demo_seed(rest),
         Some(other) => {
             error!(
                 subcommand = other,
@@ -52,7 +56,7 @@ async fn main() -> ExitCode {
 ///
 /// F-13 additions: the agent registry (`agents.db` beside the journal,
 /// built-ins seeded idempotently) and the chat-session service over the
-/// three adapters (claude-code, antigravity-agy, mock — mock so the UI and
+/// four adapters (claude-code, antigravity-agy, codex, mock — mock so the UI and
 /// tests can exercise the full surface without billing).
 async fn serve(flags: &[String]) -> ExitCode {
     let mut project: Option<PathBuf> = None;
@@ -96,14 +100,38 @@ async fn serve(flags: &[String]) -> ExitCode {
         Some(parent) => parent.join("agents.db"),
         None => PathBuf::from("agents.db"),
     };
-    let registry = match AgentRegistry::open(&registry_path)
-        .and_then(|r| r.seed_builtins().map(|inserted| (r, inserted)))
-    {
+    // One skill store. The library on disk holds every skill, the OS's own
+    // included, so they are edited in one place and offered by one catalog.
+    // Export what the library is missing, import it back, then seed agents —
+    // in that order, because a seeded agent references skills by id.
+    let registry = match AgentRegistry::open(&registry_path).and_then(|r| {
+        let library = agentos_daemon::skill_import::source_dir();
+        match agentos_daemon::skill_import::sync_library(
+            &r,
+            &library,
+            &agentos_agents::builtin_skills(),
+        ) {
+            Ok((exported, imported)) => info!(
+                library = %library.display(),
+                exported = exported.len(),
+                imported = imported.len(),
+                "skill library synced"
+            ),
+            // A library that cannot be written is not fatal: skills already
+            // in the registry still work, and the reason is worth seeing.
+            Err(err) => error!(library = %library.display(), %err, "skill library sync failed"),
+        }
+        let inserted = r.seed_builtins()?;
+        if r.migrate_orchestrator_mastermind_skill()? {
+            info!("orchestrator migrated to canonical mastermind skill");
+        }
+        Ok((r, inserted))
+    }) {
         Ok((registry, inserted)) => {
             info!(
                 registry = %registry_path.display(),
                 inserted,
-                "agent registry open; built-ins seeded"
+                "agent registry open; built-in agents seeded"
             );
             Arc::new(registry)
         }
@@ -130,36 +158,35 @@ async fn serve(flags: &[String]) -> ExitCode {
         db_path.clone(),
         workspace.clone(),
     ));
-    info!(workspace = %workspace.display(), "agent chat sessions enabled (claude-code, antigravity-agy, mock)");
-
-    // Startup marker. Daemon lifecycle is not run-scoped, so `run_id`
-    // stays `None` ("where applicable", F-00 §3); a fresh trace id ties
-    // this daemon session's events together once more of them exist.
-    let started = Event::new(EventType::Other("daemon.started".to_owned()))
-        .with_trace_id(Uuid::now_v7())
-        .with_payload(serde_json::json!({
-            "pid": std::process::id(),
-            "journal": db_path.display().to_string(),
-        }));
-    match events::append_event(&conn, &started) {
-        Ok(seq) => info!(seq, event_type = %started.event_type, "startup marker appended"),
-        Err(err) => {
-            error!(%err, "failed to append startup marker");
-            return ExitCode::FAILURE;
-        }
-    }
+    info!(
+        workspace = %workspace.display(),
+        adapters = ?AdapterSet::wired(),
+        "agent chat sessions enabled"
+    );
 
     // F-11a: the journal is served read-only from one shared connection;
     // external writers append through their own connections (WAL), which
     // the subscription tail polls observe (F-11 §3.2).
     let addr = server::ws_addr_from_env();
-    let bound = match server::WsServer::new(
-        Arc::new(Mutex::new(conn)),
-        db_path.clone(),
-        registry,
-        sessions,
-    )
-    .bind(&addr)
+    // F-12: the mastermind service shares the registry and the adapter
+    // table with chat sessions; its runs live under `<journal dir>/state`.
+    let state_dir = db_path
+        .parent()
+        .map(|parent| parent.join("state"))
+        .unwrap_or_else(|| PathBuf::from("state"));
+    let mastermind = Arc::new(agentos_daemon::mastermind::Mastermind::with_journal_db(
+        Arc::clone(&registry),
+        registry_path.clone(),
+        state_dir.clone(),
+        Some(db_path.clone()),
+        |id| AdapterSet::wired().by_id(id),
+    ));
+    info!(state_dir = %state_dir.display(), "mastermind service enabled");
+
+    let conn = Arc::new(Mutex::new(conn));
+    let bound = match server::WsServer::new(Arc::clone(&conn), db_path.clone(), registry, sessions)
+        .with_mastermind(mastermind)
+        .bind(&addr)
     {
         Ok(bound) => bound,
         Err(err) => {
@@ -168,6 +195,31 @@ async fn serve(flags: &[String]) -> ExitCode {
         }
     };
     let bound_addr = bound.local_addr();
+
+    // Startup marker, appended only once the socket is ours. Daemon
+    // lifecycle is not run-scoped, so `run_id` stays `None` ("where
+    // applicable", F-00 §3); a fresh trace id ties this daemon session's
+    // events together. Ordering matters: a second daemon losing the bind
+    // race must not leave a `daemon.started` for a session that never
+    // served a request.
+    let started = Event::new(EventType::Other("daemon.started".to_owned()))
+        .with_trace_id(Uuid::now_v7())
+        .with_payload(serde_json::json!({
+            "pid": std::process::id(),
+            "journal": db_path.display().to_string(),
+            "addr": bound_addr.to_string(),
+        }));
+    match conn
+        .lock()
+        .map_err(|_| "journal connection poisoned".to_owned())
+        .and_then(|guard| events::append_event(&guard, &started).map_err(|err| err.to_string()))
+    {
+        Ok(seq) => info!(seq, event_type = %started.event_type, "startup marker appended"),
+        Err(err) => {
+            error!(%err, "failed to append startup marker");
+            return ExitCode::FAILURE;
+        }
+    }
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let serve_task = tokio::spawn(bound.serve(shutdown_rx));
     info!(addr = %bound_addr, "agentos-daemon ready; websocket api live; waiting for ctrl-c");

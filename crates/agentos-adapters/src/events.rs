@@ -52,6 +52,24 @@ pub enum AdapterEvent {
         /// large payloads belong in content-addressed artifacts, F-00 §3).
         args_summary: String,
     },
+    /// The session is waiting on a human choice: claude plan-mode surfaces
+    /// (`AskUserQuestion` with its option list, `ExitPlanMode` with the plan
+    /// to approve). Carried structurally so the desktop can render real
+    /// buttons instead of asking the human to retype an option label; the
+    /// answer goes back as an ordinary instruction.
+    #[serde(rename_all = "camelCase")]
+    Decision {
+        /// Provider tool that asked (`AskUserQuestion`, `ExitPlanMode`).
+        tool: String,
+        /// The question, or the plan text to approve.
+        prompt: String,
+        /// Selectable answers, in provider order. Sending one back verbatim
+        /// as an instruction answers the question.
+        options: Vec<String>,
+        /// Whether the provider allows several options at once (the desktop
+        /// may still offer one click per option).
+        multi_select: bool,
+    },
     /// Usage/cost snapshot at a point in the session.
     UsageUpdate(UsageSnapshot),
     /// The provider reported rate-limit pressure. Not a failure by itself —
@@ -82,6 +100,7 @@ impl AdapterEvent {
             AdapterEvent::Started { .. } => "started",
             AdapterEvent::TextDelta(_) => "text_delta",
             AdapterEvent::ToolUse { .. } => "tool_use",
+            AdapterEvent::Decision { .. } => "decision",
             AdapterEvent::UsageUpdate(_) => "usage_update",
             AdapterEvent::RateLimit { .. } => "rate_limit",
             AdapterEvent::Finished { .. } => "finished",

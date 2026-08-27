@@ -33,7 +33,7 @@ use agentos_workflow::{NodeSpec, RunStatus, TaskStore, WorkflowEngine};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::error::OrchestratorError;
+use crate::error::{OrchestratorError, RejectionReason};
 use crate::plan::Plan;
 
 /// One durable task, as the orchestrator sees it.
@@ -100,6 +100,14 @@ pub trait PlanSink: Send + Sync {
     /// reviewer/supervisor pools (F-13) and the F-10 approval store; until
     /// those land the escalation is recorded in the plan ledger and
     /// surfaced to the user, never silently swallowed.
+    ///
+    /// A node-scoped escalation naming a terminal task, or a node the run
+    /// carries no task for, MUST be refused with
+    /// [`RejectionReason::TaskTerminal`] / [`RejectionReason::TaskNotInRun`]
+    /// rather than answered `Ok(_)`. Both levers escalation owns act on a
+    /// task's *next attempt*; reporting success for a task that will never
+    /// have one is what let a planner burn three cycles climbing its
+    /// escalation ladder against a dead node.
     fn escalate(&self, run_id: &Uuid, node_id: Option<&str>) -> Result<usize, OrchestratorError>;
 
     /// Route a live run's task(s) at another agent pool — the engine-side
@@ -107,10 +115,11 @@ pub trait PlanSink: Send + Sync {
     ///
     /// Only tasks that are queued or parked are retargeted: the engine
     /// refuses a swap under a `Leased`/`Running` task (its attempt is
-    /// already contracted against the old role) and under terminal ones
-    /// (no next attempt to route). Returns how many tasks actually moved,
-    /// so an escalation that changed nothing is reported rather than
-    /// claimed.
+    /// already contracted against the old role). Returns how many tasks
+    /// actually moved, so an escalation that changed nothing is reported
+    /// rather than claimed — and a node-scoped retarget against a terminal
+    /// or absent task is refused outright, exactly as
+    /// [`PlanSink::escalate`] refuses it.
     fn retarget(
         &self,
         run_id: &Uuid,
@@ -290,12 +299,62 @@ fn run_view(store: &TaskStore, run_id: &Uuid) -> Result<RunView, OrchestratorErr
     })
 }
 
+/// Refuse a node-scoped escalation the engine cannot act on.
+///
+/// Escalation's entire engine-side surface is "retune the priority of the
+/// next attempt" and "route the next attempt at another pool". A terminal
+/// task has no next attempt, so both levers are inert against it — and a
+/// sink that answers `Ok(0)` (or worse, `Ok(1)` for the priority write that
+/// nothing will ever read) tells the planner its escalation landed.
+///
+/// It did not, and the planner cannot tell: the observed Phase-8 repair
+/// spent three model cycles walking `supervisor` -> `stronger_agent` ->
+/// `human` against a terminally `Failed` `T07`, each answered `accepted: 1`,
+/// while the task and its five `Blocked` dependents never moved. Refusing
+/// here turns those wasted cycles into one machine-readable rejection that
+/// the next prompt carries (see [`RejectionReason::TaskTerminal`]).
+///
+/// Run-wide escalations (`node_id == None`) are unaffected: they are a
+/// blanket "hurry up" over whatever is still live, and skipping finished
+/// tasks there is correct, not a silent no-op.
+fn refuse_unescalatable(
+    store: &TaskStore,
+    run_id: &Uuid,
+    node_id: Option<&str>,
+    op: &str,
+) -> Result<(), OrchestratorError> {
+    let Some(wanted) = node_id else {
+        return Ok(());
+    };
+    let tasks = store.tasks_for_run(run_id)?;
+    let Some(task) = tasks.iter().find(|task| task.node_id == wanted) else {
+        return Err(RejectionReason::TaskNotInRun {
+            op: op.to_owned(),
+            node: wanted.to_owned(),
+            run_id: run_id.to_string(),
+        }
+        .into());
+    };
+    if task.state.is_terminal() {
+        tracing::warn!(run_id = %run_id, node = %wanted, state = %task.state, op,
+            "refused an escalation against a terminal task; it has no next attempt to route");
+        return Err(RejectionReason::TaskTerminal {
+            op: op.to_owned(),
+            node: wanted.to_owned(),
+            state: task.state.as_str().to_owned(),
+        }
+        .into());
+    }
+    Ok(())
+}
+
 /// Raise the escalated task(s) to `P0` through the engine's own API.
 fn escalate(
     store: &TaskStore,
     run_id: &Uuid,
     node_id: Option<&str>,
 ) -> Result<usize, OrchestratorError> {
+    refuse_unescalatable(store, run_id, node_id, "escalate")?;
     let tasks = store.tasks_for_run(run_id)?;
     let mut retuned = 0;
     for task in tasks {
@@ -303,8 +362,11 @@ fn escalate(
             if task.node_id != wanted {
                 continue;
             }
-        } else if matches!(task.state, TaskState::Done | TaskState::Cancelled) {
-            // Escalating a finished task is a no-op, not an error.
+        } else if task.state.is_terminal() {
+            // A run-wide escalation is a blanket "hurry up" over whatever
+            // is still live. Skipping terminal tasks is correct here, and
+            // includes `Failed`: raising the priority of a task that will
+            // never be leased again is bookkeeping nobody reads.
             continue;
         }
         if task.priority == Priority::P0 {
@@ -327,6 +389,7 @@ fn retarget(
     node_id: Option<&str>,
     pool: &str,
 ) -> Result<usize, OrchestratorError> {
+    refuse_unescalatable(store, run_id, node_id, "escalate")?;
     let mut moved = 0;
     for task in store.tasks_for_run(run_id)? {
         if let Some(wanted) = node_id {
@@ -433,10 +496,64 @@ mod tests {
         );
         // Idempotent: already P0.
         assert_eq!(sink.escalate(&run_id, Some("build")).unwrap(), 0);
-        // Unknown node retunes nothing rather than erroring — the plan
-        // layer is where unknown nodes are rejected.
-        assert_eq!(sink.escalate(&run_id, Some("ghost")).unwrap(), 0);
+        // A node the run carries no task for is refused, not answered
+        // `Ok(0)`: "nothing happened" and "nothing could ever happen" are
+        // different answers and the planner acts on them differently.
+        let err = sink.escalate(&run_id, Some("ghost")).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                OrchestratorError::Rejected(RejectionReason::TaskNotInRun { .. })
+            ),
+            "{err:?}"
+        );
         // Run-wide.
+        assert_eq!(sink.escalate(&run_id, None).unwrap(), 1);
+    }
+
+    #[test]
+    fn escalating_a_terminal_task_is_rejected_rather_than_reported_as_accepted() {
+        let (sink, _plan, run_id) = committed_plan();
+        let spec = sink
+            .store()
+            .tasks_for_run(&run_id)
+            .unwrap()
+            .into_iter()
+            .find(|task| task.node_id == "spec")
+            .unwrap();
+        // Drive `spec` to the terminal failure the observed quota outage
+        // produced: Ready -> Failed, no attempts left, no next attempt.
+        sink.store()
+            .cas_transition(&spec.id, TaskState::Ready, TaskState::Failed)
+            .unwrap();
+
+        for error in [
+            sink.escalate(&run_id, Some("spec")).unwrap_err(),
+            sink.retarget(&run_id, Some("spec"), "reviewers")
+                .unwrap_err(),
+        ] {
+            match error {
+                OrchestratorError::Rejected(RejectionReason::TaskTerminal {
+                    ref node,
+                    ref state,
+                    ..
+                }) => {
+                    assert_eq!(node, "spec");
+                    assert_eq!(state, "failed");
+                    assert!(error.to_string().contains("reopen the run"), "{error}");
+                }
+                other => panic!("expected a task_terminal rejection, got {other:?}"),
+            }
+        }
+
+        // The refusal is a read-only verdict: nothing was retuned or routed.
+        let view = sink.run_view(&run_id).unwrap();
+        let spec_view = view.tasks.iter().find(|t| t.node_id == "spec").unwrap();
+        assert_eq!(spec_view.priority, Priority::P1, "priority untouched");
+        assert_eq!(spec_view.pool.as_deref(), Some("backend"), "role untouched");
+
+        // A run-wide escalation still works: it is a blanket "hurry up"
+        // over whatever is live, not a claim about one dead node.
         assert_eq!(sink.escalate(&run_id, None).unwrap(), 1);
     }
 }

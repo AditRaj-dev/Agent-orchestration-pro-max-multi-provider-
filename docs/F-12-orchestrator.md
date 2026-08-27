@@ -316,3 +316,78 @@ $ CARGO_TARGET_DIR=target/orch cargo clippy -p agentos-orchestrator --all-target
 **Billing:** zero billable calls in the suite. Every planning turn is either a
 scripted string or the credential-free F-02 `MockAdapter`; the only live-binary
 test is `#[ignore]`d, env-gated, and runs discovery probes only.
+## 8. Daemon wiring — the flow as five RPC methods (2026-08-23)
+
+Until this session F-12 was reachable only from tests: the crate could
+propose plan operations and F-07 could spawn registry agents, but nothing
+joined them. `crates/agentos-daemon/src/mastermind.rs` is that join, and the
+desktop's **Mastermind** view (`apps/desktop/src/views/Mastermind.tsx`) is
+its surface.
+
+| Method | Params | What it does |
+|---|---|---|
+| `mastermind.start` | `goal`, `repo`, `plannerAdapter?`, `plannerModel?` | Builds the session: registry roster → `PlanPolicy.pools` + prompt roster, a `Supervisor` over `repo`, and the requested planning runtime/model (falling back to the `orchestrator` record). No model call. |
+| `mastermind.plan` | `sessionId` | One planning cycle. Returns accepted count and every rejection with its `hint`. Nothing durable is created. |
+| `mastermind.commit` | `sessionId` | **The gate.** Plan → `WorkflowSpec` + one `TaskContract` per node → `Supervisor::start_run`. |
+| `mastermind.drive` | `sessionId`, `maxTicks?` | Ticks the engine: ready tasks are leased and their agents spawned. |
+| `mastermind.reopenRun` | `sessionId` | Operator recovery after a cleared transient outage: every `Failed` task returns to `ready` with a fresh attempt budget, every `Blocked` dependent returns to `planned`, the run leaves `failed`. Journaled as `run.reopened`. `invalid_params` when the run is not failed. |
+| `mastermind.status` / `.list` | `sessionId` / — | Plan + the engine's run view; live sessions. |
+
+**Why `reopenRun` exists, and why it is not automatic.** `TaskState::Failed`
+is terminal and stays terminal: `can_transition` has no arc out of it, so no
+scheduler tick, retry decision or budget gate can resurrect a failed task.
+That is right for a failure whose cause is still true and wrong for one that
+has cleared. An observed Phase-8 build finished 14 of 20 tasks, then `T07`
+hit an `antigravity-agy` quota outage and exhausted its transient retries
+while the window was still shut; five dependents parked `Blocked` and the run
+went `Failed`. When the quota reset there was no path back. The reopen is a
+single explicit CAS in `TaskStore::reopen_run` — the only writer of a
+`Failed -> Ready` edge in the workspace — reachable only from this operator
+RPC. Escalation is *not* that path and now says so: an `escalate` naming a
+terminal task is rejected with `task_terminal`, whose hint points the planner
+here instead of letting it climb `supervisor -> stronger_agent -> human`
+against a node that will never get another attempt.
+
+Three constraints this wiring had to satisfy, each of which shaped it:
+
+1. **The roster is the routing table.** `PlanPolicy::pools` is filled from
+   the F-13 registry and the same records ride into the prompt as
+   `RosterEntry`s, so `pool` values are real agent ids with real
+   descriptions instead of `DEFAULT_POOLS`' three placeholders. `Orchestrator`
+   grew `with_roster` for this — `PlanSnapshot::with_roster` already existed
+   but nothing called it. The `orchestrator` record itself is filtered out:
+   it commands, so it is never a worker pool. An id the model invents is
+   refused as `unknown_pool`, not silently dispatched to nobody.
+2. **Commits go through the supervisor, not the engine.** `PlanSink` is
+   implemented for `WorkflowEngine`, but a run materialized that way has no
+   run manifest and `SupervisorExecutor` refuses to dispatch a task whose
+   manifest is missing. `SupervisorSink::commit` therefore compiles the plan
+   **and** synthesizes a full `TaskContract` per node (goal + stated
+   objective + upstream node ids + repo HEAD as `base_commit` +
+   `GitPolicy::NoDirectGit`), then calls `Supervisor::start_run`. Reads
+   (`run_view`, `escalate`, `retarget`, `add_node`) delegate to a plain
+   `WorkflowSink` over the same store.
+3. **The dependency cycle had to be broken first.** `agentos-runtime`
+   depended on `agentos-daemon` for the journal, so the daemon could not
+   depend on the runtime. `db` and `events` moved into a new
+   **`agentos-journal`** crate that both sit on; `agentos_daemon::db` and
+   `agentos_daemon::events` remain valid paths via re-export, so no call
+   site changed.
+
+The user gate is preserved by construction: planning cycles never
+materialize anything, and `commit` is a separate call the UI puts behind its
+own button.
+
+**Complete context per worker.** A dispatched agent's prompt is composed of
+three layers, none of which the agent supplies itself: its registry skill
+bodies (F-13 `preamble_for`), then the synthesized contract objective (run
+goal → this task → upstream tasks to read handoffs from), then the
+policy-compiled permission set. Its model, adapter and tool denylist come
+from its record.
+
+**Not verified live.** `mastermind.plan` is a billable opus-5 turn, so the
+checked-in evidence covers everything up to it: session start against the
+live daemon (roster of 18 pools, `reviewerPool: code-reviewer`, zero nodes
+before planning), `status`, an uncommitted `drive` correctly refused, and
+four unit/integration tests including contract synthesis. The planning and
+drive legs need a manual run with credentials.

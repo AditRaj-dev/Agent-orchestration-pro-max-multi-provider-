@@ -255,7 +255,19 @@ impl HandoffPacket {
         final_result: Option<&str>,
         structured: Option<&Value>,
     ) -> Self {
-        let structured = structured.unwrap_or(&Value::Null);
+        // Only the mock adapter and agy's `--json-schema` path produce a
+        // structured payload; claude and codex have no such surface, and
+        // `SpawnSpec` carries no schema to request one. Without a fallback
+        // every real-provider packet arrives with an empty `tests` array and
+        // review can never pass. The completion report the objective asks
+        // for — a fenced JSON object at the end of the final message — is
+        // the provider-independent channel, used only when the adapter
+        // gave us nothing structured of its own.
+        let parsed = structured
+            .filter(|value| value.is_object())
+            .cloned()
+            .or_else(|| final_result.and_then(completion_report));
+        let structured = parsed.as_ref().unwrap_or(&Value::Null);
         let summary = structured
             .get("summary")
             .and_then(Value::as_str)
@@ -286,6 +298,84 @@ impl HandoffPacket {
             transcript_ref: None,
         }
     }
+}
+
+/// Recover a completion report from a worker's final message.
+///
+/// Accepts the last ```` ```json ```` fence, else the last balanced
+/// top-level `{...}` run in the text. Anything that does not parse as a
+/// JSON *object* degrades to `None` — a worker that ignored the format
+/// simply reports no evidence, exactly as before.
+fn completion_report(text: &str) -> Option<Value> {
+    fenced_json(text)
+        .or_else(|| trailing_object(text))
+        .and_then(|candidate| serde_json::from_str::<Value>(&candidate).ok())
+        .filter(Value::is_object)
+}
+
+/// The body of the last ```` ```json ```` (or bare ```` ``` ````) fence.
+fn fenced_json(text: &str) -> Option<String> {
+    let mut best: Option<String> = None;
+    let mut rest = text;
+    while let Some(open) = rest.find("```") {
+        let after = &rest[open + 3..];
+        // Skip the info string on the fence's opening line.
+        let (info, body) = match after.find('\n') {
+            Some(nl) => (after[..nl].trim(), &after[nl + 1..]),
+            None => break,
+        };
+        let Some(close) = body.find("```") else { break };
+        if info.is_empty() || info.eq_ignore_ascii_case("json") {
+            let candidate = body[..close].trim();
+            if candidate.starts_with('{') {
+                best = Some(candidate.to_owned());
+            }
+        }
+        rest = &body[close + 3..];
+    }
+    best
+}
+
+/// The last balanced `{...}` run in the text, ignoring braces inside JSON
+/// strings. Scans backwards from the final `}` so trailing prose after the
+/// object is tolerated.
+fn trailing_object(text: &str) -> Option<String> {
+    let bytes = text.as_bytes();
+    let end = text.rfind('}')?;
+    let mut depth = 0i32;
+    let mut in_string = false;
+    let mut index = end as isize;
+    while index >= 0 {
+        let byte = bytes[index as usize];
+        if in_string {
+            // A quote is an opener unless escaped by an odd backslash run.
+            if byte == b'"' {
+                let mut slashes = 0isize;
+                let mut back = index - 1;
+                while back >= 0 && bytes[back as usize] == b'\\' {
+                    slashes += 1;
+                    back -= 1;
+                }
+                if slashes % 2 == 0 {
+                    in_string = false;
+                }
+            }
+        } else {
+            match byte {
+                b'"' => in_string = true,
+                b'}' => depth += 1,
+                b'{' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some(text[index as usize..=end].to_owned());
+                    }
+                }
+                _ => {}
+            }
+        }
+        index -= 1;
+    }
+    None
 }
 
 /// Read `key` from `value` as an array of strings (anything else degrades
@@ -346,6 +436,64 @@ fn ref_is_shaped_like_a_reference(candidate: &str) -> bool {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// The whole point of the fallback: a provider with no structured
+    /// surface still delivers reviewable test evidence.
+    #[test]
+    fn a_fenced_report_in_the_final_message_becomes_the_packet() {
+        let text = "Did the thing.
+
+```json
+{\"summary\": \"rotated tokens\", \"filesChanged\": [\"src/a.rs\"], \"tests\": [{\"name\": \"cargo test\", \"status\": \"passed\", \"count\": 3}], \"unresolved\": []}
+```";
+        let packet = HandoffPacket::from_adapter_finish("T1", "worker", &[], 0, Some(text), None);
+        assert_eq!(packet.summary, "rotated tokens");
+        assert_eq!(packet.files_changed, vec!["src/a.rs".to_owned()]);
+        assert_eq!(packet.tests.len(), 1);
+        assert_eq!(packet.tests[0].status, TestStatus::Passed);
+        assert!(packet.unresolved.is_empty());
+    }
+
+    /// An adapter that *does* speak structured output keeps winning, and a
+    /// trailing object survives prose after it.
+    #[test]
+    fn structured_output_wins_and_a_bare_trailing_object_still_parses() {
+        let text =
+            "{\"summary\": \"from text\", \"tests\": [{\"name\": \"t\", \"status\": \"skipped\"}]}
+
+Let me know if you want changes.";
+        let from_text =
+            HandoffPacket::from_adapter_finish("T1", "worker", &[], 0, Some(text), None);
+        assert_eq!(from_text.summary, "from text");
+        assert_eq!(from_text.tests.len(), 1);
+
+        let structured = json!({"summary": "from adapter", "tests": []});
+        let from_adapter = HandoffPacket::from_adapter_finish(
+            "T1",
+            "worker",
+            &[],
+            0,
+            Some(text),
+            Some(&structured),
+        );
+        assert_eq!(from_adapter.summary, "from adapter");
+        assert!(from_adapter.tests.is_empty());
+    }
+
+    /// Prose that merely mentions braces must not become evidence.
+    #[test]
+    fn a_message_without_a_report_yields_no_evidence() {
+        let packet = HandoffPacket::from_adapter_finish(
+            "T1",
+            "worker",
+            &[],
+            0,
+            Some("I edited the { thing } and it works."),
+            None,
+        );
+        assert!(packet.tests.is_empty());
+        assert_eq!(packet.summary, "I edited the { thing } and it works.");
+    }
 
     /// The Appendix C example, verbatim.
     fn appendix_c() -> serde_json::Value {

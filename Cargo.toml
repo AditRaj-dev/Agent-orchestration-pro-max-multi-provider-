@@ -10,6 +10,8 @@ members = [
     "crates/agentos-context",
     "crates/agentos-policy",
     "crates/agentos-orchestrator",
+    "crates/agentos-agents",
+    "crates/agentos-journal",
 ]
 # F-11b Tauri shell builds outside the workspace (own dependency tree,
 # own target dir) so `cargo test --workspace` stays the daemon/crates gate.

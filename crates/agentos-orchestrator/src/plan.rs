@@ -407,6 +407,11 @@ impl Plan {
         };
         if let Some(objective) = &payload.objective {
             self.check_reason("create_task", "objective", objective)?;
+            if defers_human_discovery(objective) {
+                return Err(RejectionReason::DeferredHumanDiscovery {
+                    node: payload.node_id.clone(),
+                });
+            }
         }
         let node = PlannedNode {
             spec: NodeSpec {
@@ -630,6 +635,20 @@ impl Plan {
     }
 }
 
+fn defers_human_discovery(objective: &str) -> bool {
+    let normalized = objective.to_ascii_lowercase();
+    [
+        "interview the user",
+        "interview user to",
+        "ask the user",
+        "clarify with the user",
+        "collect requirements from the user",
+        "gather requirements from the user",
+    ]
+    .iter()
+    .any(|marker| normalized.contains(marker))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -662,6 +681,33 @@ mod tests {
         plan.validate().expect("engine must accept the plan");
         let spec = plan.to_spec();
         assert_eq!(spec.nodes[1].depends_on, vec!["spec".to_owned()]);
+    }
+
+    #[test]
+    fn create_task_cannot_defer_product_discovery_to_a_worker() {
+        let mut plan = plan();
+        let operation = PlanOperation::CreateTask(CreateTask {
+            node_id: "product-spec".to_owned(),
+            node_type: NodeType::Run,
+            depends_on: vec![],
+            pool: Some("backend".to_owned()),
+            objective: Some(
+                "Interview user to resolve session pairing, authentication, and deployment."
+                    .to_owned(),
+            ),
+            priority: None,
+            budgets: None,
+            retry: None,
+        });
+
+        let reason = plan
+            .apply(&operation)
+            .expect_err("discovery must stay human-gated");
+        assert!(matches!(
+            reason,
+            RejectionReason::DeferredHumanDiscovery { ref node } if node == "product-spec"
+        ));
+        assert!(plan.nodes().is_empty());
     }
 
     #[test]

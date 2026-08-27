@@ -11,10 +11,12 @@
 
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use serde_json::json;
 use tokio::sync::broadcast;
+use tokio::sync::Notify;
 
 use crate::adapter::{RuntimeAdapter, SessionBackend, SessionHandle};
 use crate::error::{AdapterError, AdapterFailure};
@@ -56,6 +58,19 @@ pub enum MockBehavior {
         /// How many leading sessions fail before the first success.
         failures_before_success: usize,
     },
+    /// An interviewing agent, shaped like a real plan-mode agy run: each
+    /// turn asks one question and then ends the TURN (not the session),
+    /// and the adapter refuses instructions while a turn is still
+    /// streaming. Answering resumes the same session and asks the next
+    /// question, until all of them are answered.
+    ///
+    /// This reproduces the loop that a silent respawn produced: a caller
+    /// that opens a new session on a mid-turn rejection gets an agent with
+    /// no memory, which asks question 1 again, forever.
+    Interview {
+        /// How many questions the agent asks before finishing.
+        questions: usize,
+    },
 }
 
 /// The mock adapter: canned discovery surfaces, scripted sessions,
@@ -82,6 +97,33 @@ impl MockAdapter {
     pub fn behavior(&self) -> &MockBehavior {
         &self.behavior
     }
+
+    fn launch(&self, spec: SpawnSpec, session_id: String) -> SessionHandle {
+        let attempt = self.attempts.fetch_add(1, Ordering::Relaxed) + 1;
+        let (events, _) = broadcast::channel(256);
+        let state = Arc::new(SessionState {
+            cancelled: AtomicBool::new(false),
+            finished: AtomicBool::new(false),
+            run_active: AtomicBool::new(false),
+            resumed: Notify::new(),
+        });
+        let backend = Arc::new(MockSessionBackend {
+            session_id: session_id.clone(),
+            state: state.clone(),
+        });
+        let handle = SessionHandle::new(session_id.clone(), events.clone(), backend);
+
+        self.sessions
+            .lock()
+            .expect("mock session registry poisoned")
+            .push(handle.clone());
+
+        let behavior = self.behavior.clone();
+        tokio::spawn(async move {
+            drive_session(&session_id, &spec, behavior, attempt, &events, &state).await;
+        });
+        handle
+    }
 }
 
 #[async_trait]
@@ -107,33 +149,17 @@ impl RuntimeAdapter for MockAdapter {
     }
 
     async fn start_session(&self, spec: SpawnSpec) -> Result<SessionHandle, AdapterError> {
-        let attempt = self.attempts.fetch_add(1, Ordering::Relaxed) + 1;
         let session_no = self.next_session.fetch_add(1, Ordering::Relaxed) + 1;
         let session_id = format!("mock-{session_no}");
+        Ok(self.launch(spec, session_id))
+    }
 
-        let (events, _) = broadcast::channel(256);
-        let state = Arc::new(SessionState {
-            cancelled: AtomicBool::new(false),
-            finished: AtomicBool::new(false),
-        });
-        let backend = Arc::new(MockSessionBackend {
-            session_id: session_id.clone(),
-            state: state.clone(),
-        });
-        let handle = SessionHandle::new(session_id.clone(), events.clone(), backend);
-
-        self.sessions
-            .lock()
-            .expect("mock session registry poisoned")
-            .push(handle.clone());
-
-        let behavior = self.behavior.clone();
-        let driver_id = session_id;
-        tokio::spawn(async move {
-            drive_session(&driver_id, &spec, behavior, attempt, &events, &state).await;
-        });
-
-        Ok(handle)
+    async fn resume_session(
+        &self,
+        spec: SpawnSpec,
+        provider_session_id: String,
+    ) -> Result<SessionHandle, AdapterError> {
+        Ok(self.launch(spec, provider_session_id))
     }
 
     async fn shutdown(&self) -> Result<(), AdapterError> {
@@ -154,6 +180,11 @@ impl RuntimeAdapter for MockAdapter {
 struct SessionState {
     cancelled: AtomicBool,
     finished: AtomicBool,
+    /// A turn is streaming; instructions are refused as `Busy` until it
+    /// reaches its terminal event, exactly as an agy print run behaves.
+    run_active: AtomicBool,
+    /// Signalled when an instruction lands between turns.
+    resumed: Notify,
 }
 
 /// [`SessionBackend`] for a mock session.
@@ -170,6 +201,13 @@ impl SessionBackend for MockSessionBackend {
         {
             return Err(AdapterError::SessionNotActive(self.session_id.clone()));
         }
+        if self.state.run_active.load(Ordering::Relaxed) {
+            // Alive, just mid-turn. The caller must wait for the terminal
+            // event, never open a second session.
+            return Err(AdapterError::Busy(self.session_id.clone()));
+        }
+        // Between turns: this resumes the scripted interview.
+        self.state.resumed.notify_one();
         // The mock's runs are fully scripted from the `SpawnSpec`, so
         // instructions are accepted (API surface stays exercisable) but do
         // not perturb the deterministic script.
@@ -179,6 +217,14 @@ impl SessionBackend for MockSessionBackend {
     }
 
     async fn cancel(&self) -> Result<(), AdapterError> {
+        // Cancelling something already over is a caller mistake, not a
+        // cancellation: reporting success here made the daemon journal a
+        // `session.cancelled` for a session that had already finished.
+        if self.state.finished.load(Ordering::Relaxed)
+            || self.state.cancelled.load(Ordering::Relaxed)
+        {
+            return Err(AdapterError::SessionNotActive(self.session_id.clone()));
+        }
         self.state.cancelled.store(true, Ordering::Relaxed);
         Ok(())
     }
@@ -267,7 +313,82 @@ async fn drive_session(
                 run_success(session_id, spec, 1, &[], events, state);
             }
         }
+        MockBehavior::Interview { questions } => {
+            run_interview(session_id, questions, events, state).await;
+        }
     }
+}
+
+/// How long a scripted turn keeps streaming after emitting its question.
+/// Real adapters hold the run open briefly after asking; without a window
+/// the mid-turn rejection would be unobservable and the test vacuous.
+const INTERVIEW_TURN_TAIL: Duration = Duration::from_millis(300);
+
+/// Stream a plan-mode interview: one question per turn, the session staying
+/// instructable between turns.
+async fn run_interview(
+    session_id: &str,
+    questions: usize,
+    events: &broadcast::Sender<AdapterEvent>,
+    state: &SessionState,
+) {
+    if !emit_started(session_id, events, state) {
+        return;
+    }
+
+    for question in 1..=questions {
+        state.run_active.store(true, Ordering::Relaxed);
+        if !emit(
+            events,
+            state,
+            AdapterEvent::Decision {
+                tool: "AskUserQuestion".to_owned(),
+                prompt: format!("question {question} of {questions}?"),
+                options: vec![format!("answer {question}a"), format!("answer {question}b")],
+                multi_select: false,
+            },
+        ) {
+            return;
+        }
+        // The turn keeps streaming for a moment after asking.
+        tokio::time::sleep(INTERVIEW_TURN_TAIL).await;
+        if !emit(
+            events,
+            state,
+            AdapterEvent::Finished {
+                final_result: Some(format!("asked question {question}")),
+                exit_code: 0,
+                structured: None,
+            },
+        ) {
+            return;
+        }
+        state.run_active.store(false, Ordering::Relaxed);
+
+        // Wait for the answer, staying responsive to cancellation.
+        loop {
+            if state.cancelled.load(Ordering::Relaxed) {
+                return;
+            }
+            if tokio::time::timeout(Duration::from_millis(25), state.resumed.notified())
+                .await
+                .is_ok()
+            {
+                break;
+            }
+        }
+    }
+
+    state.finished.store(true, Ordering::Relaxed);
+    emit(
+        events,
+        state,
+        AdapterEvent::Finished {
+            final_result: Some(format!("interview complete after {questions} question(s)")),
+            exit_code: 0,
+            structured: None,
+        },
+    );
 }
 
 /// Stream the success lifecycle:
@@ -620,6 +741,8 @@ mod tests {
         let state = SessionState {
             cancelled: AtomicBool::new(false),
             finished: AtomicBool::new(false),
+            run_active: AtomicBool::new(false),
+            resumed: Notify::new(),
         };
         let mut rx = events.subscribe();
         run_failure(

@@ -21,7 +21,9 @@ use rusqlite::{Connection, Row};
 
 use crate::error::AgentsError;
 use crate::record::{AgentEffort, AgentMode, AgentRecord};
-use crate::seeds::{builtin_agents, builtin_skills};
+use crate::seeds::{
+    builtin_agents, builtin_skills, global_skill_sections, is_global_skill, render_skill_preamble,
+};
 use crate::skill::SkillRecord;
 
 /// Busy-handler wait applied to every connection (F-01 canon).
@@ -364,7 +366,13 @@ impl AgentRegistry {
     /// Install the built-in skills and agents **idempotently**:
     /// insert-only-if-absent, so an edited built-in survives reseeds and
     /// upgrades. Returns the number of rows inserted.
-    pub fn seed_builtins(&self) -> Result<usize, AgentsError> {
+    /// Insert the shipped skill bodies straight into the table.
+    ///
+    /// Production does not use this: the daemon syncs the skill library on
+    /// disk instead, so there is exactly one store. It exists for callers
+    /// that have no library — unit tests, and anyone embedding the registry
+    /// without the daemon around it.
+    pub fn seed_builtin_skills(&self) -> Result<usize, AgentsError> {
         let mut conn = self.lock()?;
         let tx = conn.transaction().map_err(map_sqlite_error)?;
         let mut inserted = 0;
@@ -393,6 +401,20 @@ impl AgentRegistry {
                 inserted += 1;
             }
         }
+        tx.commit().map_err(map_sqlite_error)?;
+        Ok(inserted)
+    }
+
+    pub fn seed_builtins(&self) -> Result<usize, AgentsError> {
+        let mut conn = self.lock()?;
+        let tx = conn.transaction().map_err(map_sqlite_error)?;
+        // Skills are NOT seeded here. There is one skill store — the library
+        // on disk — and the daemon exports the OS's own methods into it and
+        // imports them back before this runs. Seeding them into the table too
+        // would recreate the second, divergent store this system deliberately
+        // does not have. Callers with no library (tests, embedders) call
+        // [`AgentRegistry::seed_builtin_skills`] first.
+        let mut inserted = 0;
         for agent in builtin_agents() {
             let exists: bool = tx
                 .query_row(
@@ -411,31 +433,51 @@ impl AgentRegistry {
         Ok(inserted)
     }
 
+    /// One-time compatibility migration for installations seeded before
+    /// the canonical `mastermind` skill replaced the shortened command
+    /// manifest. Deliberately narrow: user-customized skill sets are left
+    /// untouched.
+    pub fn migrate_orchestrator_mastermind_skill(&self) -> Result<bool, AgentsError> {
+        let Some(mut record) = self.get_agent("orchestrator")? else {
+            return Ok(false);
+        };
+        if record.skills != ["mastermind-commands".to_owned()] {
+            return Ok(false);
+        }
+        record.skills = vec!["mastermind".to_owned()];
+        self.update_agent(record)?;
+        Ok(true)
+    }
+
     // ---------------------------------------------------------- preamble
 
     /// Render an agent's skills into the prompt preamble prepended to its
-    /// session objective. Empty string when the agent holds no skills.
+    /// session objective. Caveman and Ponytail are application-level
+    /// invariants and are always first, independent of the record's editable
+    /// skill list.
     ///
-    /// Composed at spawn time (not stored), so editing a skill body changes
-    /// the next session without touching any agent row.
+    /// Composed at spawn time (not stored), so editing an ordinary skill body
+    /// changes the next session without touching an agent row. Global skills
+    /// are compiled in so a registry edit cannot weaken either invariant.
     pub fn preamble_for(&self, record: &AgentRecord) -> Result<String, AgentsError> {
-        if record.skills.is_empty() {
-            return Ok(String::new());
+        let mut sections = global_skill_sections();
+        if !record.skills.is_empty() {
+            let conn = self.lock()?;
+            for id in &record.skills {
+                // Global copies above are authoritative and must never be
+                // duplicated by legacy or user-edited records.
+                if is_global_skill(id) {
+                    continue;
+                }
+                let skill = skill_by_id(&conn, id)?
+                    .ok_or_else(|| AgentsError::NotFound(format!("skill {id}")))?;
+                sections.push(format!(
+                    "## Skill: {} ({})\n\n{}",
+                    skill.name, skill.id, skill.body
+                ));
+            }
         }
-        let conn = self.lock()?;
-        let mut sections = Vec::with_capacity(record.skills.len());
-        for id in &record.skills {
-            let skill = skill_by_id(&conn, id)?
-                .ok_or_else(|| AgentsError::NotFound(format!("skill {id}")))?;
-            sections.push(format!(
-                "## Skill: {} ({})\n\n{}",
-                skill.name, skill.id, skill.body
-            ));
-        }
-        Ok(format!(
-            "# Assigned skills\n\nYou operate under the following skill directives for this session.\n\n{}\n\n---\n\n",
-            sections.join("\n\n")
-        ))
+        Ok(render_skill_preamble(&sections))
     }
 }
 
@@ -677,6 +719,7 @@ mod tests {
 
     fn registry_with_seeds() -> AgentRegistry {
         let registry = AgentRegistry::open_in_memory().expect("open registry");
+        registry.seed_builtin_skills().expect("seed skills");
         registry.seed_builtins().expect("seed");
         registry
     }
@@ -795,12 +838,14 @@ mod tests {
     fn seeding_is_idempotent_and_preserves_edits() {
         let registry = registry_with_seeds();
         // Reseed inserts nothing the second time.
+        registry.seed_builtin_skills().expect("seed skills");
         assert_eq!(registry.seed_builtins().expect("reseed"), 0);
 
         // An edited built-in keeps its edit across a reseed.
         let mut edited = registry.get_agent("orchestrator").expect("read").unwrap();
         edited.description = "my tuned orchestrator".to_owned();
         registry.update_agent(edited).expect("edit");
+        registry.seed_builtin_skills().expect("seed skills");
         registry.seed_builtins().expect("reseed");
         let after = registry.get_agent("orchestrator").expect("read").unwrap();
         assert_eq!(after.description, "my tuned orchestrator");
@@ -829,6 +874,11 @@ mod tests {
         let researcher = registry.get_agent("researcher").expect("read").unwrap();
         let preamble = registry.preamble_for(&researcher).expect("preamble");
         assert!(preamble.starts_with("# Assigned skills"));
+        assert!(preamble.contains("/caveman"));
+        assert!(preamble.contains("Technical substance exact"));
+        assert!(preamble.contains("ACTIVE EVERY RESPONSE"));
+        assert!(preamble.contains("Global skill: Ponytail"));
+        assert!(preamble.contains("Standard library? Use it."));
         assert!(preamble.contains("## Skill: Tech Research (tech-research)"));
         assert!(preamble.contains("Bottom line"), "skill body present");
         assert!(preamble.ends_with("---\n\n"), "separator before objective");
@@ -840,12 +890,56 @@ mod tests {
     }
 
     #[test]
-    fn preamble_is_empty_without_skills() {
+    fn global_skills_are_injected_without_assigned_skills() {
         let registry = registry_with_seeds();
         let mut agent = custom_agent("bare");
         agent.skills = vec![];
         let created = registry.create_agent(agent).expect("create");
-        assert_eq!(registry.preamble_for(&created).expect("preamble"), "");
+        let preamble = registry.preamble_for(&created).expect("preamble");
+        assert!(preamble.contains("Global skill: /caveman"));
+        assert!(preamble.contains("Auto-Clarity"));
+        assert!(preamble.contains("Global skill: Ponytail"));
+        assert!(preamble.contains("minimum correct code"));
+    }
+
+    #[test]
+    fn explicitly_listing_global_skills_does_not_duplicate_them() {
+        let registry = registry_with_seeds();
+        let mut agent = custom_agent("explicit-globals");
+        agent.skills = vec![
+            crate::seeds::CAVEMAN_SKILL_ID.to_owned(),
+            crate::seeds::PONYTAIL_SKILL_ID.to_owned(),
+        ];
+        let created = registry.create_agent(agent).expect("create");
+        let preamble = registry.preamble_for(&created).expect("preamble");
+        assert_eq!(preamble.matches("Global skill: /caveman").count(), 1);
+        assert_eq!(preamble.matches("Global skill: Ponytail").count(), 1);
+    }
+
+    #[test]
+    fn global_skills_precede_role_skills_for_representative_agent_classes() {
+        let registry = registry_with_seeds();
+        for id in [
+            "orchestrator",
+            "spec-writer",
+            "nextjs-dev",
+            "general-worker-luna",
+            "debugger",
+            "debugger-sol-escalation",
+            "code-reviewer",
+        ] {
+            let agent = registry.get_agent(id).expect("read").unwrap();
+            let preamble = registry.preamble_for(&agent).expect("preamble");
+            let caveman = preamble.find("Global skill: /caveman").unwrap();
+            let ponytail = preamble.find("Global skill: Ponytail").unwrap();
+            assert!(caveman < ponytail, "{id}: Caveman must precede Ponytail");
+            if let Some(role_skill) = preamble.find("## Skill:") {
+                assert!(
+                    ponytail < role_skill,
+                    "{id}: global skills must precede role skills"
+                );
+            }
+        }
     }
 
     #[test]
@@ -894,6 +988,7 @@ mod tests {
         let path = dir.path().join("agents.db");
         {
             let registry = AgentRegistry::open(&path).expect("open");
+            registry.seed_builtin_skills().expect("seed skills");
             registry.seed_builtins().expect("seed");
             registry
                 .create_agent(custom_agent("persistent"))
@@ -904,6 +999,7 @@ mod tests {
             reopened.get_agent("persistent").expect("read").is_some(),
             "rows survive reopen"
         );
+        reopened.seed_builtin_skills().expect("seed skills");
         assert_eq!(reopened.seed_builtins().expect("reseed"), 0);
     }
 
@@ -935,22 +1031,84 @@ mod tests {
         assert_eq!(researcher.mode, AgentMode::Plan);
     }
 
+    /// The planning agent (mastermind Phases 1-4) runs on the top-tier
+    /// model and must be able to write the documents it produces.
+    #[test]
+    fn spec_writer_plans_on_opus_and_can_write_docs() {
+        let registry = registry_with_seeds();
+        let spec = registry.get_agent("spec-writer").expect("read").unwrap();
+        assert_eq!(spec.adapter_id, "claude-code");
+        assert_eq!(spec.model.as_deref(), Some("claude-opus-5"));
+        assert_eq!(spec.mode, AgentMode::AcceptEdits);
+        assert!(spec.skills.contains(&"product-spec".to_owned()));
+
+        let preamble = registry.preamble_for(&spec).expect("preamble");
+        for phase in [
+            "DISCOVERY.md",
+            "PRD.md",
+            "docs/features/",
+            "IMPLEMENTATION_PLAN.md",
+        ] {
+            assert!(preamble.contains(phase), "spec skill must cover {phase}");
+        }
+    }
+
+    #[test]
+    fn requested_worker_pool_writes_on_claude_sonnet_5_and_holds_the_graph_rule() {
+        let registry = registry_with_seeds();
+        for id in [
+            "database-engineer",
+            "devops-deployer",
+            "docs-writer",
+            "flutter-dev",
+            "nextjs-dev",
+            "nodejs-dev",
+            "python-specialist",
+            "react-dev",
+            "react-native-dev",
+            "rust-specialist",
+            "test-engineer",
+            "typescript-specialist",
+        ] {
+            let coder = registry.get_agent(id).expect("read").unwrap();
+            assert_eq!(coder.adapter_id, "claude-code", "{id} provider");
+            assert_eq!(
+                coder.model.as_deref(),
+                Some("claude-sonnet-5"),
+                "{id} model"
+            );
+            assert_eq!(coder.mode, AgentMode::AcceptEdits, "{id} must write files");
+            assert!(
+                coder.skills.contains(&"code-graph-discipline".to_owned()),
+                "{id} must hold the strict graph rule"
+            );
+            assert!(coder.skills.contains(&"decision-protocol".to_owned()));
+        }
+    }
+
     /// The design phase is a proper agent (user request 2026-08-22,
     /// distilled from `~/.claude/agents/ui-designer.md` + mastermind
     /// Phases 6–7): the only built-in with write access, holding the
-    /// product-design skill, on sonnet via agy.
+    /// product-design skill, on Gemini 3.1 Pro High via agy.
     #[test]
     fn ui_designer_is_the_write_capable_design_phase_agent() {
         let registry = registry_with_seeds();
         let designer = registry.get_agent("ui-designer").expect("read").unwrap();
         assert_eq!(designer.adapter_id, ADAPTER_ANTIGRAVITY_AGY);
-        assert_eq!(designer.model.as_deref(), Some("claude-sonnet-4-6"));
+        assert_eq!(designer.model.as_deref(), Some("gemini-3.1-pro-high"));
         assert_eq!(
             designer.mode,
             AgentMode::AcceptEdits,
             "designers ship artifacts"
         );
-        assert_eq!(designer.skills, vec!["product-design".to_owned()]);
+        assert_eq!(
+            designer.skills,
+            vec![
+                "product-design".to_owned(),
+                "code-graph-discipline".to_owned(),
+                "decision-protocol".to_owned()
+            ]
+        );
         assert!(designer.timeout_secs >= 1800, "mockup runs are long");
 
         // Every other built-in stays read-only.
@@ -961,10 +1119,58 @@ mod tests {
 
         // The skill body carries the load-bearing method rules.
         let skill = registry.get_skill("product-design").expect("read").unwrap();
-        for rule in ["DESIGN.md", "tokens.css", "var(--*)", "INDEX.md", "4.5:1"] {
+        for rule in [
+            "DESIGN.md",
+            "tokens.css",
+            "var(--*)",
+            "INDEX.md",
+            "4.5:1",
+            "Brand register",
+            "Product register",
+            "Absolute bans",
+            "AI slop test",
+        ] {
             assert!(
                 skill.body.contains(rule),
                 "product-design must cover {rule}"
+            );
+        }
+    }
+
+    #[test]
+    fn reviewers_and_debugger_match_the_requested_models_and_keep_their_modes() {
+        let registry = registry_with_seeds();
+
+        let reviewer = registry.get_agent("code-reviewer").expect("read").unwrap();
+        assert_eq!(reviewer.adapter_id, "codex");
+        assert_eq!(reviewer.model.as_deref(), Some("gpt-5.6-terra"));
+        assert_eq!(reviewer.mode, AgentMode::Plan);
+
+        let security = registry
+            .get_agent("security-reviewer")
+            .expect("read")
+            .unwrap();
+        assert_eq!(security.adapter_id, "claude-code");
+        assert_eq!(security.model.as_deref(), Some("claude-sonnet-5"));
+        assert_eq!(security.mode, AgentMode::Plan);
+
+        let debugger = registry.get_agent("debugger").expect("read").unwrap();
+        assert_eq!(debugger.adapter_id, "codex");
+        assert_eq!(debugger.model.as_deref(), Some("gpt-5.6-terra"));
+        assert_eq!(debugger.mode, AgentMode::AcceptEdits);
+
+        let sol = registry
+            .get_agent("debugger-sol-escalation")
+            .expect("read")
+            .unwrap();
+        assert_eq!(sol.adapter_id, "codex");
+        assert_eq!(sol.model.as_deref(), Some("gpt-5.6-sol"));
+        assert_eq!(sol.mode, AgentMode::AcceptEdits);
+        assert!(sol.description.contains("Escalation-only"));
+        for denied in ["commit", "merge", "rebase", "push", "reset"] {
+            assert!(
+                sol.tool_denylist.iter().any(|rule| rule.contains(denied)),
+                "Sol escalation must deny git {denied}"
             );
         }
     }
