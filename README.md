@@ -604,7 +604,7 @@ The journal and projections are deliberately distinct: durable workflow rows con
 
 Major views include:
 
-- Project launcher — daemon-owned recent projects, safe preflight, and starter creation;
+- Project launcher — daemon-owned recent projects, safe preflight, starter creation, and a native Windows/macOS/Linux directory picker in the Tauri shell;
 - Mastermind — guided discovery, provider/model choice, explicit approvals, concurrency selection, and editable DAG validation;
 - Hybrid workspace — a dependency graph, real event packets, equivalent task list, activity journal, and contextual inspector;
 - Conversations — a ChatGPT-like transcript with explicit agent/provider/model/effort/mode/path authority, automatically applied saved skills, temporary `/skill` bindings, and a searchable slash-command palette;

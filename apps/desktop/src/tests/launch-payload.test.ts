@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { mastermindStartPayload, projectCreatePayload, projectOpenPayload, projectScaffoldPayload } from "../App";
+import { mastermindStartPayload, normalizeConversation, projectCreatePayload, projectOpenPayload, projectScaffoldPayload } from "../App";
 
 describe("daemon launch payloads", () => {
   it("uses daemon-owned project field names", () => {
@@ -14,6 +14,16 @@ describe("daemon launch payloads", () => {
       starterId: "nextjs",
       sessionDefaults: { initialGoal: "Ship the app" },
     });
+  });
+
+  it("normalizes daemon chat summaries that use sessionId", () => {
+    expect(normalizeConversation({ sessionId: "chat-1", title: "Investigate routing", status: "active" })).toEqual({
+      id: "chat-1",
+      title: "Investigate routing",
+      status: "active",
+      parentSessionId: undefined,
+    });
+    expect(normalizeConversation({ title: "missing identity" })).toBeUndefined();
   });
 
   it("keeps Mastermind concurrency inside the daemon contract", () => {
