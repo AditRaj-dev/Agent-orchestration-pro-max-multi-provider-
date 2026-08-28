@@ -42,9 +42,10 @@ use agentos_adapters::claude::ClaudeAdapter;
 use agentos_adapters::codex::CodexAdapter;
 use agentos_adapters::mock::{MockAdapter, MockBehavior};
 use agentos_adapters::{AdapterError, AdapterEvent, RuntimeAdapter, SpawnSpec};
-use agentos_agents::{AgentMode, AgentRecord, AgentRegistry, AgentsError};
+use agentos_agents::{AgentEffort, AgentMode, AgentRecord, AgentRegistry, AgentsError};
 use agentos_core::Event;
 use chrono::Utc;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::sync::broadcast::error::RecvError;
 use uuid::Uuid;
@@ -109,6 +110,48 @@ struct ResumeTarget {
     from_session: String,
     /// The provider-side handle the adapter resumes.
     provider_session_id: String,
+}
+
+/// Ephemeral choices for one chat only. They are never written back into the
+/// registry; project-level defaults are persisted by `projects`, separately.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionOverrides {
+    #[serde(default)]
+    pub project_id: Option<String>,
+    #[serde(default)]
+    pub workspace: Option<String>,
+    #[serde(default)]
+    pub adapter_id: Option<String>,
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub effort: Option<AgentEffort>,
+    #[serde(default)]
+    pub mode: Option<AgentMode>,
+    /// `read_only`, `paths`, or `workspace`; this is a less adapter-specific write
+    /// scope alias for UI callers. It wins over `mode` when both are given.
+    #[serde(default)]
+    pub write_scope: Option<String>,
+    /// Explicit write roots for scoped edit sessions. Relative paths resolve
+    /// beneath `workspace`; absolute paths must still be contained by it.
+    #[serde(default)]
+    pub allowed_paths: Option<Vec<String>>,
+    #[serde(default)]
+    pub skills: Option<Vec<String>>,
+    #[serde(default)]
+    pub timeout_secs: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PreparedSession {
+    pub agent: AgentRecord,
+    pub workspace: String,
+    pub project_id: Option<String>,
+    pub requires_edit_confirmation: bool,
+    pub write_scope: String,
+    pub allowed_paths: Vec<String>,
 }
 
 /// The daemon's adapter set: the four wired runtimes. Concrete (not
@@ -232,7 +275,49 @@ impl AgentSessions {
     /// and hand the event pump to a driver task. Returns the chat session
     /// id.
     pub async fn start(&self, agent_id: &str, message: &str) -> Result<String, SessionError> {
-        self.start_inner(agent_id, message, None).await
+        self.start_inner(agent_id, message, None, None).await
+    }
+
+    /// Resolve and validate an ephemeral session configuration without
+    /// starting a provider process. This makes the edit confirmation UI a
+    /// real preflight, not a cosmetic prompt.
+    pub fn prepare(
+        &self,
+        agent_id: &str,
+        overrides: SessionOverrides,
+    ) -> Result<PreparedSession, SessionError> {
+        let record = self
+            .registry
+            .resolve(agent_id)?
+            .ok_or_else(|| SessionError::NotFound(format!("agent {agent_id} (or disabled)")))?;
+        let (agent, workspace) = apply_overrides(record, &overrides, &self.workspace)?;
+        let allowed_paths = resolve_allowed_paths(&agent, &overrides, &workspace)?;
+        let write_scope = if allowed_paths.is_empty() {
+            "read_only"
+        } else if allowed_paths.len() == 1 && allowed_paths[0] == workspace.display().to_string() {
+            "workspace"
+        } else {
+            "paths"
+        };
+        Ok(PreparedSession {
+            requires_edit_confirmation: agent.mode == AgentMode::AcceptEdits,
+            agent,
+            workspace: workspace.display().to_string(),
+            project_id: overrides.project_id,
+            write_scope: write_scope.to_owned(),
+            allowed_paths,
+        })
+    }
+
+    /// Start against a configuration already validated by `prepare`.
+    pub async fn start_with_overrides(
+        &self,
+        agent_id: &str,
+        message: &str,
+        overrides: SessionOverrides,
+    ) -> Result<String, SessionError> {
+        self.start_inner(agent_id, message, None, Some(overrides))
+            .await
     }
 
     /// Continue an earlier conversation (F-13b): look the old session up in
@@ -261,6 +346,7 @@ impl AgentSessions {
                 from_session: session_id.to_owned(),
                 provider_session_id: provider_session,
             }),
+            None,
         )
         .await
     }
@@ -301,6 +387,7 @@ impl AgentSessions {
         agent_id: &str,
         message: &str,
         resume: Option<ResumeTarget>,
+        overrides: Option<SessionOverrides>,
     ) -> Result<String, SessionError> {
         if message.trim().is_empty() {
             return Err(SessionError::InvalidParams(
@@ -311,6 +398,9 @@ impl AgentSessions {
             .registry
             .resolve(agent_id)?
             .ok_or_else(|| SessionError::NotFound(format!("agent {agent_id} (or disabled)")))?;
+        let overrides = overrides.unwrap_or_default();
+        let (record, workspace) = apply_overrides(record, &overrides, &self.workspace)?;
+        let allowed_paths = resolve_allowed_paths(&record, &overrides, &workspace)?;
         let adapter = self.adapter(&record.adapter_id).ok_or_else(|| {
             SessionError::InvalidParams(format!(
                 "no adapter {:?} is wired into this daemon",
@@ -327,7 +417,13 @@ impl AgentSessions {
         if record.skills.iter().any(|s| s == AGENT_CREATION_SKILL) {
             preamble.push_str(&self.registry_catalog_preamble()?);
         }
-        let spec = chat_spawn_spec(&record, &preamble, message, self.workspace.clone());
+        let spec = chat_spawn_spec(
+            &record,
+            &preamble,
+            message,
+            workspace.clone(),
+            allowed_paths.clone(),
+        );
 
         // Journal before spawn so the conversation's first frame is
         // ordered ahead of anything the session emits.
@@ -342,7 +438,14 @@ impl AgentSessions {
                     "sessionId": session_id,
                     "provider": adapter.id(),
                     "model": record.model,
-                    "workspace": self.workspace.display().to_string(),
+                    "workspace": workspace.display().to_string(),
+                    "projectId": overrides.project_id,
+                    "adapterId": record.adapter_id,
+                    "effort": record.effort.map(|effort| effort.as_str()),
+                    "mode": record.mode.as_str(),
+                    "allowedPaths": allowed_paths,
+                    "skills": record.skills,
+                    "timeoutSecs": record.timeout_secs,
                     "chat": true,
                     "resumedFrom": resume.as_ref().map(|target| target.from_session.clone()),
                     "resumedProviderSession":
@@ -614,6 +717,116 @@ impl AgentSessions {
     }
 }
 
+fn apply_overrides(
+    mut record: AgentRecord,
+    overrides: &SessionOverrides,
+    default_workspace: &std::path::Path,
+) -> Result<(AgentRecord, PathBuf), SessionError> {
+    if let Some(adapter_id) = &overrides.adapter_id {
+        record.adapter_id = adapter_id.clone();
+    }
+    if let Some(model) = &overrides.model {
+        if model.trim().is_empty() {
+            return Err(SessionError::InvalidParams(
+                "model must be non-empty when set".to_owned(),
+            ));
+        }
+        record.model = Some(model.clone());
+    }
+    if let Some(effort) = overrides.effort {
+        record.effort = Some(effort);
+    }
+    if let Some(mode) = overrides.mode {
+        record.mode = mode;
+    }
+    if let Some(scope) = &overrides.write_scope {
+        record.mode = match scope.as_str() {
+            "read_only" => AgentMode::Plan,
+            "paths" | "workspace" => AgentMode::AcceptEdits,
+            _ => {
+                return Err(SessionError::InvalidParams(
+                    "writeScope must be read_only, paths, or workspace".to_owned(),
+                ))
+            }
+        };
+    }
+    if let Some(skills) = &overrides.skills {
+        record.skills = skills.clone();
+    }
+    if let Some(timeout_secs) = overrides.timeout_secs {
+        record.timeout_secs = timeout_secs;
+    }
+    record.validate()?;
+    let workspace = match overrides.workspace.as_deref() {
+        Some(path) => std::fs::canonicalize(path).map_err(|_| {
+            SessionError::InvalidParams(format!("workspace {path:?} is not an existing directory"))
+        })?,
+        None => default_workspace.to_path_buf(),
+    };
+    if !workspace.is_dir() {
+        return Err(SessionError::InvalidParams(format!(
+            "workspace {} is not an existing directory",
+            workspace.display()
+        )));
+    }
+    Ok((record, workspace))
+}
+
+fn resolve_allowed_paths(
+    record: &AgentRecord,
+    overrides: &SessionOverrides,
+    workspace: &std::path::Path,
+) -> Result<Vec<String>, SessionError> {
+    if record.mode == AgentMode::Plan || overrides.write_scope.as_deref() == Some("read_only") {
+        return Ok(Vec::new());
+    }
+    if overrides.write_scope.as_deref() == Some("workspace") {
+        return Ok(vec![workspace.display().to_string()]);
+    }
+    let requested = overrides.allowed_paths.as_deref().unwrap_or_default();
+    if overrides.write_scope.as_deref() == Some("paths") && requested.is_empty() {
+        return Err(SessionError::InvalidParams(
+            "writeScope paths requires at least one allowedPaths entry".to_owned(),
+        ));
+    }
+    if requested.is_empty() {
+        return Ok(vec![workspace.display().to_string()]);
+    }
+    let canonical_workspace = std::fs::canonicalize(workspace).map_err(|error| {
+        SessionError::InvalidParams(format!(
+            "workspace {} cannot be resolved: {error}",
+            workspace.display()
+        ))
+    })?;
+    let mut resolved = Vec::with_capacity(requested.len());
+    for path in requested {
+        let candidate = std::path::Path::new(path);
+        let candidate = if candidate.is_absolute() {
+            candidate.to_path_buf()
+        } else {
+            canonical_workspace.join(candidate)
+        };
+        let canonical = std::fs::canonicalize(&candidate).map_err(|_| {
+            SessionError::InvalidParams(format!(
+                "allowed path {} is not an existing file or directory",
+                candidate.display()
+            ))
+        })?;
+        if !canonical.starts_with(&canonical_workspace) {
+            return Err(SessionError::InvalidParams(format!(
+                "allowed path {} escapes workspace {}",
+                canonical.display(),
+                canonical_workspace.display()
+            )));
+        }
+        let rendered = canonical.display().to_string();
+        if !resolved.contains(&rendered) {
+            resolved.push(rendered);
+        }
+    }
+    Ok(resolved)
+}
+
 /// Build the chat SpawnSpec from a record: skill preamble ahead of the
 /// message, record model/tools/timeout, mode mapped through the adapters'
 /// contract (agy derives plan-mode from empty `allowed_paths`; claude pins
@@ -623,6 +836,7 @@ fn chat_spawn_spec(
     preamble: &str,
     message: &str,
     workspace: PathBuf,
+    allowed_paths: Vec<String>,
 ) -> SpawnSpec {
     let mut tool_denylist = record.tool_denylist.clone();
     if record.mode == AgentMode::Plan && record.adapter_id == "claude-code" {
@@ -641,10 +855,7 @@ fn chat_spawn_spec(
         // list and `accept-edits` from a non-empty one (extra dirs are
         // deduped against the workspace `--add-dir`). Plan agents stay
         // read-only; accept-edits agents name their workspace.
-        allowed_paths: match record.mode {
-            AgentMode::Plan => Vec::new(),
-            AgentMode::AcceptEdits => vec![workspace.display().to_string()],
-        },
+        allowed_paths,
         forbidden_paths: Vec::new(),
         tool_allowlist: record.tool_allowlist.clone(),
         tool_denylist,
@@ -1544,7 +1755,13 @@ mod tests {
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };
-        let spec = chat_spawn_spec(&record, "# Preamble\n", "do the thing", PathBuf::from("ws"));
+        let spec = chat_spawn_spec(
+            &record,
+            "# Preamble\n",
+            "do the thing",
+            PathBuf::from("ws"),
+            Vec::new(),
+        );
         assert!(spec.objective.starts_with("# Preamble\n"));
         assert!(spec.objective.ends_with("do the thing"));
         assert_eq!(spec.model.as_deref(), Some("mock-model-1"));
@@ -1572,7 +1789,7 @@ mod tests {
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };
-        let spec = chat_spawn_spec(&record, "", "hi", PathBuf::from("ws"));
+        let spec = chat_spawn_spec(&record, "", "hi", PathBuf::from("ws"), Vec::new());
         for tool in PLAN_MODE_WRITE_DENYLIST {
             assert!(
                 spec.tool_denylist.contains(&tool.to_owned()),
@@ -1581,7 +1798,13 @@ mod tests {
         }
         // Edit mode keeps the record's lists untouched.
         record.mode = AgentMode::AcceptEdits;
-        let spec = chat_spawn_spec(&record, "", "hi", PathBuf::from("ws"));
+        let spec = chat_spawn_spec(
+            &record,
+            "",
+            "hi",
+            PathBuf::from("ws"),
+            vec!["ws".to_owned()],
+        );
         assert!(spec.tool_denylist.is_empty());
     }
 
@@ -1627,5 +1850,68 @@ Let me know if that fits."#;
         assert!(blocks[1].contains("raw"));
         // An opener must start its line — inline backticks are not fences.
         assert!(fenced_blocks("pre ```json\n{\"a\":1}\n```").is_empty());
+    }
+
+    #[test]
+    fn preparation_keeps_overrides_ephemeral_and_flags_write_scope() {
+        let (registry, sessions, dir) = mock_sessions();
+        let original = registry.resolve("mock-creator").unwrap().unwrap();
+        assert_eq!(original.mode, AgentMode::Plan);
+        let prepared = sessions
+            .prepare(
+                "mock-creator",
+                SessionOverrides {
+                    workspace: Some(dir.path().display().to_string()),
+                    write_scope: Some("workspace".to_owned()),
+                    timeout_secs: Some(90),
+                    ..SessionOverrides::default()
+                },
+            )
+            .unwrap();
+        assert!(prepared.requires_edit_confirmation);
+        assert_eq!(prepared.agent.mode, AgentMode::AcceptEdits);
+        assert_eq!(prepared.agent.timeout_secs, 90);
+        assert_eq!(registry.resolve("mock-creator").unwrap().unwrap(), original);
+    }
+
+    #[test]
+    fn preparation_resolves_scoped_paths_inside_the_workspace() {
+        let (_registry, sessions, dir) = mock_sessions();
+        let source = dir.path().join("src");
+        std::fs::create_dir(&source).unwrap();
+        let prepared = sessions
+            .prepare(
+                "mock-creator",
+                SessionOverrides {
+                    workspace: Some(dir.path().display().to_string()),
+                    write_scope: Some("paths".to_owned()),
+                    allowed_paths: Some(vec!["src".to_owned()]),
+                    ..SessionOverrides::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(prepared.write_scope, "paths");
+        assert_eq!(
+            prepared.allowed_paths,
+            vec![std::fs::canonicalize(source).unwrap().display().to_string()]
+        );
+    }
+
+    #[test]
+    fn preparation_rejects_scoped_paths_outside_the_workspace() {
+        let (_registry, sessions, dir) = mock_sessions();
+        let outside = tempfile::tempdir().unwrap();
+        let error = sessions
+            .prepare(
+                "mock-creator",
+                SessionOverrides {
+                    workspace: Some(dir.path().display().to_string()),
+                    write_scope: Some("paths".to_owned()),
+                    allowed_paths: Some(vec![outside.path().display().to_string()]),
+                    ..SessionOverrides::default()
+                },
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("escapes workspace"));
     }
 }

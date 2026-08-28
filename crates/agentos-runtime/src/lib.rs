@@ -48,7 +48,10 @@ pub mod policy;
 pub mod supervisor;
 pub mod usage_ledger;
 
-pub use agentos_workflow::ReopenReport;
+pub use agentos_workflow::{
+    ControlAction, ControlResult, EngineConfig, QueueBlock, QueueReason, ReopenReport,
+    WorkflowControlEvent, WorkflowControlHook,
+};
 pub use contract::{ContractBudgets, ContractRule, GitPolicy, TaskContract, TaskContractBuilder};
 pub use digest::sha256_hex;
 pub use error::RuntimeError;

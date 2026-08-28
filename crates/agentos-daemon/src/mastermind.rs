@@ -163,6 +163,8 @@ pub enum MastermindError {
     NotCommitted(String),
     #[error("session {session} run is {status}, not failed; there is nothing to reopen")]
     RunNotFailed { session: String, status: String },
+    #[error("invalid workflow control request: {0}")]
+    InvalidControl(String),
     #[error("session {0} still has unanswered discovery questions; finish discovery before committing or running agents")]
     DiscoveryIncomplete(String),
     #[error("session {0} is waiting for approval of docs/DISCOVERY.md")]
@@ -3196,6 +3198,21 @@ The scoped authoring turn completed successfully but its                  delive
         planner_adapter: Option<&str>,
         planner_model: Option<&str>,
     ) -> Result<Value, MastermindError> {
+        self.start_with_concurrency(goal, repo, planner_adapter, planner_model, 4)
+            .await
+    }
+
+    /// Start with an operator-selected concurrency cap. One Mastermind
+    /// session owns one supervisor/run, so this is also the persisted run
+    /// admission default for that session.
+    pub async fn start_with_concurrency(
+        &self,
+        goal: &str,
+        repo: &Path,
+        planner_adapter: Option<&str>,
+        planner_model: Option<&str>,
+        max_concurrency: usize,
+    ) -> Result<Value, MastermindError> {
         if !repo.is_dir() {
             return Err(MastermindError::NoRepo(repo.to_path_buf()));
         }
@@ -3252,6 +3269,7 @@ The scoped authoring turn completed successfully but its                  delive
         let mut config = SupervisorConfig::for_repo(&state_dir, repo)
             .with_agents_db(&self.agents_db)
             .with_shared_task_workspace()
+            .with_max_concurrency(max_concurrency)
             .with_role_model(STRONGER_AGENT, &planner_model_slug);
         config.journal_db = self.supervisor_journal(&state_dir);
         config.orchestrator = ORCHESTRATOR_AGENT.to_owned();
@@ -3779,6 +3797,85 @@ The scoped authoring turn completed successfully but its                  delive
                 })).collect::<Vec<_>>(),
             })),
             "session": guard.summary(),
+        }))
+    }
+
+    /// Stop admitting new attempts while allowing current leases to drain.
+    pub async fn pause_run(&self, session_id: &str) -> Result<Value, MastermindError> {
+        let session = self.session(session_id)?;
+        let guard = session.lock().await;
+        let run_id = guard
+            .orchestrator
+            .plan()
+            .run_id()
+            .ok_or_else(|| MastermindError::NotCommitted(session_id.to_owned()))?;
+        Ok(json!({ "control": guard.supervisor.pause_run(&run_id)? }))
+    }
+
+    /// Resume normal admission for a persistently paused run.
+    pub async fn resume_run(&self, session_id: &str) -> Result<Value, MastermindError> {
+        let session = self.session(session_id)?;
+        let guard = session.lock().await;
+        let run_id = guard
+            .orchestrator
+            .plan()
+            .run_id()
+            .ok_or_else(|| MastermindError::NotCommitted(session_id.to_owned()))?;
+        Ok(json!({ "control": guard.supervisor.resume_run(&run_id)? }))
+    }
+
+    /// Cancel all cancellable work in a committed run.
+    pub async fn cancel_run(&self, session_id: &str) -> Result<Value, MastermindError> {
+        let session = self.session(session_id)?;
+        let guard = session.lock().await;
+        let run_id = guard
+            .orchestrator
+            .plan()
+            .run_id()
+            .ok_or_else(|| MastermindError::NotCommitted(session_id.to_owned()))?;
+        Ok(json!({ "control": guard.supervisor.cancel_run(&run_id)? }))
+    }
+
+    /// Cancel one queued or running task without affecting unrelated work.
+    pub async fn cancel_task(
+        &self,
+        session_id: &str,
+        task_id: &str,
+    ) -> Result<Value, MastermindError> {
+        let task_id = Uuid::parse_str(task_id)
+            .map_err(|_| MastermindError::InvalidControl("taskId must be a UUID".to_owned()))?;
+        let session = self.session(session_id)?;
+        let guard = session.lock().await;
+        Ok(json!({ "control": guard.supervisor.cancel_task(&task_id)? }))
+    }
+
+    /// Reopen one failed task with a fresh retry attempt.
+    pub async fn retry_task(
+        &self,
+        session_id: &str,
+        task_id: &str,
+    ) -> Result<Value, MastermindError> {
+        let task_id = Uuid::parse_str(task_id)
+            .map_err(|_| MastermindError::InvalidControl("taskId must be a UUID".to_owned()))?;
+        let session = self.session(session_id)?;
+        let guard = session.lock().await;
+        Ok(json!({ "control": guard.supervisor.retry_task(&task_id)? }))
+    }
+
+    /// Change the role used by queued or retryable work. Active attempts are
+    /// rejected by the workflow engine and therefore remain immutable.
+    pub async fn reroute_task(
+        &self,
+        session_id: &str,
+        task_id: &str,
+        agent_role: Option<&str>,
+    ) -> Result<Value, MastermindError> {
+        let task_id = Uuid::parse_str(task_id)
+            .map_err(|_| MastermindError::InvalidControl("taskId must be a UUID".to_owned()))?;
+        let session = self.session(session_id)?;
+        let guard = session.lock().await;
+        Ok(json!({
+            "control": guard.supervisor.reroute_task(&task_id, agent_role)?
         }))
     }
 

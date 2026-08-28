@@ -59,9 +59,10 @@ use tokio_tungstenite::WebSocketStream;
 use tracing::{debug, warn};
 use uuid::Uuid;
 
-use crate::agent_sessions::{AgentSessions, SessionError};
+use crate::agent_sessions::{AgentSessions, SessionError, SessionOverrides};
 use crate::events::{self, SequencedEvent};
 use crate::projection;
+use crate::projects::{CreateProject, ProjectError, ProjectStore, ScaffoldProject, UpdateProject};
 
 /// Registry-mutation journal events (F-13 audit trail: the tables are
 /// mutable, the journal records who changed what when).
@@ -102,6 +103,9 @@ pub const CODE_INVALID_PARAMS: &str = "invalid_params";
 pub const CODE_INTERNAL_ERROR: &str = "internal_error";
 /// Error code: unknown method name.
 pub const CODE_METHOD_NOT_FOUND: &str = "method_not_found";
+/// A local optional dependency (currently Memex) is unavailable. Callers can
+/// render a setup action instead of mistaking absence for an empty dataset.
+pub const CODE_DEPENDENCY_UNAVAILABLE: &str = "dependency_unavailable";
 
 /// Hard ceiling for `events.list` `limit` (§3.2).
 const MAX_LIST_LIMIT: i64 = 1000;
@@ -147,7 +151,373 @@ impl ApiError {
             message: message.into(),
         }
     }
+}
 
+impl WsServer {
+    fn projects(&self) -> Result<&ProjectStore, ApiError> {
+        self.projects.as_deref().ok_or_else(|| {
+            ApiError::internal("project store could not be opened beside the daemon journal")
+        })
+    }
+
+    fn projects_create(&self, params: &Value) -> Result<Value, ApiError> {
+        let input: CreateProject = serde_json::from_value(params.clone())
+            .map_err(|err| ApiError::invalid_params(format!("invalid project: {err}")))?;
+        let record = self.projects()?.create(input).map_err(project_error)?;
+        self.audit(
+            "project.created",
+            json!({ "projectId": record.id, "rootPath": record.root_path }),
+        )?;
+        Ok(json!({ "project": record }))
+    }
+
+    fn projects_scaffold(&self, params: &Value) -> Result<Value, ApiError> {
+        let input: ScaffoldProject = serde_json::from_value(params.clone()).map_err(|err| {
+            ApiError::invalid_params(format!("invalid project scaffold request: {err}"))
+        })?;
+        let record = self.projects()?.scaffold(input).map_err(project_error)?;
+        self.audit(
+            "project.scaffolded",
+            json!({ "projectId": record.id, "rootPath": record.root_path }),
+        )?;
+        Ok(json!({ "project": record }))
+    }
+
+    fn projects_open(&self, params: &Value) -> Result<Value, ApiError> {
+        let id = required_string(params, "id")?;
+        let record = self.projects()?.open_project(id).map_err(project_error)?;
+        self.audit("project.opened", json!({ "projectId": record.id }))?;
+        Ok(
+            json!({ "project": record, "preflight": ProjectStore::preflight(&record.root_path).map_err(project_error)? }),
+        )
+    }
+
+    fn projects_update(&self, params: &Value) -> Result<Value, ApiError> {
+        let input: UpdateProject = serde_json::from_value(params.clone())
+            .map_err(|err| ApiError::invalid_params(format!("invalid project update: {err}")))?;
+        let record = self.projects()?.update(input).map_err(project_error)?;
+        self.audit("project.updated", json!({ "projectId": record.id }))?;
+        Ok(json!({ "project": record }))
+    }
+
+    fn projects_forget(&self, params: &Value) -> Result<Value, ApiError> {
+        let id = required_string(params, "id")?;
+        self.projects()?.forget(id).map_err(project_error)?;
+        self.audit("project.forgotten", json!({ "projectId": id }))?;
+        Ok(json!({ "forgotten": true, "id": id }))
+    }
+
+    fn session_prepare(&self, params: &Value) -> Result<Value, ApiError> {
+        let agent_id = required_string(params, "agentId")?;
+        let overrides = self.session_overrides(params)?;
+        let prepared = self
+            .sessions
+            .prepare(agent_id, overrides.clone())
+            .map_err(session_error)?;
+        let token = Uuid::now_v7().to_string();
+        self.prepared
+            .lock()
+            .map_err(|_| ApiError::internal("prepared-session mutex poisoned"))?
+            .insert(
+                token.clone(),
+                PreparedRequest {
+                    agent_id: agent_id.to_owned(),
+                    overrides,
+                    expires_at: std::time::Instant::now() + Duration::from_secs(600),
+                },
+            );
+        self.audit(
+            "agent.session_prepared",
+            json!({
+                "agentId": agent_id, "projectId": prepared.project_id,
+                "requiresEditConfirmation": prepared.requires_edit_confirmation,
+            }),
+        )?;
+        Ok(json!({
+            "prepared": prepared,
+            "prepareToken": token,
+            "editConfirmationToken": if prepared.requires_edit_confirmation { Value::String(token) } else { Value::Null },
+            "expiresInSecs": 600,
+        }))
+    }
+
+    async fn session_start(
+        &self,
+        params: &Value,
+        agent_id: &str,
+        message: &str,
+    ) -> Result<String, ApiError> {
+        let token = optional_string(params, "prepareToken")?
+            .or(optional_string(params, "editConfirmationToken")?);
+        if let Some(token) = token {
+            let request = self
+                .prepared
+                .lock()
+                .map_err(|_| ApiError::internal("prepared-session mutex poisoned"))?
+                .remove(token)
+                .ok_or_else(|| ApiError::invalid_params("unknown or already-used prepareToken"))?;
+            if request.expires_at < std::time::Instant::now() {
+                return Err(ApiError::invalid_params(
+                    "prepareToken has expired; prepare the session again",
+                ));
+            }
+            if request.agent_id != agent_id {
+                return Err(ApiError::invalid_params(
+                    "prepareToken belongs to a different agent",
+                ));
+            }
+            let id = self
+                .sessions
+                .start_with_overrides(agent_id, message, request.overrides)
+                .await
+                .map_err(session_error)?;
+            self.audit(
+                "agent.session_started",
+                json!({ "sessionId": id, "agentId": agent_id, "prepared": true }),
+            )?;
+            return Ok(id);
+        }
+        if params.get("overrides").is_some() || params.get("projectId").is_some() {
+            let overrides = self.session_overrides(params)?;
+            let preview = self
+                .sessions
+                .prepare(agent_id, overrides.clone())
+                .map_err(session_error)?;
+            if preview.requires_edit_confirmation {
+                return Err(ApiError::invalid_params("write-capable session overrides require agent.session.prepare and editConfirmationToken"));
+            }
+            let id = self
+                .sessions
+                .start_with_overrides(agent_id, message, overrides)
+                .await
+                .map_err(session_error)?;
+            self.audit(
+                "agent.session_started",
+                json!({ "sessionId": id, "agentId": agent_id, "prepared": false }),
+            )?;
+            return Ok(id);
+        }
+        self.sessions
+            .start(agent_id, message)
+            .await
+            .map_err(session_error)
+    }
+
+    /// Merge an explicitly selected project's saved defaults with the call's
+    /// transient overrides. The latter win; neither path mutates the agent.
+    fn session_overrides(&self, params: &Value) -> Result<SessionOverrides, ApiError> {
+        let mut merged = params
+            .get("overrides")
+            .cloned()
+            .unwrap_or_else(|| json!({}));
+        if !merged.is_object() {
+            return Err(ApiError::invalid_params("overrides must be an object"));
+        }
+        let project_id = merged["projectId"]
+            .as_str()
+            .or_else(|| params.get("projectId").and_then(Value::as_str));
+        if let Some(project_id) = project_id {
+            let project = self.projects()?.get(project_id).map_err(project_error)?;
+            let mut defaults = project.session_defaults;
+            if !defaults.is_object() {
+                return Err(ApiError::internal("project sessionDefaults is corrupt"));
+            }
+            let call = merged.as_object().cloned().unwrap_or_default();
+            let defaults_map = defaults.as_object_mut().expect("object checked");
+            for (key, value) in call {
+                defaults_map.insert(key, value);
+            }
+            defaults_map
+                .entry("projectId".to_owned())
+                .or_insert_with(|| Value::String(project_id.to_owned()));
+            defaults_map
+                .entry("workspace".to_owned())
+                .or_insert_with(|| Value::String(project.root_path));
+            merged = defaults;
+        }
+        serde_json::from_value(merged)
+            .map_err(|err| ApiError::invalid_params(format!("invalid session overrides: {err}")))
+    }
+
+    fn conversation_journal(&self) -> Result<Vec<SequencedEvent>, ApiError> {
+        self.with_journal(|conn| events::tail_with_seq(conn, 0, u32::MAX))
+    }
+
+    fn chat_session_get(&self, params: &Value) -> Result<Value, ApiError> {
+        let session_id = required_string(params, "sessionId")?;
+        let session = self
+            .sessions
+            .chat_session(session_id)
+            .map_err(session_error)?
+            .ok_or_else(|| {
+                ApiError::invalid_params(format!("chat session {session_id} was not found"))
+            })?;
+        let journal = self.conversation_journal()?;
+        Ok(
+            json!({ "session": session, "messages": self.sessions.chat_transcript(session_id).map_err(session_error)?,
+            "lineage": crate::conversation::lineage(&journal, session_id),
+            "contextManifest": crate::conversation::context_manifest(&journal, session_id) }),
+        )
+    }
+
+    fn conversation_lineage(&self, params: &Value) -> Result<Value, ApiError> {
+        let session_id = required_string(params, "sessionId")?;
+        Ok(
+            json!({ "lineage": crate::conversation::lineage(&self.conversation_journal()?, session_id) }),
+        )
+    }
+
+    fn conversation_manifest(&self, params: &Value) -> Result<Value, ApiError> {
+        let session_id = required_string(params, "sessionId")?;
+        let manifest =
+            crate::conversation::context_manifest(&self.conversation_journal()?, session_id)
+                .ok_or_else(|| {
+                    ApiError::invalid_params(format!("no context manifest exists for {session_id}"))
+                })?;
+        Ok(json!({ "contextManifest": manifest }))
+    }
+
+    fn conversation_handoff_preview(&self, params: &Value) -> Result<Value, ApiError> {
+        let handoff = self.curated_handoff(params)?;
+        self.audit(
+            "conversation.handoff_previewed",
+            serde_json::to_value(&handoff).map_err(|err| ApiError::internal(err.to_string()))?,
+        )?;
+        Ok(json!({ "handoff": handoff }))
+    }
+
+    /// Validate and render the transportable handoff packet shared by preview
+    /// and commit. Preview remains side-effect free with respect to Memex;
+    /// commit is the only path that writes a Memex handoff row.
+    fn curated_handoff(
+        &self,
+        params: &Value,
+    ) -> Result<crate::conversation::CuratedHandoff, ApiError> {
+        let session_id = required_string(params, "sessionId")?;
+        let to_agent = required_string(params, "toAgent")?;
+        let summary = required_string(params, "summary")?;
+        let session = self
+            .sessions
+            .chat_session(session_id)
+            .map_err(session_error)?
+            .ok_or_else(|| {
+                ApiError::invalid_params(format!("chat session {session_id} was not found"))
+            })?;
+        let manifest =
+            crate::conversation::context_manifest(&self.conversation_journal()?, session_id)
+                .ok_or_else(|| {
+                    ApiError::invalid_params(format!("no context manifest exists for {session_id}"))
+                })?;
+        let handoff = crate::conversation::CuratedHandoff {
+            session_id: session_id.to_owned(),
+            from_agent: session.agent_id,
+            to_agent: to_agent.to_owned(),
+            summary: summary.to_owned(),
+            artifact_refs: optional_string_list(params, "artifactRefs")?,
+            skill_bindings: manifest.skills,
+        };
+        Ok(handoff)
+    }
+
+    fn conversation_handoff_commit(&self, params: &Value) -> Result<Value, ApiError> {
+        let project = self.memex_project(params)?;
+        let handoff = self.curated_handoff(params)?;
+        let task_id = required_string(params, "taskId")?;
+        let blockers = optional_string(params, "blockers")?.unwrap_or("");
+        // Memex's current CLI accepts one artifact string. JSON preserves
+        // arbitrary path/URI punctuation and remains lossless for callers.
+        let artifacts = encode_artifact_refs(&handoff.artifact_refs)?;
+        let handoff_id = self
+            .memex
+            .handoff_create(
+                &project,
+                &handoff.from_agent,
+                &handoff.to_agent,
+                task_id,
+                &handoff.summary,
+                &artifacts,
+                blockers,
+            )
+            .map_err(memex_error)?;
+        self.audit(
+            "conversation.handoff_committed",
+            json!({
+                "handoffId": handoff_id,
+                "project": project,
+                "taskId": task_id,
+                "handoff": handoff,
+            }),
+        )?;
+        Ok(json!({ "handoffId": handoff_id, "handoff": handoff }))
+    }
+
+    fn memory_search(&self, params: &Value) -> Result<Value, ApiError> {
+        let project = self.memex_project(params)?;
+        let query = required_string(params, "query")?;
+        let limit = optional_non_negative_i64(params, "limit")?
+            .unwrap_or(20)
+            .clamp(1, 100) as usize;
+        let memories = self
+            .memex
+            .search(&project, query, limit)
+            .map_err(memex_error)?;
+        Ok(json!({ "memories": memories, "project": project }))
+    }
+
+    fn memory_store(&self, params: &Value) -> Result<Value, ApiError> {
+        let project = self.memex_project(params)?;
+        let content = required_string(params, "content")?;
+        let agent = optional_string(params, "agent")?.unwrap_or("user");
+        let provider = optional_string(params, "provider")?.unwrap_or("agentos");
+        let kind = optional_string(params, "type")?.unwrap_or("note");
+        let tags = params.get("tags").map(tags_string).transpose()?;
+        let id = self
+            .memex
+            .remember(
+                &project,
+                content,
+                agent,
+                provider,
+                kind,
+                tags.as_deref().unwrap_or(""),
+            )
+            .map_err(memex_error)?;
+        self.audit(
+            "memory.stored",
+            json!({ "memoryId": id, "project": project, "type": kind }),
+        )?;
+        Ok(json!({ "memoryId": id, "project": project }))
+    }
+
+    fn handoffs_list(&self, params: &Value) -> Result<Value, ApiError> {
+        let project = self.memex_project(params)?;
+        let status = optional_string(params, "status")?;
+        let handoffs = self.memex.handoffs(&project, status).map_err(memex_error)?;
+        Ok(json!({ "handoffs": handoffs, "project": project }))
+    }
+
+    fn memex_project(&self, params: &Value) -> Result<String, ApiError> {
+        let id = required_string(params, "projectId")?;
+        let project = self.projects()?.get(id).map_err(project_error)?;
+        Ok(crate::memex::MemexClient::project_key(Path::new(
+            &project.root_path,
+        )))
+    }
+
+    fn audit(&self, event_type: &str, payload: Value) -> Result<(), ApiError> {
+        self.with_journal(|conn| {
+            events::append_event(
+                conn,
+                &Event::new(EventType::Other(event_type.to_owned()))
+                    .with_trace_id(Uuid::now_v7())
+                    .with_payload(payload),
+            )
+            .map(|_| ())
+        })
+    }
+}
+
+impl ApiError {
     /// `method_not_found`.
     fn method_not_found(message: impl Into<String>) -> Self {
         Self {
@@ -189,12 +559,22 @@ pub struct WsServer {
     journal_path: PathBuf,
     registry: Arc<agentos_agents::AgentRegistry>,
     sessions: Arc<AgentSessions>,
+    projects: Option<Arc<ProjectStore>>,
+    memex: crate::memex::MemexClient,
+    prepared: StdMutex<HashMap<String, PreparedRequest>>,
     /// F-12: the mastermind service, when the daemon was built with one.
     /// `None` in fixtures and UI-only daemons — the `mastermind.*` methods
     /// then answer `not_supported` instead of pretending to plan.
     mastermind: Option<Arc<crate::mastermind::Mastermind>>,
     started_at: DateTime<Utc>,
     next_subscription: std::sync::atomic::AtomicU64,
+}
+
+#[derive(Debug, Clone)]
+struct PreparedRequest {
+    agent_id: String,
+    overrides: SessionOverrides,
+    expires_at: std::time::Instant,
 }
 
 impl WsServer {
@@ -209,11 +589,19 @@ impl WsServer {
         registry: Arc<agentos_agents::AgentRegistry>,
         sessions: Arc<AgentSessions>,
     ) -> Self {
+        let journal_path = journal_path.into();
+        let projects_path = journal_path
+            .parent()
+            .map(|parent| parent.join("projects.db"))
+            .unwrap_or_else(|| PathBuf::from("projects.db"));
         Self {
             journal,
-            journal_path: journal_path.into(),
+            journal_path,
             registry,
             sessions,
+            projects: ProjectStore::open(projects_path).ok().map(Arc::new),
+            memex: crate::memex::MemexClient::from_env(),
+            prepared: StdMutex::new(HashMap::new()),
             mastermind: None,
             started_at: Utc::now(),
             next_subscription: std::sync::atomic::AtomicU64::new(1),
@@ -302,6 +690,52 @@ impl WsServer {
                 let tasks = projection.tasks(run_id.as_deref());
                 Ok(json!({ "tasks": tasks }))
             }
+            "runs.pause" => {
+                let session_id = required_string(params, "sessionId")?;
+                self.mastermind()?
+                    .pause_run(session_id)
+                    .await
+                    .map_err(mastermind_error)
+            }
+            "runs.resume" => {
+                let session_id = required_string(params, "sessionId")?;
+                self.mastermind()?
+                    .resume_run(session_id)
+                    .await
+                    .map_err(mastermind_error)
+            }
+            "runs.cancel" => {
+                let session_id = required_string(params, "sessionId")?;
+                self.mastermind()?
+                    .cancel_run(session_id)
+                    .await
+                    .map_err(mastermind_error)
+            }
+            "tasks.cancel" => {
+                let session_id = required_string(params, "sessionId")?;
+                let task_id = required_string(params, "taskId")?;
+                self.mastermind()?
+                    .cancel_task(session_id, task_id)
+                    .await
+                    .map_err(mastermind_error)
+            }
+            "tasks.retry" => {
+                let session_id = required_string(params, "sessionId")?;
+                let task_id = required_string(params, "taskId")?;
+                self.mastermind()?
+                    .retry_task(session_id, task_id)
+                    .await
+                    .map_err(mastermind_error)
+            }
+            "tasks.reroute" => {
+                let session_id = required_string(params, "sessionId")?;
+                let task_id = required_string(params, "taskId")?;
+                let agent_id = optional_string(params, "agentId")?;
+                self.mastermind()?
+                    .reroute_task(session_id, task_id, agent_id)
+                    .await
+                    .map_err(mastermind_error)
+            }
             // Provider rate-limit meters for the top bar. A cheap file
             // read, so the desktop polls it rather than subscribing.
             "usage.limits" => Ok(json!({ "meters": crate::usage_meters::meters() })),
@@ -333,14 +767,42 @@ impl WsServer {
                 let providers = self.sessions.provider_catalog().await;
                 Ok(json!({ "providers": providers }))
             }
+            // Provider-facing aliases give the desktop a stable product
+            // namespace without removing the F-13 registry compatibility.
+            "providers.refresh" => {
+                let providers = self.sessions.provider_catalog().await;
+                Ok(json!({ "providers": providers, "refreshedAt": now_rfc3339() }))
+            }
+            "providers.setupGuide" => Ok(json!({ "providers": [
+                {"id":"claude-code", "setup":"Install and sign in with the Claude Code CLI."},
+                {"id":"antigravity-agy", "setup":"Install agy and authenticate with its provider."},
+                {"id":"codex", "setup":"Install and sign in with the Codex CLI."},
+                {"id":"mock", "setup":"Built in for local testing; no account required."}
+            ] })),
+            // ----- Daemon-owned projects --------------------------------
+            "projects.list" => {
+                Ok(json!({ "projects": self.projects()?.list().map_err(project_error)? }))
+            }
+            "projects.create" => self.projects_create(params),
+            "projects.scaffold" => self.projects_scaffold(params),
+            "projects.get" => {
+                let id = required_string(params, "id")?;
+                Ok(json!({ "project": self.projects()?.get(id).map_err(project_error)? }))
+            }
+            "projects.open" => self.projects_open(params),
+            "projects.update" => self.projects_update(params),
+            "projects.forget" => self.projects_forget(params),
+            "projects.starters" | "projects.catalog" => Ok(ProjectStore::starters()),
+            "projects.preflight" => {
+                let root_path = required_string(params, "rootPath")?;
+                ProjectStore::preflight(root_path).map_err(project_error)
+            }
+            // ----- Session preparation and ephemeral configuration -------
+            "agent.session.prepare" => self.session_prepare(params),
             "agent.session.start" => {
                 let agent_id = required_string(params, "agentId")?;
                 let message = required_string(params, "message")?;
-                let session_id = self
-                    .sessions
-                    .start(agent_id, message)
-                    .await
-                    .map_err(session_error)?;
+                let session_id = self.session_start(params, agent_id, message).await?;
                 Ok(json!({ "sessionId": session_id }))
             }
             // F-13b chat history: past conversations folded out of the
@@ -366,6 +828,11 @@ impl WsServer {
                     .map_err(session_error)?;
                 Ok(json!({ "messages": messages, "session": summary }))
             }
+            "chat.session.get" => self.chat_session_get(params),
+            "conversation.lineage" => self.conversation_lineage(params),
+            "conversation.contextManifest" => self.conversation_manifest(params),
+            "conversation.handoff.preview" => self.conversation_handoff_preview(params),
+            "conversation.handoff.commit" => self.conversation_handoff_commit(params),
             "agent.session.reopen" => {
                 let session_id = required_string(params, "sessionId")?;
                 let message = required_string(params, "message")?;
@@ -393,6 +860,16 @@ impl WsServer {
                     .map_err(session_error)?;
                 Ok(json!({ "cancelled": true }))
             }
+            // ----- Memex bridge ------------------------------------------
+            "memory.search" => self.memory_search(params),
+            "memory.store" => self.memory_store(params),
+            "memory.get" => Err(ApiError::not_supported(
+                "the installed Memex CLI has no stable memory-get capability; use memory.search",
+            )),
+            "handoffs.list" => self.handoffs_list(params),
+            "handoffs.get" => Err(ApiError::not_supported(
+                "the installed Memex CLI has no stable handoff-get capability; use handoffs.list",
+            )),
             // ----- F-12: the mastermind flow -----------------------------
             "mastermind.start" => {
                 let goal = required_string(params, "goal")?;
@@ -405,12 +882,20 @@ impl WsServer {
                     .get("plannerModel")
                     .and_then(Value::as_str)
                     .filter(|value| !value.is_empty());
+                let max_concurrency =
+                    optional_non_negative_i64(params, "maxConcurrency")?.unwrap_or(4) as usize;
+                if !(1..=8).contains(&max_concurrency) {
+                    return Err(ApiError::invalid_params(
+                        "maxConcurrency must be between 1 and 8",
+                    ));
+                }
                 self.mastermind()?
-                    .start(
+                    .start_with_concurrency(
                         goal,
                         std::path::Path::new(repo),
                         planner_adapter,
                         planner_model,
+                        max_concurrency,
                     )
                     .await
                     .map_err(mastermind_error)
@@ -1513,6 +1998,78 @@ fn registry_error(err: agentos_agents::AgentsError) -> ApiError {
     }
 }
 
+fn project_error(err: ProjectError) -> ApiError {
+    match err {
+        ProjectError::InvalidPath(_)
+        | ProjectError::InvalidParent(_)
+        | ProjectError::NotFound(_)
+        | ProjectError::Invalid(_)
+        | ProjectError::UnsafeName(_)
+        | ProjectError::UnknownStarter(_)
+        | ProjectError::DestinationExists(_) => ApiError::invalid_params(err.to_string()),
+        ProjectError::ScaffoldIo { .. }
+        | ProjectError::GitInit { .. }
+        | ProjectError::Sql(_)
+        | ProjectError::Json(_) => ApiError::internal(format!("project storage failure: {err}")),
+    }
+}
+
+fn memex_error(err: crate::memex::MemexError) -> ApiError {
+    match err {
+        crate::memex::MemexError::Spawn { .. } => ApiError {
+            code: CODE_DEPENDENCY_UNAVAILABLE,
+            message: format!("Memex is unavailable: {err}"),
+        },
+        crate::memex::MemexError::Failed { .. } => ApiError::not_supported(format!(
+            "the installed Memex CLI does not support this operation: {err}"
+        )),
+        crate::memex::MemexError::Json(_) => {
+            ApiError::internal(format!("Memex returned an invalid response: {err}"))
+        }
+    }
+}
+
+fn optional_string_list(params: &Value, key: &str) -> Result<Vec<String>, ApiError> {
+    match params.get(key) {
+        None | Some(Value::Null) => Ok(Vec::new()),
+        Some(Value::Array(values)) => values
+            .iter()
+            .map(|value| {
+                value
+                    .as_str()
+                    .filter(|value| !value.is_empty())
+                    .map(ToOwned::to_owned)
+                    .ok_or_else(|| {
+                        ApiError::invalid_params(format!(
+                            "{key} must be an array of non-empty strings"
+                        ))
+                    })
+            })
+            .collect(),
+        Some(_) => Err(ApiError::invalid_params(format!(
+            "{key} must be an array of strings"
+        ))),
+    }
+}
+
+fn tags_string(value: &Value) -> Result<String, ApiError> {
+    match value {
+        Value::String(tags) => Ok(tags.clone()),
+        Value::Array(_) => Ok(optional_string_list(&json!({ "tags": value }), "tags")?.join(",")),
+        _ => Err(ApiError::invalid_params(
+            "tags must be a string or array of strings",
+        )),
+    }
+}
+
+/// Memex currently accepts artifacts as one string. Encode the curated list
+/// as JSON rather than joining it, so references containing commas or URLs
+/// round-trip without ambiguity.
+fn encode_artifact_refs(refs: &[String]) -> Result<String, ApiError> {
+    serde_json::to_string(refs)
+        .map_err(|err| ApiError::internal(format!("cannot encode handoff artifacts: {err}")))
+}
+
 /// Chat-session failures → §2.2 codes.
 fn session_error(err: SessionError) -> ApiError {
     match err {
@@ -1551,6 +2108,7 @@ fn mastermind_error(err: crate::mastermind::MastermindError) -> ApiError {
         // daemon fault: the engine's own status says there is nothing
         // stranded to recover.
         E::RunNotFailed { .. } => ApiError::invalid_params(err.to_string()),
+        E::InvalidControl(_) => ApiError::invalid_params(err.to_string()),
         E::DiscoveryIncomplete(_)
         | E::DiscoveryAwaitingApproval(_)
         | E::InvalidPhase { .. }
@@ -1732,5 +2290,54 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn committed_handoff_artifacts_are_losslessly_encoded_for_memex() {
+        let refs = vec![
+            "file:///D:/Project/a,b.md".to_owned(),
+            "https://example.test/review?item=1,2".to_owned(),
+        ];
+        let encoded = encode_artifact_refs(&refs).expect("artifact refs encode");
+        assert_eq!(
+            serde_json::from_str::<Vec<String>>(&encoded).unwrap(),
+            refs,
+            "Memex receives one unambiguous artifact string"
+        );
+    }
+
+    #[test]
+    fn projects_scaffold_rpc_creates_and_registers_a_builtin_starter() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let parent = dir.path().join("projects");
+        std::fs::create_dir(&parent).expect("projects parent");
+        let journal_path = dir.path().join("journal.db");
+        let journal = crate::db::open_db(&journal_path).expect("journal");
+        let registry = Arc::new(
+            agentos_agents::AgentRegistry::open(&dir.path().join("agents.db")).expect("registry"),
+        );
+        let sessions = Arc::new(AgentSessions::new(
+            Arc::clone(&registry),
+            crate::agent_sessions::AdapterSet::wired(),
+            journal_path.clone(),
+            dir.path().to_path_buf(),
+        ));
+        let server = WsServer::new(
+            Arc::new(StdMutex::new(journal)),
+            journal_path,
+            registry,
+            sessions,
+        );
+
+        let result = server
+            .projects_scaffold(&json!({
+                "parentPath": parent,
+                "name": "rpc-project",
+                "starterId": "blank-git"
+            }))
+            .expect("scaffold RPC succeeds");
+        assert_eq!(result["project"]["name"], json!("rpc-project"));
+        assert!(parent.join("rpc-project/.git").is_dir());
+        assert_eq!(server.projects().unwrap().list().unwrap().len(), 1);
     }
 }

@@ -84,8 +84,9 @@ use agentos_policy::{
     PolicyDenial,
 };
 use agentos_workflow::{
-    NodeType, Outcome, ReopenReport, RunStatus, Scheduler, TaskExecutor, TaskRecord, TaskStore,
-    TickReport, WorkflowEngine, WorkflowSpec, DEFAULT_LEASE_TTL,
+    ControlResult, EngineConfig, NodeType, Outcome, ReopenReport, RunStatus, Scheduler,
+    TaskContract as WorkflowTaskContract, TaskExecutor, TaskRecord, TaskStore, TickReport,
+    WorkflowEngine, WorkflowSpec, DEFAULT_LEASE_TTL,
 };
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -258,6 +259,8 @@ pub struct SupervisorConfig {
     pub approval_ttl_secs: u64,
     /// Lease ttl the supervisor's engine grants.
     pub lease_ttl: Duration,
+    /// Maximum workflow attempts admitted concurrently (1 through 8).
+    pub max_concurrency: usize,
     /// Rebuild the code graph after a worker node writes. Reviewers have no
     /// shell and cannot build one themselves, so if the harness does not do
     /// this the graph is only ever as fresh as a worker chose to make it.
@@ -293,6 +296,7 @@ impl SupervisorConfig {
             human_approval_gate: Gate::ProdAction,
             approval_ttl_secs: 900,
             lease_ttl: DEFAULT_LEASE_TTL,
+            max_concurrency: 4,
             graph_refresh: GraphRefresh::default(),
             graph_refresh_timeout_secs: 120,
         }
@@ -302,6 +306,13 @@ impl SupervisorConfig {
     pub fn with_role_adapter(mut self, role: &str, adapter_id: &str) -> Self {
         self.role_adapters
             .insert(role.to_owned(), adapter_id.to_owned());
+        self
+    }
+
+    /// Bound parallel workflow admission for this supervisor instance.
+    /// Validation is performed while constructing the workflow engine.
+    pub fn with_max_concurrency(mut self, max_concurrency: usize) -> Self {
+        self.max_concurrency = max_concurrency;
         self
     }
 
@@ -2430,8 +2441,16 @@ impl Supervisor {
         let executor: Arc<dyn TaskExecutor> = Arc::new(SupervisorExecutor {
             core: Arc::clone(&core),
         });
-        let engine =
-            Arc::new(WorkflowEngine::new(Arc::clone(&store), executor).with_lease_ttl(lease_ttl));
+        let engine = Arc::new(
+            WorkflowEngine::new_with_config(
+                Arc::clone(&store),
+                executor,
+                EngineConfig {
+                    max_concurrency: core.config.max_concurrency,
+                },
+            )?
+            .with_lease_ttl(lease_ttl),
+        );
         Ok(Self {
             core,
             engine,
@@ -2443,6 +2462,42 @@ impl Supervisor {
     /// external workers inject crash-simulating ghost leases in tests).
     pub fn engine(&self) -> &WorkflowEngine {
         &self.engine
+    }
+
+    /// Persistently pause a run with drain semantics (no new leases).
+    pub fn pause_run(&self, run_id: &Uuid) -> Result<ControlResult, RuntimeError> {
+        Ok(self.engine.pause_run(run_id)?)
+    }
+
+    /// Resume a paused run.
+    pub fn resume_run(&self, run_id: &Uuid) -> Result<ControlResult, RuntimeError> {
+        Ok(self.engine.resume_run(run_id)?)
+    }
+
+    /// Cancel one task, invoking the executor's best-effort cancellation
+    /// hook if it was already running.
+    pub fn cancel_task(&self, task_id: &Uuid) -> Result<ControlResult, RuntimeError> {
+        Ok(self.engine.cancel_task(task_id)?)
+    }
+
+    /// Cancel all cancellable work in a run.
+    pub fn cancel_run(&self, run_id: &Uuid) -> Result<ControlResult, RuntimeError> {
+        Ok(self.engine.cancel_run(run_id)?)
+    }
+
+    /// Reopen one failed task with a fresh retry budget.
+    pub fn retry_task(&self, task_id: &Uuid) -> Result<ControlResult, RuntimeError> {
+        Ok(self.engine.retry_task(task_id)?)
+    }
+
+    /// Reroute only unleased queued or parked work; active execution profiles
+    /// stay immutable.
+    pub fn reroute_task(
+        &self,
+        task_id: &Uuid,
+        role: Option<&str>,
+    ) -> Result<ControlResult, RuntimeError> {
+        Ok(self.engine.reroute_task(task_id, role)?)
     }
 
     /// The durable task/run store, for embedders that need to read or
@@ -2576,6 +2631,27 @@ impl Supervisor {
         }
 
         let run_id = self.engine.start_run(spec, goal)?;
+        // Shared-workspace runs must serialize overlapping writes before
+        // workers spawn. Isolated worktree runs retain the established
+        // ownership-map admission path, which emits the useful conflict
+        // audit event and then retries without billing an attempt.
+        if self.core.config.shared_task_workspace {
+            for task in self.store.tasks_for_run(&run_id)? {
+                let contract = contracts
+                    .get(&task.node_id)
+                    .expect("presence validated before materialization");
+                self.store.set_task_contract(
+                    &task.id,
+                    &WorkflowTaskContract {
+                        objective: contract.objective.clone(),
+                        allowed_paths: contract.allowed_paths.clone(),
+                        forbidden_paths: contract.forbidden_paths.clone(),
+                        acceptance_criteria: contract.acceptance_criteria.clone(),
+                        required_checks: contract.required_checks.clone(),
+                    },
+                )?;
+            }
+        }
         let manifest = RunManifest {
             run_id,
             trace_id: Uuid::now_v7(),
@@ -2697,7 +2773,7 @@ impl Supervisor {
     /// [`ReopenReport::changed_anything`] themselves.
     pub fn reopen_run(&self, run_id: &Uuid) -> Result<ReopenReport, RuntimeError> {
         let manifest = self.core.manifest(run_id)?;
-        let report = self.store.reopen_run(run_id)?;
+        let report = self.engine.reopen_run(run_id)?;
         self.core.emit_run_checked(
             run_id,
             &manifest,

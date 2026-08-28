@@ -442,7 +442,9 @@ A tick performs:
 5. record outcomes with compare-and-swap transitions;
 6. refresh run status.
 
-Ready tasks are ordered by priority (`P0` first), then age, then ID. Dependency gates allow independent ready nodes to run in parallel. Path ownership may still serialize tasks whose write scopes overlap.
+Ready tasks are ordered by priority (`P0` first), then age, then ID. Dependency gates allow independent ready nodes to run in parallel. Admission defaults to four concurrent attempts and accepts a validated per-Mastermind override from one through eight. Persisted path scopes serialize overlapping writers while disjoint frontend/backend scopes can execute together.
+
+Operator controls are explicit state transitions, not scheduler guesses. Pause has drain semantics: existing leases may finish while new leases stop. Resume re-enables admission. Task/run cancellation uses a best-effort executor cancellation hook after durable state changes. Retry reopens only failed work, and reroute changes only queued or retryable tasks—an active attempt's execution profile is immutable.
 
 ### Leases and crash recovery
 
@@ -578,9 +580,13 @@ The daemon binds to loopback only and serves JSON RPC-like request envelopes ove
 | Group | Representative methods |
 |---|---|
 | Health and events | `ping`, `daemon.info`, `events.list`, `events.subscribe`, `events.unsubscribe` |
-| Projections | `runs.list`, `tasks.list`, `agents.list`, `usage.limits` |
+| Projects and starters | `projects.list`, `projects.create`, `projects.scaffold`, `projects.open`, `projects.update`, `projects.forget`, `projects.preflight`, `projects.starters` |
+| Projections and controls | `runs.list`, `pause`, `resume`, `cancel`, `tasks.list`, `cancel`, `retry`, `reroute`, `agents.list`, `usage.limits` |
 | Registry | `registry.agents.*`, `registry.skills.*`, `registry.catalog` |
-| Agent chat | `agent.session.start`, `send`, `reopen`, `cancel`, `chat.sessions`, `chat.transcript` |
+| Providers | `providers.refresh`, `providers.setupGuide` |
+| Agent chat | `agent.session.prepare`, `start`, `send`, `reopen`, `cancel`, `chat.sessions`, `chat.transcript`, `chat.session.get` |
+| Conversation context | `conversation.lineage`, `conversation.contextManifest`, `conversation.handoff.preview`, `conversation.handoff.commit` |
+| Memory | `memory.search`, `memory.store`, `handoffs.list` |
 | Mastermind | `mastermind.start`, `commit`, `approvePhase`, `authorizePhaseWrite`, `revisePhase`, `drive`, `reopenRun`, `status`, `artifact`, `list` |
 | Git UI seams | `git.push-targets`, `git.push-target.set`, `git.diff` |
 
@@ -594,20 +600,25 @@ The journal and projections are deliberately distinct: durable workflow rows con
 
 ## Desktop command center
 
-`apps/desktop` is a React 18 + TypeScript frontend with an optional Tauri 2 shell. It communicates only through the loopback WebSocket API.
+`apps/desktop` is a greenfield React 18 + TypeScript frontend with an optional Tauri 2 shell. It communicates only through the loopback WebSocket API. `PRODUCT.md` defines the product contract and `DESIGN.md` defines the visual, accessibility, and motion system.
 
 Major views include:
 
-- Command Center — run status, agent cards, activity, and usage limits;
-- Mastermind — phase workflow, write authorization, reviews, revisions, and artifacts;
-- Runs Graph — a dependency DAG with task details;
-- Session — agent activity and structured event inspection;
-- Agents — registry editing, provider catalog, chat, and proposals;
-- Review — Git/review event timeline and attribution;
-- Inbox — approvals, failures, conflicts, and budget intervention;
-- Settings — daemon endpoint, project selection, and diagnostics.
+- Project launcher — daemon-owned recent projects, safe preflight, and starter creation;
+- Mastermind — guided discovery, provider/model choice, explicit approvals, concurrency selection, and editable DAG validation;
+- Hybrid workspace — a dependency graph, real event packets, equivalent task list, activity journal, and contextual inspector;
+- Conversations — a ChatGPT-like transcript with explicit agent/provider/model/effort/mode/path authority, automatically applied saved skills, temporary `/skill` bindings, and a searchable slash-command palette;
+- Handoffs — curated context previews and Memex-backed records that link source and target conversations without copying an unbounded transcript;
+- Agents, Memory, Artifacts, and Providers — registry defaults, semantic recall, approved outputs, model catalogs, auth state, and guided setup;
+- Settings — light/dark appearance and the resolved local daemon endpoint. Reduced motion follows the operating-system preference.
 
-The client reconnects with exponential backoff, uses a heartbeat, resumes subscriptions from the last sequence, coalesces high-frequency telemetry, and keeps a bounded event ring buffer. State stores and fold logic have Vitest coverage.
+Before a write-capable chat starts, the client calls `agent.session.prepare`. The daemon resolves the saved agent plus transient overrides, canonicalizes every scoped write path beneath the selected workspace, and returns a short-lived, single-use confirmation token. Starting a session with a different provider, model, agent, or authority produces a new linked conversation rather than mutating an active provider session.
+
+The project wizard has two deliberately different paths. Existing-folder mode performs a metadata-only preflight and registers the selected directory. New-project mode calls `projects.scaffold`, which accepts only one of six built-in starter IDs (`blank-git`, `nextjs`, `react-vite`, `node-api`, `python`, or `rust`), writes into a verified sibling staging directory, initializes Git with structured arguments, and atomically publishes the finished directory. It never accepts a template URL or arbitrary setup command.
+
+Slash commands are client-side operator controls, not hidden prompt text. `/agent`, `/provider`, `/model`, `/effort`, `/mode`, `/scope`, and `/skill` configure the next conversation; `/handoff`, `/cancel`, `/clear`, and `/help` act immediately when their prerequisites exist. The palette also advertises reserved workflow commands so the interaction vocabulary can expand without changing the composer layout; unsupported or incomplete commands fail visibly instead of being forwarded as model instructions.
+
+The client reconnects with exponential backoff, resumes journal subscriptions, and keeps a bounded event ring buffer. Graph motion is driven only by received daemon events and is disabled under reduced-motion preferences. RPC framing, DAG validation, launch preparation, and core UI behavior have Vitest coverage.
 
 ## Repository map
 
@@ -627,7 +638,7 @@ The client reconnects with exponential backoff, uses a heartbeat, resumes subscr
 │   ├── agentos-git/                  Worktrees, ownership, queue, ledger, Git CLI
 │   └── agentos-daemon/               Binary, WS API, Mastermind, chat, projections
 ├── apps/desktop/
-│   ├── src/                          React UI, stores, daemon client, views
+│   ├── src/                          React shell, RPC client, DAG helpers, styles, tests
 │   └── src-tauri/                    Native Tauri shell
 ├── docs/                             Feature-level architecture and evidence
 └── fixtures/demo-run.json            Billing-free demo journal fixture
@@ -838,6 +849,9 @@ This is not yet a turnkey autonomous production release.
 9. **Review command access has a deliberate exception.** Phase 9’s reviewer is shell-capable and write-scoped so builds can produce output. Write/delegation tools remain denied, but this is still a broader trust envelope than other review phases.
 10. **Some provider behavior is inherently external.** Model slugs, CLI schemas, authentication, quotas, and capabilities can change. Free detection/catalog probes and fixture tests reduce drift but cannot eliminate it.
 11. **No open-source license is currently granted.** The workspace declares `UNLICENSED`. Add an explicit license before inviting redistribution or external contributions.
+12. **Direct DAG mutation is not yet a committed daemon transaction.** The new desktop validates draft topology locally, but the closed six-operation orchestrator vocabulary cannot remove or arbitrarily rewrite nodes. A future revisioned draft API must extend that vocabulary before visual edits can safely replace the authoritative plan.
+13. **Canvas layout is client-local.** Automatic positions and pinning work during the current workspace session; daemon-shared layout persistence remains a follow-up.
+14. **Concurrency is selected when a Mastermind session starts.** Pause/resume/cancel/retry/reroute are live controls, but changing the concurrency cap after the supervisor is constructed is not yet supported.
 
 ## Further documentation
 

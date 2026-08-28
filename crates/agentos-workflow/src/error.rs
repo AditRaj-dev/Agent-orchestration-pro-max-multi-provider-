@@ -55,6 +55,11 @@ pub enum ValidationError {
 /// logic errors.
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
 pub enum WorkflowError {
+    /// The configured worker cap is outside the deliberately small,
+    /// operator-safe range. Keeping this bounded makes admission behaviour
+    /// predictable for desktop and daemon embedders.
+    #[error("max concurrency must be between 1 and 8 (got {value})")]
+    InvalidMaxConcurrency { value: usize },
     /// The workflow spec was rejected by validation.
     #[error("spec rejected: {0}")]
     Validation(#[from] ValidationError),

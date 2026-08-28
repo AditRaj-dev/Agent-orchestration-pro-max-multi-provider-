@@ -39,9 +39,11 @@
 
 pub mod agent_sessions;
 pub mod chat_history;
+pub mod conversation;
 pub mod mastermind;
 pub mod memex;
 pub mod projection;
+pub mod projects;
 pub mod seed;
 pub mod server;
 pub mod skill_import;

@@ -41,7 +41,7 @@ const WAL_SET_ATTEMPTS: u32 = 5;
 const WAL_SET_RETRY_DELAY: Duration = Duration::from_millis(200);
 
 /// Highest schema version this build understands.
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
 
 /// Migration v1: the durable `runs` and `tasks` tables.
 const MIGRATION_V1: &str = r#"
@@ -83,6 +83,12 @@ CREATE INDEX IF NOT EXISTS idx_tasks_run_id ON tasks (run_id);
 CREATE INDEX IF NOT EXISTS idx_tasks_lease_expiry ON tasks (state, lease_expires_at);
 "#;
 
+/// Migration v2: pause state is durable so a daemon restart cannot silently
+/// resume a run an operator deliberately drained.
+const MIGRATION_V2: &str = r#"
+ALTER TABLE runs ADD COLUMN paused INTEGER NOT NULL DEFAULT 0;
+"#;
+
 /// Column list shared by every task SELECT.
 const TASK_COLUMNS: &str = "id, run_id, workflow_id, node_id, state, priority, \
                             lease_owner, lease_expires_at, heartbeat_at, \
@@ -96,7 +102,10 @@ pub enum RunStatus {
     Running,
     /// Every task reached `Done`.
     Completed,
-    /// At least one task reached `Failed`.
+    /// At least one task reached `Failed` or was explicitly cancelled. The
+    /// original three-value wire contract has no separate run-cancelled
+    /// value, so cancellation is terminally unsuccessful at run level while
+    /// each task still retains its precise `Cancelled` state.
     Failed,
 }
 
@@ -113,7 +122,10 @@ impl RunStatus {
     /// Derive the run status from its tasks (the durable tasks are the
     /// source of truth; the stored column is a cached projection).
     pub fn from_tasks(tasks: &[TaskRecord]) -> Self {
-        if tasks.iter().any(|task| task.state == TaskState::Failed) {
+        if tasks
+            .iter()
+            .any(|task| matches!(task.state, TaskState::Failed | TaskState::Cancelled))
+        {
             RunStatus::Failed
         } else if tasks.iter().all(|task| task.state == TaskState::Done) {
             RunStatus::Completed
@@ -157,6 +169,9 @@ pub struct RunRecord {
     pub workflow_version: u32,
     pub goal: String,
     pub status: RunStatus,
+    /// A paused run drains in-flight attempts but grants no new leases.
+    #[serde(default)]
+    pub paused: bool,
     pub created_at: DateTime<Utc>,
 }
 
@@ -417,7 +432,7 @@ impl TaskStore {
     pub fn run(&self, run_id: &Uuid) -> Result<RunRecord, CoreError> {
         let conn = self.lock()?;
         conn.query_row(
-            "SELECT id, workflow_id, workflow_version, goal, status, created_at
+            "SELECT id, workflow_id, workflow_version, goal, status, paused, created_at
              FROM runs WHERE id = ?1",
             rusqlite::params![run_id.to_string()],
             row_to_run,
@@ -430,7 +445,7 @@ impl TaskStore {
         let conn = self.lock()?;
         let mut stmt = conn
             .prepare(
-                "SELECT id, workflow_id, workflow_version, goal, status, created_at
+                "SELECT id, workflow_id, workflow_version, goal, status, paused, created_at
                  FROM runs ORDER BY created_at ASC, id ASC",
             )
             .map_err(map_sqlite_error)?;
@@ -448,6 +463,24 @@ impl TaskStore {
         )
         .map_err(map_sqlite_error)?;
         Ok(())
+    }
+
+    /// Persistently pause or resume a run. Pausing never mutates tasks: any
+    /// existing lease is allowed to finish, while the engine's admission
+    /// phase observes this flag before granting another one.
+    pub fn set_run_paused(&self, run_id: &Uuid, paused: bool) -> Result<RunRecord, CoreError> {
+        let conn = self.lock()?;
+        let updated = conn
+            .execute(
+                "UPDATE runs SET paused = ?2 WHERE id = ?1",
+                rusqlite::params![run_id.to_string(), i64::from(paused)],
+            )
+            .map_err(map_sqlite_error)?;
+        if updated != 1 {
+            return Err(CoreError::NotFound(format!("run {run_id}")));
+        }
+        drop(conn);
+        self.run(run_id)
     }
 
     // --------------------------------------------------------------- tasks
@@ -605,6 +638,144 @@ impl TaskStore {
                 let _ = tx.rollback();
                 Err(err)
             }
+        }
+    }
+
+    /// Cancel one task when it has not reached an irrevocable terminal
+    /// success state. The lifecycle graph permits cancellation from queued,
+    /// parked and executing states; committed work intentionally remains
+    /// immutable. Returns the post-control record, or `None` when the task
+    /// was already terminal/committed and therefore untouched.
+    pub fn cancel_task(&self, task_id: &Uuid) -> Result<Option<TaskRecord>, CoreError> {
+        let task = self.task(task_id)?;
+        if matches!(
+            task.state,
+            TaskState::Done | TaskState::Failed | TaskState::Cancelled | TaskState::Committed
+        ) {
+            return Ok(None);
+        }
+        match self.cas_transition(task_id, task.state, TaskState::Cancelled) {
+            Ok(task) => Ok(Some(task)),
+            Err(CoreError::IllegalTransition { .. }) => Ok(None),
+            Err(err) => Err(err),
+        }
+    }
+
+    /// Cancel every cancellable task in a run. Running attempts are moved to
+    /// `Cancelled` immediately; executors receive their best-effort hook at
+    /// the engine layer after this durable decision succeeds.
+    pub fn cancel_run(&self, run_id: &Uuid) -> Result<Vec<TaskRecord>, CoreError> {
+        self.run(run_id)?;
+        let mut cancelled = Vec::new();
+        for task in self.tasks_for_run(run_id)? {
+            if let Some(task) = self.cancel_task(&task.id)? {
+                cancelled.push(task);
+            }
+        }
+        Ok(cancelled)
+    }
+
+    /// Explicitly reopen one failed task with a fresh retry budget. This is
+    /// the task-scoped companion to [`Self::reopen_run`]; terminal failure is
+    /// never revived by scheduler code.
+    pub fn reopen_task(&self, task_id: &Uuid) -> Result<Option<TaskRecord>, CoreError> {
+        let task = self.task(task_id)?;
+        if task.state != TaskState::Failed {
+            return Ok(None);
+        }
+        let now = Utc::now();
+        let conn = self.lock()?;
+        let changed = conn
+            .execute(
+                "UPDATE tasks SET state = ?2, attempt_count = 0, lease_owner = NULL,
+             lease_expires_at = NULL, heartbeat_at = NULL, created_at = ?3, updated_at = ?3
+             WHERE id = ?1 AND state = ?4",
+                rusqlite::params![
+                    task_id.to_string(),
+                    TaskState::Ready.as_str(),
+                    now.to_rfc3339(),
+                    TaskState::Failed.as_str()
+                ],
+            )
+            .map_err(map_sqlite_error)?;
+        drop(conn);
+        if changed == 1 {
+            Ok(Some(self.task(task_id)?))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Return the blocked descendants of an explicitly reopened task to
+    /// `Planned`. This is the narrow task-scoped counterpart to
+    /// [`Self::reopen_run`]: normal scheduler code still cannot leave
+    /// `Blocked`, and the dependency gate decides when these rows become
+    /// `Ready` again.
+    pub fn unpark_blocked_dependents(&self, task_id: &Uuid) -> Result<Vec<TaskRecord>, CoreError> {
+        let root = self.task(task_id)?;
+        let tasks = self.tasks_for_run(&root.run_id)?;
+        let mut frontier = vec![root.node_id];
+        let mut descendants = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        while let Some(node_id) = frontier.pop() {
+            for task in &tasks {
+                if task.node.depends_on.contains(&node_id) && seen.insert(task.id) {
+                    frontier.push(task.node_id.clone());
+                    if task.state == TaskState::Blocked {
+                        descendants.push(task.id);
+                    }
+                }
+            }
+        }
+        let now = Utc::now().to_rfc3339();
+        let conn = self.lock()?;
+        for id in &descendants {
+            conn.execute(
+                "UPDATE tasks SET state = ?2, created_at = ?3, updated_at = ?3 WHERE id = ?1 AND state = ?4",
+                rusqlite::params![
+                    id.to_string(),
+                    TaskState::Planned.as_str(),
+                    now,
+                    TaskState::Blocked.as_str()
+                ],
+            )
+            .map_err(map_sqlite_error)?;
+        }
+        drop(conn);
+        descendants.into_iter().map(|id| self.task(&id)).collect()
+    }
+
+    /// Replace the persisted contract used by workflow-level admission. This
+    /// is intended for runtime composition before a task is leased; active
+    /// attempts retain the immutable contract snapshot they already saw.
+    pub fn set_task_contract(
+        &self,
+        task_id: &Uuid,
+        contract: &TaskContract,
+    ) -> Result<Option<TaskRecord>, CoreError> {
+        let task = self.task(task_id)?;
+        if !retargetable(task.state) {
+            return Ok(None);
+        }
+        let contract_json = serde_json::to_string(contract)
+            .map_err(|err| CoreError::Serialization(format!("contract: {err}")))?;
+        let conn = self.lock()?;
+        let changed = conn
+            .execute(
+                "UPDATE tasks SET contract = ?2, updated_at = ?3 WHERE id = ?1 AND state = ?4",
+                rusqlite::params![
+                    task_id.to_string(),
+                    contract_json,
+                    Utc::now().to_rfc3339(),
+                    task.state.as_str()
+                ],
+            )
+            .map_err(map_sqlite_error)?;
+        drop(conn);
+        if changed == 1 {
+            Ok(Some(self.task(task_id)?))
+        } else {
+            Ok(None)
         }
     }
 
@@ -1104,25 +1275,21 @@ fn cas_update_state(
     }
 }
 
-/// States in which a task's node spec may be retargeted: it is queued or
-/// parked, so the next lease will read the new role. Executing states
-/// (`Leased`, `Running`) and terminal states are refused.
+/// States in which a task's node spec may be retargeted: it is queued for a
+/// first/retry attempt, so the next lease will read the new role. Blocked and
+/// human-gated work stays with its existing routing until explicitly resumed;
+/// executing (`Leased`, `Running`) and terminal states are refused.
 fn retargetable(state: TaskState) -> bool {
     matches!(
         state,
-        TaskState::Created
-            | TaskState::Planned
-            | TaskState::Ready
-            | TaskState::Blocked
-            | TaskState::Retryable
-            | TaskState::HumanRequired
+        TaskState::Planned | TaskState::Ready | TaskState::Retryable
     )
 }
 
 /// Read a run row inside an open transaction.
 fn run_in_tx(tx: &Transaction<'_>, run_id: &Uuid) -> Result<RunRecord, CoreError> {
     tx.query_row(
-        "SELECT id, workflow_id, workflow_version, goal, status, created_at
+        "SELECT id, workflow_id, workflow_version, goal, status, paused, created_at
          FROM runs WHERE id = ?1",
         rusqlite::params![run_id.to_string()],
         row_to_run,
@@ -1218,6 +1385,7 @@ fn row_to_run(row: &Row<'_>) -> Result<RunRecord, rusqlite::Error> {
             .map_err(int_conversion_failure)?,
         goal: row.get("goal")?,
         status: parse_enum(&row.get::<_, String>("status")?).map_err(sql_conversion_failure)?,
+        paused: row.get::<_, i64>("paused")? != 0,
         created_at: parse_timestamp(&row.get::<_, String>("created_at")?)
             .map_err(sql_conversion_failure)?,
     })
@@ -1328,11 +1496,13 @@ fn migrate(conn: &mut Connection) -> Result<(), CoreError> {
              (schema version {SCHEMA_VERSION}); upgrade first"
         )));
     }
-    if current == SCHEMA_VERSION {
-        return Ok(());
-    }
     let tx = conn.transaction().map_err(map_sqlite_error)?;
-    tx.execute_batch(MIGRATION_V1).map_err(map_sqlite_error)?;
+    if current < 1 {
+        tx.execute_batch(MIGRATION_V1).map_err(map_sqlite_error)?;
+    }
+    if current < 2 {
+        tx.execute_batch(MIGRATION_V2).map_err(map_sqlite_error)?;
+    }
     tx.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION};"))
         .map_err(map_sqlite_error)?;
     tx.commit().map_err(map_sqlite_error)?;

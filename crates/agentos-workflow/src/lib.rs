@@ -34,8 +34,9 @@ pub mod validate;
 
 pub use error::{ValidationError, WorkflowError};
 pub use executor::{
-    DriverReport, FailureKind, Outcome, TaskExecutor, TaskFailure, TaskSuccess, TickReport,
-    WorkflowEngine,
+    ControlAction, ControlResult, DriverReport, EngineConfig, FailureKind, Outcome, QueueBlock,
+    QueueReason, TaskExecutor, TaskFailure, TaskSuccess, TickReport, WorkflowControlEvent,
+    WorkflowControlHook, WorkflowEngine,
 };
 pub use scheduler::{CostLedger, NoCostLedger, Scheduler, DEFAULT_LEASE_TTL};
 pub use spec::{Budgets, NodeSpec, NodeType, RetryPolicy, TaskContract, WorkflowSpec};

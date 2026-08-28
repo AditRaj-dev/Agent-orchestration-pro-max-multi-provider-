@@ -9,8 +9,9 @@ use std::time::Duration;
 
 use agentos_core::{CoreError, Priority, TaskState};
 use agentos_workflow::{
-    Budgets, FailureKind, NodeSpec, NodeType, Outcome, RetryPolicy, RunStatus, TaskContract,
-    TaskExecutor, TaskRecord, TaskStore, WorkflowEngine, WorkflowError, WorkflowSpec,
+    Budgets, EngineConfig, FailureKind, NodeSpec, NodeType, Outcome, QueueReason, RetryPolicy,
+    RunStatus, TaskContract, TaskExecutor, TaskRecord, TaskStore, WorkflowEngine, WorkflowError,
+    WorkflowSpec,
 };
 use async_trait::async_trait;
 use uuid::Uuid;
@@ -99,6 +100,25 @@ impl TaskExecutor for ScriptedExecutor {
 struct ConcurrentExecutor {
     current: AtomicUsize,
     max_seen: AtomicUsize,
+}
+
+/// Records the best-effort cancellation signal without requiring a real
+/// provider process in the workflow test suite.
+struct CancellableExecutor {
+    cancelled: AtomicUsize,
+}
+
+#[async_trait]
+impl TaskExecutor for CancellableExecutor {
+    async fn run(&self, task: &TaskRecord, _contract: &TaskContract) -> Outcome {
+        Outcome::Success {
+            packet: serde_json::json!({ "node": task.node_id }),
+        }
+    }
+
+    fn cancel(&self, _task: &TaskRecord) {
+        self.cancelled.fetch_add(1, Ordering::SeqCst);
+    }
 }
 
 #[async_trait]
@@ -225,6 +245,224 @@ async fn parallel_fan_out_runs_before_review() {
     assert_eq!(states["b"], TaskState::Done);
     assert_eq!(states["review"], TaskState::Done);
     assert_eq!(engine.run_status(&run_id).unwrap(), RunStatus::Completed);
+}
+
+/// Disjoint write scopes retain the existing fan-out behaviour, while a
+/// configured cap bounds admission before workers are spawned.
+#[tokio::test]
+async fn admission_runs_disjoint_work_in_parallel_and_enforces_the_cap() {
+    let (_dir, store) = temp_store();
+    let executor = Arc::new(ConcurrentExecutor {
+        current: AtomicUsize::new(0),
+        max_seen: AtomicUsize::new(0),
+    });
+    let engine = WorkflowEngine::new_with_config(
+        Arc::clone(&store),
+        Arc::clone(&executor) as Arc<dyn TaskExecutor>,
+        EngineConfig { max_concurrency: 2 },
+    )
+    .unwrap();
+    let run_id = engine
+        .start_run(
+            &spec(
+                "scoped",
+                vec![
+                    node("frontend", NodeType::Run, &[]),
+                    node("backend", NodeType::Run, &[]),
+                ],
+            ),
+            "ship both",
+        )
+        .unwrap();
+    let tasks = store.tasks_for_run(&run_id).unwrap();
+    for (task, path) in tasks.iter().zip(["frontend", "backend"]) {
+        store
+            .set_task_contract(
+                &task.id,
+                &TaskContract {
+                    objective: task.node_id.clone(),
+                    allowed_paths: vec![path.to_owned()],
+                    forbidden_paths: vec![],
+                    acceptance_criteria: vec![],
+                    required_checks: vec![],
+                },
+            )
+            .unwrap();
+    }
+    engine.run_until_idle(8).await.unwrap();
+    assert_eq!(executor.max_seen.load(Ordering::SeqCst), 2);
+
+    let capped_executor = Arc::new(ConcurrentExecutor {
+        current: AtomicUsize::new(0),
+        max_seen: AtomicUsize::new(0),
+    });
+    let capped = WorkflowEngine::new_with_config(
+        Arc::new(TaskStore::open_in_memory().unwrap()),
+        Arc::clone(&capped_executor) as Arc<dyn TaskExecutor>,
+        EngineConfig { max_concurrency: 1 },
+    )
+    .unwrap();
+    capped
+        .start_run(
+            &spec(
+                "capped",
+                vec![node("a", NodeType::Run, &[]), node("b", NodeType::Run, &[])],
+            ),
+            "one at a time",
+        )
+        .unwrap();
+    capped.run_until_idle(8).await.unwrap();
+    assert_eq!(capped_executor.max_seen.load(Ordering::SeqCst), 1);
+    assert!(WorkflowEngine::new_with_config(
+        Arc::new(TaskStore::open_in_memory().unwrap()),
+        Arc::new(ScriptedExecutor::new()),
+        EngineConfig { max_concurrency: 9 },
+    )
+    .is_err());
+}
+
+/// Overlapping declared write scopes are serialized and the deferred work
+/// gets a machine-readable reason instead of consuming retry budget.
+#[tokio::test]
+async fn overlapping_write_scopes_are_serialized_with_a_queue_reason() {
+    let (_dir, store) = temp_store();
+    let executor = Arc::new(ConcurrentExecutor {
+        current: AtomicUsize::new(0),
+        max_seen: AtomicUsize::new(0),
+    });
+    let engine = WorkflowEngine::new_with_config(
+        Arc::clone(&store),
+        Arc::clone(&executor) as Arc<dyn TaskExecutor>,
+        EngineConfig { max_concurrency: 4 },
+    )
+    .unwrap();
+    let run_id = engine
+        .start_run(
+            &spec(
+                "overlap",
+                vec![
+                    node("api", NodeType::Run, &[]),
+                    node("server", NodeType::Run, &[]),
+                ],
+            ),
+            "serialize writes",
+        )
+        .unwrap();
+    let tasks = store.tasks_for_run(&run_id).unwrap();
+    for (task, path) in tasks.iter().zip(["src", "src/api"]) {
+        store
+            .set_task_contract(
+                &task.id,
+                &TaskContract {
+                    objective: task.node_id.clone(),
+                    allowed_paths: vec![path.to_owned()],
+                    forbidden_paths: vec![],
+                    acceptance_criteria: vec![],
+                    required_checks: vec![],
+                },
+            )
+            .unwrap();
+    }
+    let first = engine.tick().await.unwrap();
+    assert!(first
+        .queued
+        .iter()
+        .any(|blocked| blocked.reasons == vec![QueueReason::PathConflict]));
+    engine.run_until_idle(8).await.unwrap();
+    assert_eq!(executor.max_seen.load(Ordering::SeqCst), 1);
+}
+
+/// Pause is durable and draining: it admits no new lease, then a resumed
+/// engine can pick the already-ready work back up.
+#[tokio::test]
+async fn pause_resume_cancel_and_retry_are_explicit_controls() {
+    let (_dir, store) = temp_store();
+    let engine = WorkflowEngine::new(Arc::clone(&store), Arc::new(ScriptedExecutor::new()));
+    let run_id = engine
+        .start_run(
+            &spec("controls", vec![node("work", NodeType::Run, &[])]),
+            "control it",
+        )
+        .unwrap();
+    engine.pause_run(&run_id).unwrap();
+    assert!(store.run(&run_id).unwrap().paused);
+    let paused = engine.tick().await.unwrap();
+    assert_eq!(paused.leased, 0);
+    assert!(paused
+        .queued
+        .iter()
+        .any(|blocked| blocked.reasons == vec![QueueReason::Paused]));
+    engine.resume_run(&run_id).unwrap();
+    engine.run_until_idle(4).await.unwrap();
+    assert_eq!(states_by_node(&engine, run_id)["work"], TaskState::Done);
+
+    let retry_run = engine
+        .start_run(
+            &spec(
+                "retry",
+                vec![
+                    node("failed", NodeType::Run, &[]),
+                    node("later", NodeType::Run, &["failed"]),
+                ],
+            ),
+            "retry it",
+        )
+        .unwrap();
+    let failed = store
+        .tasks_for_run(&retry_run)
+        .unwrap()
+        .into_iter()
+        .find(|task| task.node_id == "failed")
+        .unwrap();
+    let failed = store
+        .cas_transition(&failed.id, TaskState::Ready, TaskState::Failed)
+        .unwrap();
+    engine.scheduler().block_dependents_of(&failed).unwrap();
+    let retried = engine.retry_task(&failed.id).unwrap();
+    assert!(retried.changed.contains(&failed.id));
+    assert_eq!(store.task(&failed.id).unwrap().state, TaskState::Ready);
+    assert_eq!(
+        states_by_node(&engine, retry_run)["later"],
+        TaskState::Planned
+    );
+
+    let cancel_run = engine
+        .start_run(
+            &spec("cancel", vec![node("queued", NodeType::Run, &[])]),
+            "cancel it",
+        )
+        .unwrap();
+    let cancelled = engine.cancel_run(&cancel_run).unwrap();
+    assert_eq!(cancelled.changed.len(), 1);
+    assert_eq!(
+        states_by_node(&engine, cancel_run)["queued"],
+        TaskState::Cancelled
+    );
+
+    let cancellable = Arc::new(CancellableExecutor {
+        cancelled: AtomicUsize::new(0),
+    });
+    let hook_engine = WorkflowEngine::new(
+        Arc::new(TaskStore::open_in_memory().unwrap()),
+        Arc::clone(&cancellable) as Arc<dyn TaskExecutor>,
+    );
+    let hook_run = hook_engine
+        .start_run(
+            &spec("hook", vec![node("leased", NodeType::Run, &[])]),
+            "stop it",
+        )
+        .unwrap();
+    let leased = hook_engine
+        .store()
+        .tasks_for_run(&hook_run)
+        .unwrap()
+        .remove(0);
+    hook_engine
+        .scheduler()
+        .grant_lease(&leased.id, hook_engine.owner(), Duration::from_secs(60))
+        .unwrap();
+    hook_engine.cancel_task(&leased.id).unwrap();
+    assert_eq!(cancellable.cancelled.load(Ordering::SeqCst), 1);
 }
 
 /// Crash recovery (OR-05): a lease that expires without an outcome (the
