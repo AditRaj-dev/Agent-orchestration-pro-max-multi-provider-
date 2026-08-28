@@ -11,3 +11,30 @@
 @media (max-width: 1279px) { .app-shell[data-inspector="true"] { grid-template-columns: 68px minmax(0, 1fr); } .project-inspector { box-shadow: -12px 0 24px color-mix(in srgb, #000 14%, transparent); position: fixed; top: 64px; width: 282px; z-index: 5; } .chat { grid-template-columns: 190px minmax(0, 1fr); } .chat-inspector { display: none; } .authority { grid-template-columns: repeat(3, 1fr); } }
 @media (prefers-reduced-motion: reduce) { *, *::before, *::after { animation-duration: .01ms !important; scroll-behavior: auto !important; transition-duration: .01ms !important; } .packet { display: none; } }
 .message.tool, .runtime-note { border-left-width: 1px; } .memory-layout article { border-top-width: 1px; }
+.orchestrator-graph-note { align-items: start; background: var(--surface); border: 1px solid var(--line); border-left: 2px solid var(--moss); display: grid; gap: 14px; grid-template-columns: 118px 1fr; padding: 15px 16px; }
+.orchestrator-graph-note > span { color: var(--moss); font: 10px "Geist Mono", monospace; letter-spacing: .05em; text-transform: uppercase; }
+.orchestrator-graph-note b { color: var(--ink); display: block; font-size: 13px; margin-bottom: 4px; }
+.orchestrator-graph-note p, .live-node-inspector p { font-size: 11px; }
+.workspace-flow { padding: 16px; }
+.workspace-flow .topology-workbench { margin-top: 15px; }
+.workspace-topology, .workspace-topology .topology-canvas { min-height: 390px; }
+.workspace-topology .node-inspector { max-height: 390px; }
+.live-node-inspector dl { margin: 0; }
+.topology-node.done rect { stroke: color-mix(in oklch, var(--moss) 70%, var(--line)); }
+.topology-node.active rect { fill: color-mix(in oklch, var(--raised) 86%, var(--moss)); stroke: var(--moss); }
+.topology-node.blocked rect { stroke: var(--danger); }
+@media (max-width: 1279px) { .workspace-grid { grid-template-columns: minmax(0, 1fr) 240px; gap: 14px; } .workspace-topology { grid-template-columns: 1fr; } .workspace-topology .node-inspector { max-height: none; } }
+.phase-flow li > div { color: var(--muted); display: grid; font-size: 12px; gap: 6px; padding: 10px 0; }
+.phase-flow li.active > div { color: var(--ink); }
+.phase-flow li.done > div { color: var(--moss); }
+.phase-console { background: var(--surface); border: 1px solid var(--line); max-width: 920px; padding: 20px; }
+.phase-console > header { align-items: start; border-bottom: 1px solid var(--line); display: flex; justify-content: space-between; margin-bottom: 18px; padding-bottom: 16px; }
+.phase-console > header span, .decision-card > span { color: var(--moss); font: 10px "Geist Mono", monospace; letter-spacing: .05em; text-transform: uppercase; }
+.phase-console > header h2 { font-size: 22px; margin-top: 4px; text-transform: capitalize; }
+.phase-console > header code { color: var(--muted); }
+.decision-card { background: var(--canvas); border: 1px solid var(--line); padding: 16px; }
+.decision-card h3 { font-size: 16px; line-height: 1.4; margin: 7px 0 13px; }
+.decision-options { display: grid; gap: 7px; }
+.decision-options button { text-align: left; }
+.decision-card form { display: grid; gap: 8px; grid-template-columns: 1fr auto; margin-top: 10px; }
+.phase-console details { border-top: 1px solid var(--line); margin-top: 16px; padding-top: 12px; }

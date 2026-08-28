@@ -9,43 +9,47 @@ export const baseNodes: WorkflowNode[] = [
   { id: "verify", title: "Verify", role: "Verifier", state: "idle", x: 846, y: 147, needs: ["review"] },
 ];
 
-export const validateDag = (nodes: WorkflowNode[]) => {
-  const ids = new Set(nodes.map((node) => node.id));
-  if (ids.size !== nodes.length) return "Every node requires a unique identifier.";
-  const visiting = new Set<string>();
-  const visited = new Set<string>();
-  const visit = (id: string): boolean => {
-    if (visiting.has(id)) return true;
-    if (visited.has(id)) return false;
-    visiting.add(id);
-    const node = nodes.find((item) => item.id === id);
-    if ((node?.needs || []).some((need) => !ids.has(need) || visit(need))) return true;
-    visiting.delete(id); visited.add(id); return false;
+export const workflowNodesFromTasks = (tasks: Array<Record<string, unknown>>): WorkflowNode[] => {
+  const text = (value: unknown) => typeof value === "string" ? value : "";
+  const list = (value: unknown) => Array.isArray(value) ? value.filter((item): item is string => typeof item === "string") : [];
+  const latestRun = tasks.map((task) => text(task.runId)).find(Boolean);
+  const current = latestRun ? tasks.filter((task) => text(task.runId) === latestRun) : tasks;
+  const raw = current.flatMap((task) => {
+    const id = text(task.nodeId) || text(task.taskId) || text(task.id);
+    if (!id) return [];
+    const state = text(task.state) || text(task.status);
+    const visualState: WorkflowNode["state"] = state === "done" ? "done" : ["leased", "running", "reviewing", "committing"].includes(state) ? "active" : ["failed", "cancelled", "human_required", "blocked"].includes(state) ? "blocked" : "idle";
+    return [{
+      id,
+      title: id.split(/[-_]/).filter(Boolean).map((part) => part[0]?.toUpperCase() + part.slice(1)).join(" ") || id,
+      role: text(task.agentId) || "Awaiting assignment",
+      state: visualState,
+      needs: list(task.dependsOn).length ? list(task.dependsOn) : list(task.dependencies),
+      x: 0,
+      y: 0,
+    } satisfies WorkflowNode];
+  });
+  const unique = [...new Map(raw.map((node) => [node.id, node])).values()];
+  const ids = new Set(unique.map((node) => node.id));
+  const waves = new Map<string, number>();
+  const waveOf = (id: string, seen = new Set<string>()): number => {
+    if (waves.has(id)) return waves.get(id)!;
+    if (seen.has(id)) return 0;
+    seen.add(id);
+    const node = unique.find((candidate) => candidate.id === id);
+    const dependencies = (node?.needs || []).filter((dependency) => ids.has(dependency));
+    const wave = dependencies.length ? Math.max(...dependencies.map((dependency) => waveOf(dependency, new Set(seen)))) + 1 : 0;
+    waves.set(id, wave);
+    return wave;
   };
-  return nodes.some((node) => visit(node.id)) ? "Dependencies must form an acyclic graph." : undefined;
+  unique.forEach((node) => waveOf(node.id));
+  const maxWave = Math.max(1, ...waves.values());
+  const groups = new Map<number, WorkflowNode[]>();
+  unique.forEach((node) => { const wave = waves.get(node.id) || 0; groups.set(wave, [...(groups.get(wave) || []), node]); });
+  return unique.map((node) => {
+    const wave = waves.get(node.id) || 0;
+    const peers = groups.get(wave) || [node];
+    const row = peers.findIndex((peer) => peer.id === node.id);
+    return { ...node, x: 25 + wave * (770 / maxWave), y: peers.length === 1 ? 158 : 24 + row * (300 / (peers.length - 1)) };
+  });
 };
-
-export const addWorkflowNode = (nodes: WorkflowNode[], title: string): { nodes: WorkflowNode[]; id?: string } => {
-  const cleanTitle = title.trim();
-  if (!cleanTitle) return { nodes };
-  const root = cleanTitle.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "") || "task";
-  let id = root;
-  let suffix = 2;
-  while (nodes.some((node) => node.id === id)) id = `${root}-${suffix++}`;
-  const column = nodes.length % 4;
-  const row = Math.floor(nodes.length / 4) % 2;
-  return {
-    id,
-    nodes: [...nodes, { id, title: cleanTitle, role: "Unassigned", state: "idle", x: 55 + column * 215, y: 62 + row * 180, needs: [] }],
-  };
-};
-
-export const removeWorkflowNode = (nodes: WorkflowNode[], id: string) => nodes
-  .filter((node) => node.id !== id)
-  .map((node) => ({ ...node, needs: (node.needs || []).filter((dependency) => dependency !== id) }));
-
-export const toggleWorkflowDependency = (nodes: WorkflowNode[], nodeId: string, dependencyId: string) => nodes.map((node) => {
-  if (node.id !== nodeId || nodeId === dependencyId) return node;
-  const dependencies = node.needs || [];
-  return { ...node, needs: dependencies.includes(dependencyId) ? dependencies.filter((id) => id !== dependencyId) : [...dependencies, dependencyId] };
-});

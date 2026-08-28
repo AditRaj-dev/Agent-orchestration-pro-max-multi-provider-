@@ -605,8 +605,8 @@ The journal and projections are deliberately distinct: durable workflow rows con
 Major views include:
 
 - Project launcher — daemon-owned recent projects, safe preflight, starter creation, and a native Windows/macOS/Linux directory picker in the Tauri shell;
-- Mastermind — guided discovery, provider/model choice, explicit approvals, concurrency selection, and a draggable visual DAG editor with stage inspection, connection controls, and live cycle validation;
-- Hybrid workspace — a dependency graph, real event packets, equivalent task list, activity journal, and contextual inspector;
+- Mastermind — guided discovery with structured decisions, provider/model choice, explicit scoped-write and phase approvals, revision/recovery controls, concurrency selection, and automatic generation of the acyclic task graph, parallel work, agent assignments, and review gates;
+- Hybrid workspace — a polished live projection of the orchestrator-generated graph, animated event packets, draggable client-local layout, equivalent task list, activity journal, and contextual stage inspector;
 - Conversations — a ChatGPT-like transcript with explicit agent/provider/model/effort/mode/path authority, automatically applied saved skills, temporary `/skill` bindings, and a searchable slash-command palette;
 - Handoffs — curated context previews and Memex-backed records that link source and target conversations without copying an unbounded transcript;
 - Agents, Memory, Artifacts, and Providers — registry defaults, semantic recall, approved outputs, model catalogs, auth state, and guided setup;
@@ -849,7 +849,7 @@ This is not yet a turnkey autonomous production release.
 9. **Review command access has a deliberate exception.** Phase 9’s reviewer is shell-capable and write-scoped so builds can produce output. Write/delegation tools remain denied, but this is still a broader trust envelope than other review phases.
 10. **Some provider behavior is inherently external.** Model slugs, CLI schemas, authentication, quotas, and capabilities can change. Free detection/catalog probes and fixture tests reduce drift but cannot eliminate it.
 11. **No open-source license is currently granted.** The workspace declares `UNLICENSED`. Add an explicit license before inviting redistribution or external contributions.
-12. **Direct DAG mutation is not yet a committed daemon transaction.** The new desktop validates draft topology locally, but the closed six-operation orchestrator vocabulary cannot remove or arbitrarily rewrite nodes. A future revisioned draft API must extend that vocabulary before visual edits can safely replace the authoritative plan.
+12. **The generated DAG is orchestrator-owned.** The desktop intentionally does not offer structural graph editing: Mastermind publishes the authoritative task graph, while Workspace supports inspection and client-local layout changes. A future revisioned mutation API would be required before structural visual edits could be safe.
 13. **Canvas layout is client-local.** Automatic positions and pinning work during the current workspace session; daemon-shared layout persistence remains a follow-up.
 14. **Concurrency is selected when a Mastermind session starts.** Pause/resume/cancel/retry/reroute are live controls, but changing the concurrency cap after the supervisor is constructed is not yet supported.
 

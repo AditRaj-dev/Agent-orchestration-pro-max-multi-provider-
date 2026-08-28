@@ -433,7 +433,8 @@ impl Starter {
   "name": "{name}",
   "private": true,
   "scripts": {{ "dev": "next dev", "build": "next build", "start": "next start" }},
-  "dependencies": {{ "next": "15.0.0", "react": "19.0.0", "react-dom": "19.0.0" }}
+  "dependencies": {{ "next": "15.5.24", "react": "19.2.1", "react-dom": "19.2.1" }},
+  "overrides": {{ "postcss": "8.5.26" }}
 }}
 "#
                     ),
